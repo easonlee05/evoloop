@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1040" viewBox="0 0 1800 1040">
+  <defs>
+    <style>
+      .bg { fill: #fafafa; }
+      .box { fill: #ffffff; stroke: #2b2b2b; stroke-width: 1.5; rx: 4; }
+      .lifeline { stroke: #444; stroke-width: 2; }
+      .arrow { stroke: #333; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .dashed { stroke-dasharray: 6 6; }
+      .self { stroke: #333; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .label { font-family: Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 18px; fill: #202124; }
+      .small { font-size: 16px; }
+      .title { font-size: 26px; font-weight: 700; }
+      .note { font-size: 15px; fill: #555; }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#333" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1040"/>
+  <text class="label title" x="900" y="48" text-anchor="middle">Lesson Governance Pipeline：从用户终稿到 GBrain 可信法则</text>
+  <text class="note" x="900" y="78" text-anchor="middle">Diff Agent 只发现候选法则；Lesson Service 治理审核流；GBrain 仅接收 approved lessons</text>
+
+  <!-- Participants -->
+  <g id="participants">
+    <rect class="box" x="35" y="105" width="170" height="72"/>
+    <text class="label" x="120" y="148" text-anchor="middle">Frontend Editor</text>
+
+    <rect class="box" x="395" y="105" width="170" height="72"/>
+    <text class="label" x="480" y="148" text-anchor="middle">API Gateway</text>
+
+    <rect class="box" x="680" y="105" width="185" height="72"/>
+    <text class="label" x="772.5" y="148" text-anchor="middle">Document Service</text>
+
+    <rect class="box" x="1010" y="105" width="170" height="72"/>
+    <text class="label" x="1095" y="148" text-anchor="middle">Lesson Service</text>
+
+    <rect class="box" x="1325" y="105" width="190" height="72"/>
+    <text class="label" x="1420" y="148" text-anchor="middle">Diff Agent Runtime</text>
+
+    <rect class="box" x="1595" y="105" width="170" height="72"/>
+    <text class="label" x="1680" y="148" text-anchor="middle">GBrain</text>
+  </g>
+
+  <!-- Lifelines -->
+  <line class="lifeline" x1="120" y1="177" x2="120" y2="925"/>
+  <line class="lifeline" x1="480" y1="177" x2="480" y2="925"/>
+  <line class="lifeline" x1="772.5" y1="177" x2="772.5" y2="925"/>
+  <line class="lifeline" x1="1095" y1="177" x2="1095" y2="925"/>
+  <line class="lifeline" x1="1420" y1="177" x2="1420" y2="925"/>
+  <line class="lifeline" x1="1680" y1="177" x2="1680" y2="925"/>
+
+  <!-- Bottom Participants -->
+  <rect class="box" x="35" y="925" width="170" height="72"/>
+  <text class="label" x="120" y="968" text-anchor="middle">Frontend Editor</text>
+
+  <rect class="box" x="395" y="925" width="170" height="72"/>
+  <text class="label" x="480" y="968" text-anchor="middle">API Gateway</text>
+
+  <rect class="box" x="680" y="925" width="185" height="72"/>
+  <text class="label" x="772.5" y="968" text-anchor="middle">Document Service</text>
+
+  <rect class="box" x="1010" y="925" width="170" height="72"/>
+  <text class="label" x="1095" y="968" text-anchor="middle">Lesson Service</text>
+
+  <rect class="box" x="1325" y="925" width="190" height="72"/>
+  <text class="label" x="1420" y="968" text-anchor="middle">Diff Agent Runtime</text>
+
+  <rect class="box" x="1595" y="925" width="170" height="72"/>
+  <text class="label" x="1680" y="968" text-anchor="middle">GBrain</text>
+
+  <!-- Messages -->
+  <line class="arrow" x1="120" y1="240" x2="480" y2="240"/>
+  <text class="label" x="300" y="220" text-anchor="middle">保存终稿 document.save(final_text)</text>
+
+  <line class="arrow" x1="480" y1="300" x2="772.5" y2="300"/>
+  <text class="label" x="626" y="280" text-anchor="middle">写入终稿版本</text>
+
+  <line class="arrow dashed" x1="772.5" y1="360" x2="480" y2="360"/>
+  <text class="label" x="626" y="340" text-anchor="middle">返回 document_version_id</text>
+
+  <line class="arrow" x1="480" y1="430" x2="1095" y2="430"/>
+  <text class="label" x="790" y="410" text-anchor="middle">创建 lesson_extraction_job</text>
+
+  <line class="arrow" x1="1095" y1="500" x2="772.5" y2="500"/>
+  <text class="label" x="935" y="480" text-anchor="middle">拉取 V1 草稿 + 终稿 + 版本 diff</text>
+
+  <!-- self loop -->
+  <path class="self" d="M1095 560 C1160 560,1160 620,1095 620"/>
+  <text class="label" x="1260" y="595" text-anchor="middle">拉取 HITL 仲裁日志 / Reviewer 记录</text>
+
+  <line class="arrow" x1="1095" y1="690" x2="1420" y2="690"/>
+  <text class="label" x="1258" y="670" text-anchor="middle">调用 Diff Agent 提炼候选法则</text>
+
+  <line class="arrow dashed" x1="1420" y1="750" x2="1095" y2="750"/>
+  <text class="label" x="1258" y="730" text-anchor="middle">返回 candidate_lessons</text>
+
+  <line class="arrow dashed" x1="1095" y1="815" x2="120" y2="815"/>
+  <text class="label" x="608" y="795" text-anchor="middle">推送待审核法则</text>
+
+  <line class="arrow" x1="120" y1="875" x2="480" y2="875"/>
+  <text class="label" x="300" y="855" text-anchor="middle">approve / edit / limit scope / reject</text>
+
+  <line class="arrow" x1="480" y1="910" x2="1095" y2="910"/>
+  <text class="label" x="788" y="890" text-anchor="middle">提交审核结果</text>
+
+  <line class="arrow" x1="1095" y1="875" x2="1680" y2="875"/>
+  <text class="label" x="1388" y="855" text-anchor="middle">仅写入 approved lessons</text>
+</svg>
