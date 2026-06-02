@@ -1,85 +1,87 @@
 # Agent Map
 
-这是新后端重构 worktree 的导航图。不要再按旧 `app/server.py`、旧 `app/workflow/orchestrator.py` 或旧 `app/agents/*` 查找主架构；这些旧实现已删除。
+这是当前 EvoLoop agent 仓库的导航图。`manual` 和 `prd` 都通过同一个任务引擎执行，不需要分别查找独立 orchestrator。
 
-## 一句话
+## 首读顺序
 
-本仓库正在重构为 PM-Agent 双产品线平台后端。`manual` 和 `prd` 都通过同一个 `TaskService + WorkflowEngine + ToolService` 执行。
+1. `AGENTS.md`
+2. `README.md`
+3. `GBRAIN_ARCHITECTURE.md`
+4. `docs/refactor/api-contract.md`
+5. 用 `rg` 定位相关模型、页面或接口
 
-## 首读规则
+默认不要读取 `.env`、`workspace/outputs/`、`workspace/inputs/temp/` 和完整材料库。
 
-1. 先读 `AGENTS.md`。
-2. 再读 `GBRAIN_ARCHITECTURE.md` 和 `docs/architecture/05-workflow-tool-architecture.md`。
-3. API 对接先读 `docs/refactor/api-contract.md`。
-4. 用 `rg` 定位相关模型或步骤，不要默认读取 `.env`、用户材料、输出产物或完整样例库。
-
-## 核心入口
+## 后端核心入口
 
 | 文件 | 作用 |
 |---|---|
-| `app/core/task.py` | `TaskDefinition`、`WorkflowSpec`、`StepResult`、任务/步骤状态。 |
-| `app/core/context.py` | `TaskContext`、用户裁决、任务上下文。 |
-| `app/core/events.py` | 结构化事件模型，供 SSE/API 回放。 |
+| `app/core/task.py` | `TaskDefinition`、`WorkflowSpec`、`WorkflowStep`、`StepResult`、任务状态。 |
+| `app/core/context.py` | `TaskContext`、`UserDecision`、共享上下文。 |
+| `app/core/events.py` | `Event` 与 `EventBus`，供 API 和 SSE 回放。 |
 | `app/core/tools.py` | `ToolSpec`、`ToolCall`、`ToolResult`、`ToolPolicy`。 |
-| `app/workflows/engine.py` | 通用 WorkflowEngine，不硬编码 manual/prd 业务路径。 |
-| `app/workflows/definitions.py` | `manual` 和 `prd` 任务定义注册表。 |
-| `app/workflows/manual.py` | manual TaskDefinition skeleton。 |
-| `app/workflows/prd.py` | prd TaskDefinition 最小可运行工作流。 |
-| `app/services/task_service.py` | 创建、运行、恢复、取消任务。 |
-| `app/services/tool_service.py` | Tool 注册、权限校验、调用审计和事件输出。 |
-| `app/services/fakes.py` | FakeLLM / FakeKnowledge / FakeStorage，本地测试用。 |
-| `app/api/server.py` | Phase 1 API skeleton。 |
-| `frontend/src/api.js` | EvoLoop 前端 API helper，仅负责数据请求，不承载样式。 |
-| `docs/refactor/api-contract.md` | 前后端 API/SSE 契约，后端主维护。 |
-| `tests/test_backend_phase1.py` | Phase 1 行为测试。 |
+| `app/workflows/definitions.py` | `manual` / `prd` 任务定义注册表。 |
+| `app/workflows/manual.py` | 操作手册任务定义。 |
+| `app/workflows/prd.py` | PRD 任务定义。 |
+| `app/workflows/engine.py` | 通用任务引擎，负责步骤执行、并行组、仲裁暂停与恢复。 |
+| `app/services/task_service.py` | 创建、运行、恢复、取消、删除任务。 |
+| `app/services/tool_service.py` | Tool 注册、白名单校验、审计事件。 |
+| `app/services/file_service.py` | 文档读写和备份封装。 |
+| `app/services/gbrain_service.py` | 本地 `gbrain` 检索适配与安全降级。 |
+| `app/api/server.py` | FastAPI API、SSE、任务列表、文档和辅助页面接口。 |
+| `tests/test_backend_phase1.py` | 当前后端行为测试。 |
 
-## 新工作流
+## 前端核心入口
+
+| 文件 | 作用 |
+|---|---|
+| `frontend/src/api.js` | 前端统一请求封装。 |
+| `frontend/src/pages/Workspace/index.jsx` | 工作台主页面：会话区、文档区、引用交互、任务动作。 |
+| `frontend/src/pages/Workspace/workspace.css` | 当前工作台样式。 |
+| `frontend/src/pages/Workspace/quoteSelection.js` | 引用胶囊、悬浮文案和字数限制逻辑。 |
+| `frontend/src/pages/Workspace/workspaceSession.js` | 控制是否自动打开文档、是否自动执行任务。 |
+| `frontend/src/pages/Workspace/workspaceActions.js` | 文档按钮文案和继续运行提示逻辑。 |
+
+## 关键链路
 
 ```text
 POST /api/tasks
   -> TaskService.create_task
   -> TaskDefinition 注册表选择 manual/prd
-  -> TaskContext 初始化
+  -> 生成 TaskContext 并写入 task.json/context.json
 
 POST /api/tasks/{task_id}/run
   -> WorkflowEngine.run
-  -> 解释 WorkflowSpec steps
-  -> 通过 ToolService 调用 material/knowledge/artifact/format/diff/event 工具
-  -> 每步写 checkpoint
-  -> 输出结构化 Event
-  -> 需要仲裁时 waiting_for_user
-  -> 收到 decisions 后从 resume_step_id 恢复
+  -> 按 WorkflowSpec 执行 context / agent / gate / arbitration / artifact / checkpoint
+  -> ToolService 统一处理知识检索、产物写入等能力
+  -> EventBus + events.jsonl 提供回放与 SSE
+
+GET /api/tasks/{task_id}/document
+PUT /api/tasks/{task_id}/document
+  -> 读取或更新当前 Markdown 文档
+  -> 更新前先备份旧 artifact
 ```
 
-## 前端联调
+## 常见修改路径
 
-- Claude 前端位于 `frontend/`，仓库 `.gitignore` 已改为只忽略根目录 `/workspace/`，避免误伤工作台页面 `frontend/src/pages/Workspace/`。
-- 不要轻易修改 `frontend/**/*.css` 和设计 token；对接优先改 `frontend/src/api.js` 与页面数据请求。
-- Vite 默认端口 4000，后端 FastAPI 默认端口 8000；可通过 `VITE_API_BASE` 指向其他后端地址。
+- 任务类型或工作流步骤：`app/workflows/`
+- 任务状态、共享上下文、事件模型：`app/core/`
+- API 字段和 SSE 事件：`app/api/server.py`、`docs/refactor/api-contract.md`
+- 文档读写、备份、知识检索：`app/services/`
+- 工作台交互：`frontend/src/pages/Workspace/`
+- 前后端请求封装：`frontend/src/api.js`
 
-## Tool 边界
+## 约束摘要
 
-首期 Tool：
-
-- `material.read`
-- `material.parse`
-- `knowledge.retrieve`
-- `artifact.write`
-- `artifact.read`
-- `artifact.backup`
-- `format.validate`
-- `diff.extract_rules`
-- `event.emit`
-
-所有 write/external 类型 Tool 必须发 `tool.call.started` 和 `tool.call.completed/failed/denied`。
+- Agent 不直接读写文件；文档写入必须走 `artifact.write` 或文档保存接口。
+- Tool 权限不足返回 `denied`，并输出 `tool.call.denied`。
+- 前端只消费结构化 API/SSE，不解析后端日志文本。
+- 文档、知识和规则接口都不能暴露完整本地路径或未授权原文。
 
 ## 验证
 
 ```bash
 python3 -m unittest tests.test_backend_phase1 -v
 python3 -X pycache_prefix=/private/tmp/manual-agent-pycache -m py_compile app/core/*.py app/workflows/*.py app/services/*.py app/api/*.py
+npm --prefix frontend run build
 ```
-
-## 旧代码状态
-
-旧后端入口、旧 orchestrator、旧 agent 实现和旧静态页面已从当前 worktree 删除。`app/格式.md` 暂时保留为 manual 格式规范迁移资产。

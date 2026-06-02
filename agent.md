@@ -1,78 +1,41 @@
-# Agent Handoff
+# PM-Agent 核心架构
 
-本 worktree 是后端重构分支，路径：
+EvoLoop 是以 PM-Agent 为核心的双产品线平台，当前支持两类任务：`manual`（操作手册编写）和 `prd`（PRD 编写）。
 
-```text
-/Users/apple/.codex/worktrees/5062/manual-agent
+## 核心能力与工作模式
+
+PM-Agent 基于一套通用的任务执行引擎进行调度。当用户提供输入后，Agent 通过以下方式完成任务：
+
+1. **共享上下文**：在同一个 `TaskContext` 上运行，确保所有步骤和分析基于相同的事实。
+2. **多角色协作**：在工作流中扮演 PM、Tech、QA、Reviewer、Writer 等虚拟角色，并按步骤编排协同完成文档。
+3. **安全沙箱控制**：Agent 不直接读写文件、不直接访问网络，所有外部能力均通过 `ToolService` 的白名单（ToolPolicy）执行。
+4. **人类裁决（Human-in-the-loop）**：在遇到业务取舍、冲突或重要 gate 失败时，Agent 自动暂停并发出裁决请求，用户反馈后从断点继续运行。
+5. **结构化事件驱动**：执行过程中的流式消息、步骤状态及门禁结果，均通过结构化事件推送至前端。
+
+## 任务执行流程
+
+### manual（操作手册编写）
+`ingest_materials` -> `build_context` -> `retrieve_knowledge` -> `PM提纲` -> `Tech/QA并行校验` -> `Reviewer门禁` -> `Writer生成文档` -> `Reviewer文档门禁` -> `写入Artifact`。
+
+### prd（PRD 编写）
+`build_context` -> `retrieve_knowledge` -> `PM草案` -> `Tech/QA挑战` -> `PM初稿` -> `Tech/QA二审` -> `收敛门禁` -> `用户仲裁(需要时)` -> `Reviewer门禁` -> `Writer产出PRD` -> `写入Artifact`。
+
+## 运行与验证
+
+### 启动服务
+后端：
+```bash
+python3 -m uvicorn app.api.server:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-当前状态：后端 Phase 1 骨架已完成，旧后端实现已从本 worktree 删除。不要再查找或依赖旧入口 `app/server.py`、`app/main.py`、`app/chat.py`、旧 `app/workflow/*`、旧 `app/agents/*`、旧 `app/static/*`。
-
-## 后端新架构入口
-
-优先阅读：
-
-```text
-AGENT_MAP.md
-docs/refactor/api-contract.md
-app/core/task.py
-app/workflows/engine.py
-app/workflows/definitions.py
-app/services/task_service.py
-app/services/tool_service.py
+前端：
+```bash
+npm --prefix frontend run dev
 ```
 
-当前保留的新后端目录：
-
-```text
-app/api/          # API skeleton 和请求/响应 schema
-app/core/         # TaskDefinition、TaskContext、Event、Artifact、Tool 模型
-app/services/     # TaskService、ToolService、Event/File/Knowledge 服务和 fakes
-app/workflows/    # 通用 WorkflowEngine、manual/prd TaskDefinition
-app/格式.md       # manual 格式规范迁移资产
-```
-
-## 前端/Antigravity 对接
-
-前端只消费 API/SSE 契约：
-
-```text
-docs/refactor/api-contract.md
-```
-
-首期接口：
-
-- `POST /api/tasks`
-- `POST /api/tasks/{task_id}/run`
-- `GET /api/tasks/{task_id}/events`
-- `POST /api/tasks/{task_id}/decisions`
-- `GET /api/tasks/{task_id}/artifacts`
-- `GET /api/artifacts/{artifact_id}`
-- `PUT /api/artifacts/{artifact_id}`
-- `POST /api/materials`
-
-前端不要解析后端日志文本，不要依赖旧 `[__CHAT_MSG_START__|PM]` 标记。UI 状态应完全由结构化事件驱动。
-
-## 后端边界
-
-- `manual` 和 `prd` 都是 `TaskDefinition`，不能复制独立 Orchestrator。
-- `WorkflowEngine` 只解释 `WorkflowSpec` 和 `StepResult`，不写死业务路径。
-- Agent 不直接读写文件、不直接访问网络、不调用任意 shell。
-- 外部能力必须通过 `ToolService`，并受 `ToolPolicy` 白名单约束。
-- 所有 write/external Tool 必须产生 `tool.call.started` 和 `tool.call.completed/failed/denied` 事件。
-- `needs_arbitration` 是正常暂停状态，用户提交裁决后从 `resume_step_id` 恢复。
-
-## 验证命令
-
+### 验证命令
 ```bash
 python3 -m unittest tests.test_backend_phase1 -v
 python3 -X pycache_prefix=/private/tmp/manual-agent-pycache -m py_compile app/core/*.py app/workflows/*.py app/services/*.py app/api/*.py
+npm --prefix frontend run build
 ```
-
-## 还没完成的后续工作
-
-- 接真实 LLMPort 和真实 Agent prompt。
-- 接真实存储、材料上传、材料解析和 GBrain/本地知识检索。
-- 完成 manual/prd 的完整业务生成策略。
-- API skeleton 接入生产级鉴权、持久化和 live SSE。
-- Diff 候选法则审核入库流程。

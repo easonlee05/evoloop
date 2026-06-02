@@ -1,76 +1,80 @@
-# PM-Agent Platform Backend
+# EvoLoop
 
-这是后端重构 worktree。目标是把项目重构为以 PM-Agent 为核心的双产品线平台，首批支持：
+EvoLoop 是一个围绕任务、会话和文档共创的 agent 工作台。当前仓库包含一套可运行的前后端实现：前端负责任务大厅、会话区、文档编辑区和辅助页面，后端负责任务创建、工作流执行、结构化事件流、知识检索、安全工具调用和 Markdown 产物管理。
+
+当前内置两类任务：
 
 1. `manual`：操作手册编写
 2. `prd`：PRD 编写
 
-当前分支只保留新后端骨架；旧 `app/server.py`、`app/main.py`、`app/chat.py`、旧 `app/workflow/*`、旧 `app/agents/*` 和旧静态页面已从本 worktree 删除。
+它们共用同一套任务引擎：`TaskService + WorkflowEngine + ToolService`。
 
-## 目录
+## 当前能力
+
+- 创建和查看 `manual`、`prd` 任务
+- 通过 `POST /api/tasks/{task_id}/run` 显式启动或继续任务
+- 通过 SSE 订阅结构化任务事件和会话消息
+- 在工作台查看和编辑 Markdown 文档，并自动备份旧版本
+- 在会话区和文档区对任意选中文本添加引用胶囊
+- 查看最近任务、知识卡片、规则卡片和回收站数据
+- 在知识检索不可用时返回安全的降级结果，不暴露本地路径和原始私有材料
+
+## 仓库结构
 
 ```text
 app/
-  api/                 # FastAPI/API schema 草案
-  core/                # TaskDefinition、TaskContext、Event、Artifact、Tool 模型
-  services/            # TaskService、ToolService、Event/File/Knowledge 服务与 fakes
-  workflows/           # 通用 WorkflowEngine 与 manual/prd TaskDefinition
-  格式.md              # manual 格式规范资产，后续迁移到受控资产层
+  api/                 # FastAPI 路由与请求/响应 schema
+  core/                # Task / Context / Event / Tool / Artifact 核心模型
+  services/            # TaskService、ToolService、FileService、Knowledge/GBrain 适配
+  workflows/           # 通用 WorkflowEngine 与 manual/prd 任务定义
+  格式.md              # manual 任务使用的格式规范资产
+
+frontend/
+  src/api.js           # 前端 API helper
+  src/pages/Workspace/ # 当前工作台页面与引用交互逻辑
 
 docs/
-  architecture/        # 目标架构文档
-  refactor/            # 重构计划和 API/SSE 契约
+  architecture/        # 当前 agent 架构说明
+  refactor/            # API 契约与后端实现说明
 
-tests/                 # Phase 1 后端单元测试
+tests/
+  test_backend_phase1.py  # 后端行为测试
 ```
 
-## 核心原则
+## 运行方式
 
-- `manual` 和 `prd` 都是 `TaskDefinition`，不复制独立 Orchestrator。
-- `WorkflowEngine` 只解释 `WorkflowSpec` 和 `StepResult`。
-- Agent 不直接读写文件、不直接访问网络、不调用任意 shell。
-- 外部能力必须通过 `ToolService`，并受 `ToolPolicy` 白名单约束。
-- 前端只消费结构化 API/SSE 事件，不解析后端日志文本。
-- Diff 只能生成候选法则，不直接写入 approved 可信法则区。
+后端：
 
-## API/SSE 契约
-
-后端主维护：
-
-```text
-docs/refactor/api-contract.md
+```bash
+python3 -m uvicorn app.api.server:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Antigravity 前端应优先对接：
+前端：
 
-- `POST /api/tasks`
-- `POST /api/tasks/{task_id}/run`
-- `GET /api/tasks/{task_id}/events`
-- `POST /api/tasks/{task_id}/decisions`
-- `GET /api/tasks/{task_id}/artifacts`
-- `GET /api/artifacts/{artifact_id}`
-- `PUT /api/artifacts/{artifact_id}`
-- `POST /api/materials`
+```bash
+npm --prefix frontend install
+npm --prefix frontend run dev
+```
 
-## 本地验证
+前端默认读取 `http://127.0.0.1:8000`，可通过 `VITE_API_BASE` 覆盖。
+
+## 验证
 
 ```bash
 python3 -m unittest tests.test_backend_phase1 -v
 python3 -X pycache_prefix=/private/tmp/manual-agent-pycache -m py_compile app/core/*.py app/workflows/*.py app/services/*.py app/api/*.py
+npm --prefix frontend run build
 ```
 
-如果 macOS/沙盒阻止写入默认 Python cache，请使用上面的 `-X pycache_prefix=/private/tmp/...`。
+如果 macOS 或沙盒阻止写入默认 Python cache，请使用上面的 `-X pycache_prefix=/private/tmp/...`。
 
-## 当前阶段
+## 文档入口
 
-Phase 1 已完成新后端内核骨架：
-
-- 核心领域模型
-- 通用 WorkflowEngine
-- ToolService 权限和事件审计
-- `manual` / `prd` TaskDefinition
-- FakeLLM / FakeKnowledge / FakeStorage
-- API skeleton
-- 单元测试覆盖状态流转、仲裁暂停恢复、checkpoint 恢复、ToolPolicy、artifact 幂等和 prd 最小工作流
-
-后续阶段再接真实 LLM、真实存储、GBrain、本地材料解析和完整 manual/prd 业务生成策略。
+- `agent.md`：PM-Agent 核心架构与功能说明
+- `AGENTS.md`：仓库协作规则
+- `AGENT_MAP.md`：高频修改路径与代码导航
+- `GBRAIN_ARCHITECTURE.md`：当前架构文档索引
+- `docs/architecture/00-global-architecture.md`：总体运行链路
+- `docs/architecture/05-workflow-tool-architecture.md`：任务引擎和 Tool 边界
+- `docs/refactor/api-contract.md`：前后端 API/SSE 契约
+- `docs/vision/pm_agent_v2_vision.md`：PM-Agent 产品与架构白皮书

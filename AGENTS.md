@@ -16,9 +16,6 @@
 
 **默认不读：**
 - `.env`：可能含凭证
-- `workspace/outputs/`：生成产物
-- `workspace/inputs/temp/`：截图和临时材料
-- `workspace/inputs/knowledge/` 和 `workspace/inputs/samples/`：仅在材料/调试任务时读
 
 **不要修改：**
 - 用户材料和输出产物
@@ -27,14 +24,14 @@
 
 ---
 
-## 当前目标架构
+## 平台架构
 
-本仓库正在重构为以 PM-Agent 为核心的双产品线平台：
+本仓库是以 PM-Agent 为核心的双产品线平台：
 
 - `manual`：操作手册编写
 - `prd`：PRD 编写
 
-`manual` 和 `prd` 都必须是同一个通用任务引擎下的 `TaskDefinition`，不能复制独立 orchestrator。旧 `app/workflow/orchestrator.py`、`app/workflow/prd_orchestrator.py`、`app/server.py`、`app/chat.py`、`app/main.py` 不再是主架构入口。
+`manual` 和 `prd` 均基于同一个通用任务引擎下的 `TaskDefinition` 进行调度。
 
 核心后端分层：
 
@@ -75,7 +72,7 @@
 - 不要轻易改 `frontend/**/*.css` 或设计 token。
 - 前端通过稳定 API/SSE 协议协作，不解析后端日志文本。
 - 后端主维护 `docs/refactor/api-contract.md`；前端提出变更后，由后端统一更新契约。
-- `frontend/src/pages/Workspace/` 是有效工作台页面；根目录 `.gitignore` 只忽略 `/workspace/`，避免误伤该页面。
+- `frontend/src/pages/Workspace/` 是有效工作台页面。
 
 ---
 

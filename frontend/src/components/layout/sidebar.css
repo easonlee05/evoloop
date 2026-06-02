@@ -89,21 +89,8 @@
   height: 5px;
   background-color: var(--text-tertiary, #999);
   border-radius: 50%;
-  animation: badge-pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
   margin-left: auto;
   opacity: 0.7;
-}
-
-@keyframes badge-pulse {
-  0% {
-    box-shadow: 0 0 0 0 var(--text-disabled, rgba(150, 150, 150, 0.3));
-  }
-  70% {
-    box-shadow: 0 0 0 4px rgba(150, 150, 150, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(150, 150, 150, 0);
-  }
 }
 
 /* 最近对话 */
@@ -191,6 +178,15 @@
   min-height: 0;
   overflow-y: auto;
   padding-bottom: var(--sp-2);
+  scrollbar-width: none !important; /* Firefox 隐藏 */
+  -ms-overflow-style: none; /* IE/Edge 隐藏 */
+}
+
+/* 隐藏 Webkit 浏览器（Chrome/Safari）的滚动条 */
+.sidebar-history-scroll::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
 }
 
 .section-row {

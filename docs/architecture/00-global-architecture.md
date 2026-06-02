@@ -1,80 +1,66 @@
-# 全局架构：人机协同全栈飞轮
+# 全局架构
 
-系统按六个架构边界拆分：前台共创客户端、GBrain 知识库、中台铁三角、Workflow/Tool 层、Diff 经验提炼流程、可信法则入库闭环。本文只描述它们之间的关系，细节进入各子文档。
+EvoLoop 当前是一套围绕任务、会话和 Markdown 文档共创的 agent 工作台。系统由前端工作台、FastAPI API、通用任务引擎、知识检索适配和 artifact 存储组成。
 
-- [前台架构](01-frontend-architecture.md)
-- [知识库架构](02-knowledge-base-architecture.md)
-- [中台铁三角架构](03-triangle-agent-architecture.md)
-- [Diff 流程架构](04-diff-workflow-architecture.md)
+- [前端架构](01-frontend-architecture.md)
+- [知识检索架构](02-knowledge-base-architecture.md)
+- [Agent 协作架构](03-triangle-agent-architecture.md)
+- [文档与规则流](04-diff-workflow-architecture.md)
 - [工作流与 Tool 架构](05-workflow-tool-architecture.md)
 
----
+## 当前分层
 
-## 1. 架构目标
+| 层 | 主要文件 | 职责 |
+|---|---|---|
+| 前端工作台 | `frontend/src/pages/Workspace/` | 任务列表、会话区、文档区、引用胶囊、知识提示、任务动作 |
+| API 层 | `app/api/server.py` | 暴露任务、SSE、文档、知识、规则、回收站等接口 |
+| 应用服务层 | `app/services/task_service.py`、`app/services/tool_service.py` | 创建任务、运行任务、校验工具权限、输出审计事件 |
+| 工作流层 | `app/workflows/engine.py`、`app/workflows/manual.py`、`app/workflows/prd.py` | 解释任务定义并推进步骤 |
+| 核心模型层 | `app/core/*.py` | 定义任务、上下文、事件、工具、artifact 的统一模型 |
+| 存储与知识层 | `app/services/fakes.py`、`app/services/file_service.py`、`app/services/gbrain_service.py` | 保存任务文件、artifact、checkpoint，执行知识检索与降级 |
 
-1. **前台可参与**：用户可以实时查看 AI 讨论、打断错误方向、裁决争议、审核候选法则。
-2. **知识可复用**：GBrain 只负责可信知识的存储、检索和快照，不承担流程编排。
-3. **推理可收敛**：中台铁三角通过 PM、Tech、QA 的攻防形成方案，并在死锁时请求人类仲裁。
-4. **经验可治理**：Diff 流程从终稿中提炼候选法则，但必须经过人工审核后才能写入 GBrain。
-
-## 2. 总体分层
-
-| 边界 | 文档 | 核心职责 | 不负责 |
-|---|---|---|---|
-| 前台共创客户端 | [前台架构](01-frontend-architecture.md) | 任务入口、直播、打断、仲裁、终稿编辑、法则审核 | 模型推理、知识库直写 |
-| GBrain 知识库 | [知识库架构](02-knowledge-base-architecture.md) | 知识导入、索引、检索、可信法则存储、快照 | Diff 提炼流程、铁三角编排 |
-| 中台铁三角 | [中台铁三角架构](03-triangle-agent-architecture.md) | PM/Tech/QA 攻防、多角色历史上下文绑定、Writer 整合与动态产物渲染、Reviewer 门禁、人类仲裁衔接 | 长期知识沉淀、候选法则治理 |
-| Diff 流程 | [Diff 流程架构](04-diff-workflow-architecture.md) | 终稿证据冻结、候选法则提炼、审核流转 | 知识检索服务、方案生成 |
-| Workflow/Tool 层 | [工作流与 Tool 架构](05-workflow-tool-architecture.md) | 任务步骤编排、暂停恢复、受控工具调用、权限审计、Tool 事件 | Prompt 内容、前端展示、长期知识治理 |
-
-![GBrain 全栈架构拓扑](../../assets/gbrain-fullstack-topology.png)
-
-## 3. 主流程
+## 当前主流程
 
 ```text
-用户发起任务
-  -> 前台提交任务目标和材料
-  -> 中台铁三角创建任务沙盒
-  -> Workflow Engine 按 TaskDefinition 推进步骤
-  -> 中台从 GBrain 检索事实和历史法则
-  -> Tool Service 受控执行材料、知识、产物和 Diff 能力
-  -> PM / Tech / QA 多轮攻防（期间应用“轮次历史上下文绑定”保证 Agent 完整上下文认知）
-  -> 死锁时前台请求用户仲裁
-  -> Reviewer 执行质量门禁
-  -> Writer Agent 整合三方方案与用户决策，输出文档草案
-  -> 自动执行“动态产物渲染决策”（AI 输出优先，测试 Fallback 回退静态模板）
-  -> 前台共创编辑器展示草案（支持单 Icon 双态控制按钮与正文点击快捷编辑）
-  -> 用户编辑并保存终稿
-  -> Diff 流程冻结证据并提炼候选法则
-  -> 前台审核候选法则（支持修改后入库与限定作用域）
-  -> 审核通过的可信法则写入 GBrain
+用户创建任务
+  -> 后端生成 TaskContext 和 task.json
+  -> 用户显式点击继续运行
+  -> WorkflowEngine 按任务定义执行步骤
+  -> Agent 步骤流式输出消息并写入 round_history
+  -> Gate 判断是否通过或需要用户裁决
+  -> Writer 生成 Markdown，artifact.write 持久化文档
+  -> 前端读取最新文档并允许继续编辑
+  -> 用户保存文档时自动备份旧版本
 ```
 
-![人机协同工作流全景时序](../../assets/hitl-workflow-timeline.png)
+## 当前支持的任务
 
-## 4. 边界原则
+| 任务类型 | 输入重点 | 输出文档 | 特点 |
+|---|---|---|---|
+| `manual` | `module_name`、材料、补充说明 | `模块概览.md` | 适合操作手册和模块说明 |
+| `prd` | `feature`、`business_goal`、约束 | `PRD.md` | 带 PM / Tech / QA / Reviewer / Writer 协作与仲裁能力 |
 
-1. **GBrain 不跑流程**：GBrain 只做知识基础设施，不承载 Diff 编排和铁三角协作。
-2. **Diff 不写知识库**：Diff 只输出候选法则，写入 GBrain 必须经过审核。
-3. **铁三角不存长期记忆**：任务经验通过 Diff 流程治理后沉淀，不留在 Agent 隐式上下文中。
-4. **前台不越权**：前台负责交互和审核，不直接调用模型或写入 GBrain。
-5. **Agent 不直接越权使用能力**：材料读取、知识检索、产物写入和 Diff 提炼都必须通过 ToolPolicy 授权的 Tool。
+## 当前存储布局
 
-## 5. 路线图
+```text
+<storage_root>/
+  tasks/
+    task_xxx/
+      task.json
+      context.json
+      checkpoint.json
+      events.jsonl
+  artifacts/
+    artifact_task_xxx_001.json
+    backup_artifact_task_xxx_001_v1.json
+```
 
-### Phase 1：知识底座
+默认本地运行时，后端使用临时目录作为存储根目录。
 
-- 建立 GBrain 服务、SDK/API、知识导入和快照能力。
-- 支持按任务目标、业务域和作用域检索知识。
+## 当前边界
 
-### Phase 2：中台协作
-
-- 建立 PM / Tech / QA 的 3 轮共识环。
-- 建立 Reviewer 质量门禁。
-- 建立死锁分歧包和前台仲裁入口。
-
-### Phase 3：Diff 飞轮
-
-- 建立终稿证据冻结和 Diff 提炼任务。
-- 建立候选法则审核、作用域管理和入库审计。
-- 审核通过后写入 GBrain，供后续任务检索复用。
+- 前端不直接调用模型，也不直接写本地文件。
+- Agent 不直接读写文件；受控能力统一通过 ToolService。
+- 文档保存通过 artifact 接口完成，并在更新前创建备份。
+- 知识检索只返回安全摘要，不返回完整本地路径或未授权原文。
+- 所有关键状态变化通过结构化事件输出，前端不解析后端日志文本。

@@ -1,16 +1,17 @@
-# API/SSE Contract for PM-Agent Platform
+# API / SSE Contract for EvoLoop
 
-本文档是后端主维护的前后端契约。Antigravity 前端只消费这里定义的 HTTP API、Artifact 资源和结构化 SSE 事件，不解析后端日志文本。
+本文档描述当前前端工作台和后端服务之间的实际契约。前端只消费这里定义的 HTTP API、Artifact 资源和结构化 SSE 事件，不解析后端日志文本。
 
-## 1. Contract Principles
+## Contract Principles
 
-- 所有任务类型都通过 `TaskDefinition` 创建，首期支持 `manual` 和 `prd`。
-- 前端通过 SSE 消费结构化事件，不读取 console 日志协议。
+- 当前任务类型只有 `manual` 和 `prd`。
+- 所有任务都通过 `TaskDefinition` 创建，并由 `WorkflowEngine` 执行。
+- 前端通过 SSE 消费结构化事件，不读取 console 标记。
 - 事件 payload 不包含凭证、完整本地路径、未授权材料原文或 `.env` 内容。
-- Tool 权限不足返回 `tool.call.denied`，不伪装成普通失败。
+- Tool 权限不足返回 `tool.call.denied`。
 - 用户裁决是正常流程：`arbitration.requested` 后任务暂停，`arbitration.applied` 后从 `resume_step_id` 恢复。
 
-## 2. Common Objects
+## Common Objects
 
 ### Event
 
@@ -43,23 +44,24 @@
 }
 ```
 
-## 3. Endpoints
+## Endpoints
 
-### POST /api/tasks
+### `POST /api/tasks`
 
-Create a task shell and persist `task.json`, `context.json`, and a `task.created` event.
+创建任务。前端可以只传 `{ "prompt": "..." }`；后端会自动推断任务类型，并补全默认 `username`。
 
-EvoLoop frontend compatibility: the landing page may send only `{ "prompt": "..." }`. Backend infers `type` (`prd` by default, `manual` when the prompt mentions 操作手册/manual), fills `username` as `frontend`, and returns both snake_case and camelCase ids.
-
-Request fields:
+常见请求字段：
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `type` | string | yes | `manual` or `prd` |
-| `username` | string | yes | Workspace/user isolation key |
-| `title` | string | no | Display title |
-| `goal` | string | no | Generic task goal |
-| `material_ids` | string[] | no | Uploaded material ids |
+| `type` | string | no | `manual` 或 `prd`；缺省时按 prompt 推断 |
+| `username` | string | no | 未传时默认 `frontend` |
+| `title` | string | no | 前端显示标题 |
+| `goal` | string | no | 通用任务目标 |
+| `feature` | string | no | `prd` 任务名称 |
+| `business_goal` | string | no | `prd` 任务业务目标 |
+| `module_name` | string | no | `manual` 模块名 |
+| `material_ids` | string[] | no | 上传材料 id |
 
 Response:
 
@@ -72,9 +74,9 @@ Response:
 }
 ```
 
-### GET /api/tasks
+### `GET /api/tasks`
 
-List task rows for the EvoLoop task hall. `status` is frontend-facing and maps backend states to `running | review | pending | done`.
+返回任务大厅列表。`status` 是前端展示态，`raw_status` 是后端原始状态。
 
 ```json
 {
@@ -94,36 +96,34 @@ List task rows for the EvoLoop task hall. `status` is frontend-facing and maps b
 }
 ```
 
-### POST /api/tasks/{task_id}/run
+### `GET /api/tasks/{task_id}`
 
-Start or resume task execution from the latest checkpoint. If a task reaches arbitration it returns `waiting_for_user`.
+读取单个任务的前端展示数据。
 
-Response:
+### `POST /api/tasks/{task_id}/run`
 
-```json
-{
-  "task_id": "task_abc123",
-  "status": "waiting_for_user",
-  "waiting_step_id": "arbitration_business_tradeoff"
-}
-```
-
-### POST /api/tasks/{task_id}/interrupt
-
-Frontend pause/interrupt endpoint. Phase 1 maps it to safe task cancellation and emits `task.cancelled`; it must not mark unfinished artifacts as completed.
+显式启动或继续任务执行。
 
 ```json
 {
   "task_id": "task_abc123",
   "taskId": "task_abc123",
-  "status": "cancelled"
+  "status": "running",
+  "waiting_step_id": null
 }
 ```
 
-### GET /api/tasks/{task_id}/events
+### `POST /api/tasks/{task_id}/interrupt`
 
-SSE replay stream. Phase 1 replays stored `events.jsonl`; later phases can keep the stream open for live events.
-Each SSE `data` object may include `frontend_message`, a presentation helper shaped like Claude's workspace message model. Frontend may render it directly but must still treat the canonical event fields as source of truth.
+把任务标记为取消，并输出 `task.cancelled`。
+
+### `DELETE /api/tasks/{task_id}`
+
+软删除任务。任务会从主列表隐藏，但仍可在回收站查看与恢复。
+
+### `GET /api/tasks/{task_id}/events`
+
+返回 SSE 事件流。服务会先回放已有 `events.jsonl`，随后继续推送实时事件。
 
 SSE frame:
 
@@ -133,47 +133,15 @@ event: workflow.step.completed
 data: {"id":"evt_000012","task_id":"task_abc123","type":"workflow.step.completed","payload":{"step_id":"pm_draft"}}
 ```
 
-### GET /api/tasks/{task_id}/document
+每个 `data` 对象可能包含 `frontend_message` 字段，供工作台直接渲染消息 UI；标准事件字段仍然是主数据源。
 
-Read the latest task Markdown document for the workspace editor. If the task has no artifact yet, backend may run the Phase 1 workflow once to produce the first artifact.
+### `GET /api/tasks/{task_id}/messages`
 
-```json
-{
-  "task_id": "task_abc123",
-  "taskId": "task_abc123",
-  "artifact_id": "artifact_task_abc123_001",
-  "artifactId": "artifact_task_abc123_001",
-  "name": "PRD.md",
-  "version": 1,
-  "title": "积分防刷网关",
-  "content": "# 积分防刷网关 PRD\n"
-}
-```
+返回已格式化的前端消息列表，适合初始化工作台消息区。
 
-### PUT /api/tasks/{task_id}/document
+### `POST /api/tasks/{task_id}/decisions`
 
-Save frontend editor changes. Backend backs up the previous artifact and increments the existing artifact version when content changes.
-
-```json
-{
-  "content": "# Updated PRD\n"
-}
-```
-
-Response:
-
-```json
-{
-  "artifact_id": "artifact_task_abc123_001",
-  "artifactId": "artifact_task_abc123_001",
-  "version": 2,
-  "content": "# Updated PRD\n"
-}
-```
-
-### POST /api/tasks/{task_id}/decisions
-
-Apply a user arbitration decision, append it to `TaskContext.user_decisions`, emit `arbitration.applied`, and resume from the backend-declared `resume_step_id`.
+提交用户裁决并恢复任务执行。
 
 Request:
 
@@ -192,61 +160,32 @@ Request:
 }
 ```
 
-`quoted_selections` is optional. Frontend may send it when the user quotes text from the conversation area or editor before submitting a decision.
+`quoted_selections` 可选，可来自会话区或文档区的已选文本。
 
-Response:
+### `GET /api/tasks/{task_id}/artifacts`
+
+列出当前任务的 artifact。
+
+### `GET /api/tasks/{task_id}/document`
+
+读取当前任务最新 Markdown 文档。如果任务还没有 artifact，会返回一个占位文档内容，不会自动触发任务运行。
 
 ```json
 {
   "task_id": "task_abc123",
-  "status": "completed"
-}
-```
-
-### GET /api/tasks/{task_id}/artifacts
-
-List artifacts for a task.
-
-Response:
-
-```json
-{
-  "artifacts": [
-    {
-      "artifact_id": "artifact_task_abc123_001",
-      "task_id": "task_abc123",
-      "name": "PRD.md",
-      "version": 1,
-      "content_type": "text/markdown",
-      "created_by": "Writer",
-      "summary": "Generated PRD.md"
-    }
-  ]
-}
-```
-
-### GET /api/artifacts/{artifact_id}
-
-Read an artifact. The response may include Markdown content but must not expose server-local absolute paths.
-
-```json
-{
+  "taskId": "task_abc123",
   "artifact_id": "artifact_task_abc123_001",
-  "task_id": "task_abc123",
+  "artifactId": "artifact_task_abc123_001",
   "name": "PRD.md",
   "version": 1,
-  "content_type": "text/markdown",
-  "created_by": "Writer",
-  "summary": "Generated PRD.md",
-  "content": "# 工单升级 PRD\n"
+  "title": "积分防刷网关",
+  "content": "# 积分防刷网关 PRD\n"
 }
 ```
 
-### PUT /api/artifacts/{artifact_id}
+### `PUT /api/tasks/{task_id}/document`
 
-Update an artifact from the frontend editor. Backend must create a backup before writing a new version. Phase 1 keeps idempotent same-name writes; later phases should increment version when content changes.
-
-Request:
+保存文档内容。若已有 artifact，会先备份旧版本再更新内容。
 
 ```json
 {
@@ -254,11 +193,17 @@ Request:
 }
 ```
 
-### POST /api/materials
+### `GET /api/artifacts/{artifact_id}`
 
-Upload a material into the material library. Uploads do not directly write trusted knowledge.
+读取单个 artifact，响应中可包含 Markdown 内容，但不会返回服务器本地绝对路径。
 
-Response:
+### `PUT /api/artifacts/{artifact_id}`
+
+更新单个 artifact。行为和任务文档保存一致：先备份、再更新。
+
+### `POST /api/materials`
+
+上传材料文件，返回 `material_id` 和安全摘要。
 
 ```json
 {
@@ -268,43 +213,47 @@ Response:
 }
 ```
 
-### GET /api/knowledge
+### `GET /api/knowledge/health`
 
-List frontend knowledge cards. Phase 1 returns safe summaries only, never full local paths or raw private materials.
+返回当前知识检索健康状态。
 
-### POST /api/knowledge
+### `GET /api/knowledge`
 
-Create a candidate knowledge item. Upload parsing into trusted knowledge remains a later Tool-mediated flow.
+返回知识卡片列表，只包含安全摘要。
 
-### GET /api/rules?status=pending|approved|rejected
+### `POST /api/knowledge`
 
-List Diff Agent candidate or reviewed rules for the rule audit page. Candidate rules are not written to approved trusted memory until explicitly approved.
+创建候选知识卡片数据。当前不会直接写入可信知识存储。
 
-### POST /api/rules/{rule_id}/approve
+### `GET /api/rules?status=pending|approved|rejected`
 
-Approve a candidate rule, optionally with edited content.
+返回规则页面使用的规则卡片列表。
 
-### POST /api/rules/{rule_id}/reject
+### `POST /api/rules/{rule_id}/approve`
 
-Reject a candidate rule.
+批准规则卡片，可附带编辑后的内容。
 
-### GET /api/recycle
+### `POST /api/rules/{rule_id}/reject`
 
-List soft-deleted demo items for the recycle bin.
+拒绝规则卡片。
 
-### POST /api/recycle/{item_id}/restore
+### `GET /api/recycle`
 
-Restore a soft-deleted item.
+返回已软删除任务和演示回收站项。
 
-### DELETE /api/recycle/{item_id}
+### `POST /api/recycle/{item_id}/restore`
 
-Permanently delete a soft-deleted item. Phase 1 endpoint is a demo surface and does not delete user materials or outputs.
+恢复回收站项或软删除任务。
 
-### GET /api/conversations/recent
+### `DELETE /api/recycle/{item_id}`
 
-Return recent task links for the sidebar.
+永久删除回收站项；对任务会删除任务目录。
 
-## 4. Task Request Examples
+### `GET /api/conversations/recent`
+
+返回左侧任务栏最近任务分组，按最后活跃时间倒序排列，不截断为固定 10 条。
+
+## Task Request Examples
 
 ### manual
 
@@ -334,9 +283,9 @@ Return recent task links for the sidebar.
 }
 ```
 
-## 5. Event Examples
+## Event Examples
 
-### arbitration.requested
+### `arbitration.requested`
 
 ```json
 {
@@ -381,7 +330,7 @@ Return recent task links for the sidebar.
 }
 ```
 
-### arbitration.applied
+### `arbitration.applied`
 
 ```json
 {
@@ -398,7 +347,7 @@ Return recent task links for the sidebar.
 }
 ```
 
-### workflow.step.started
+### `workflow.step.started`
 
 ```json
 {
@@ -415,124 +364,11 @@ Return recent task links for the sidebar.
 }
 ```
 
-### workflow.step.completed
-
-```json
-{
-  "id": "evt_000005",
-  "task_id": "task_abc123",
-  "type": "workflow.step.completed",
-  "role": "PM",
-  "status": "succeeded",
-  "payload": {
-    "step_id": "pm_draft",
-    "summary": "PM completed"
-  },
-  "created_at": "2026-05-30T06:00:01+00:00"
-}
-```
-
-### workflow.step.failed
-
-```json
-{
-  "id": "evt_000009",
-  "task_id": "task_abc123",
-  "type": "workflow.step.failed",
-  "role": "Reviewer",
-  "status": "failed",
-  "payload": {
-    "step_id": "reviewer_gate",
-    "error": {
-      "code": "gate.failed",
-      "message": "目标一致性未通过"
-    }
-  },
-  "created_at": "2026-05-30T06:00:02+00:00"
-}
-```
-
-### tool.call.started
-
-```json
-{
-  "id": "evt_000002",
-  "task_id": "task_abc123",
-  "type": "tool.call.started",
-  "role": "SYSTEM",
-  "status": "started",
-  "payload": {
-    "tool_name": "knowledge.retrieve",
-    "step_id": "retrieve_knowledge",
-    "role": "SYSTEM",
-    "summary": "started"
-  },
-  "created_at": "2026-05-30T06:00:00+00:00"
-}
-```
-
-### tool.call.completed
-
-```json
-{
-  "id": "evt_000003",
-  "task_id": "task_abc123",
-  "type": "tool.call.completed",
-  "role": "SYSTEM",
-  "status": "succeeded",
-  "payload": {
-    "tool_name": "knowledge.retrieve",
-    "step_id": "retrieve_knowledge",
-    "role": "SYSTEM",
-    "summary": "knowledge retrieved"
-  },
-  "created_at": "2026-05-30T06:00:00+00:00"
-}
-```
-
-### tool.call.failed
+### `artifact.created`
 
 ```json
 {
   "id": "evt_000030",
-  "task_id": "task_abc123",
-  "type": "tool.call.failed",
-  "role": "SYSTEM",
-  "status": "failed",
-  "payload": {
-    "tool_name": "material.parse",
-    "step_id": "ingest_materials",
-    "role": "SYSTEM",
-    "summary": "unsupported file type"
-  },
-  "created_at": "2026-05-30T06:00:00+00:00"
-}
-```
-
-### tool.call.denied
-
-```json
-{
-  "id": "evt_000031",
-  "task_id": "task_abc123",
-  "type": "tool.call.denied",
-  "role": "PM",
-  "status": "denied",
-  "payload": {
-    "tool_name": "artifact.write",
-    "step_id": "pm_draft",
-    "role": "PM",
-    "summary": "PM cannot call artifact.write in pm_draft"
-  },
-  "created_at": "2026-05-30T06:00:00+00:00"
-}
-```
-
-### artifact.created
-
-```json
-{
-  "id": "evt_000040",
   "task_id": "task_abc123",
   "type": "artifact.created",
   "role": "Writer",
@@ -542,44 +378,6 @@ Return recent task links for the sidebar.
     "name": "PRD.md",
     "version": 1
   },
-  "created_at": "2026-05-30T06:00:03+00:00"
+  "created_at": "2026-05-30T06:05:00+00:00"
 }
 ```
-
-### task.failed
-
-```json
-{
-  "id": "evt_000050",
-  "task_id": "task_abc123",
-  "type": "task.failed",
-  "status": "failed",
-  "payload": {
-    "step_id": "reviewer_gate"
-  },
-  "created_at": "2026-05-30T06:00:04+00:00"
-}
-```
-
-### task.cancelled
-
-```json
-{
-  "id": "evt_000051",
-  "task_id": "task_abc123",
-  "type": "task.cancelled",
-  "status": "cancelled",
-  "payload": {
-    "reason": "user_cancelled"
-  },
-  "created_at": "2026-05-30T06:00:04+00:00"
-}
-```
-
-## 6. Frontend Integration Notes
-
-- Create task with `POST /api/tasks`, then call `POST /api/tasks/{task_id}/run`.
-- Subscribe to `GET /api/tasks/{task_id}/events`; render UI from event type, role, status and payload.
-- When `arbitration.requested` arrives, show `dispute_package.options` and post the user's decision to `/decisions`.
-- Use `/artifacts` and `/api/artifacts/{artifact_id}` for the file tree and Markdown editor.
-- Do not read backend filesystem paths, Python logs, or old `[__CHAT_MSG_START__|PM]` markers.
