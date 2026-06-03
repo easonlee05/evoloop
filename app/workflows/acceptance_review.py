@@ -20,7 +20,8 @@ from app.core.review import (
     ReviewResult,
     ReviewVerdict,
 )
-from app.core.task import TaskDefinition, WorkflowSpec, WorkflowStep
+from app.core.errors import DomainError
+from app.core.task import StepResult, StepStatus, Task, TaskDefinition, WorkflowSpec, WorkflowStep
 from app.workflows.policies import build_default_tool_policy
 
 
@@ -43,11 +44,12 @@ def build_acceptance_review_definition(public_task_type: str = "acceptance_revie
             ),
             WorkflowStep(id="review_gate", type="gate", title="验收门禁判断", role="Reviewer"),
             WorkflowStep(
-                id="writer_scene_docs",
+                id="writer_review_result",
                 type="artifact",
                 title="写入 review_result.md 并校验图关系",
                 role="Writer",
                 allowed_tools=["artifact.write"],
+                output_keys=["review_result"],
             ),
             WorkflowStep(id="final_checkpoint", type="checkpoint", title="保存最终 checkpoint"),
         ],
@@ -81,6 +83,9 @@ def build_acceptance_review_definition(public_task_type: str = "acceptance_revie
             "public_task_type": public_task_type,
             "is_native_3_0": True,
             "source_of_truth": "machine_spec",
+            "custom_agent_handlers": {
+                "adversarial_verify": run_adversarial_review_step,
+            },
         },
     )
 
@@ -177,6 +182,35 @@ class AdversarialVerificationAgent:
                 logging.getLogger(__name__).warning(f"Adversarial Learning loop failed: {e}")
 
         return result
+
+
+def build_review_result_from_inputs(task_id: str, inputs: dict[str, object]) -> ReviewResult:
+    """Build a ReviewResult from acceptance-review task inputs."""
+    return AdversarialVerificationAgent(
+        work_id=task_id,
+        machine_spec_ref=f"memory://tasks/{task_id}/machine_spec",
+        acceptance_protocol_ref=f"memory://tasks/{task_id}/acceptance_protocol",
+    ).verify(
+        machine_spec=str(inputs.get("machine_spec", "")),
+        acceptance_protocol=str(inputs.get("acceptance_protocol", "")),
+        implementation_summary=str(inputs.get("implementation_summary", "")),
+        diff=str(inputs.get("diff", "")),
+    )
+
+
+def run_adversarial_review_step(task: Task, step: WorkflowStep) -> StepResult:
+    """Build structured review output for the acceptance-review agent step."""
+    review_result = build_review_result_from_inputs(task.task_id, task.context.inputs)
+    return StepResult(
+        step.id,
+        StepStatus.SUCCEEDED,
+        f"{step.role} completed",
+        outputs={
+            "content": review_result.summary,
+            "review_result": review_result.to_dict(),
+            "structured": {"role": step.role, "verdict": review_result.verdict.value},
+        },
+    )
 
 
 def serialize_review_result(result: ReviewResult) -> str:
@@ -297,3 +331,21 @@ def verify_and_update_artifact_graph(
     graph.validate()
     return graph
 
+
+def render_review_result_artifact(task: Task) -> str:
+    """Serialize the earlier adversarial review output and validate graph linkage."""
+    review_payload = task.context.step_outputs.get("adversarial_verify", {}).get("review_result")
+    if not isinstance(review_payload, dict):
+        raise DomainError(
+            "workflow.acceptance_review_missing_result",
+            "Acceptance review artifact writer requires review_result output from adversarial_verify.",
+        )
+
+    review_result = ReviewResult.from_dict(review_payload)
+    verify_and_update_artifact_graph(
+        work_id=task.task_id,
+        machine_spec_ref=review_result.machine_spec_ref,
+        review_result_ref=f"memory://tasks/{task.task_id}/review_result.md",
+        acceptance_protocol_ref=review_result.acceptance_protocol_ref,
+    )
+    return serialize_review_result(review_result)

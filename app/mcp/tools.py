@@ -18,8 +18,8 @@ def register_tools(mcp):
             ctx = svc.get_product_context(task_id)
             return json.dumps({
                 "objective": ctx.objective,
-                "requirements": [r.dict() for r in ctx.requirements],
-                "decisions": [d.dict() for d in ctx.user_decisions]
+                "requirements": [r.to_dict() for r in ctx.requirements],
+                "decisions": [d.to_dict() for d in ctx.user_decisions]
             }, ensure_ascii=False, indent=2)
         except Exception as e:
             return f"Error: {e}"

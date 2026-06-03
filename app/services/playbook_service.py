@@ -19,12 +19,12 @@ class PlaybookService:
         """Initialize a DAG for a native playbook and start execution."""
         dag = TaskDAG(graph_id=work_item.work_id)
         
-        # Convert playbook steps graph to DAGNodes
-        for step in playbook.step_graph:
+        # Transition stub: mirror the frozen 3.0 contract field names only.
+        for step in playbook.steps:
             node = DAGNode(
-                node_id=step.get("id", "unknown"),
-                action_type=step.get("type", "agent"),
-                dependencies=step.get("depends_on", [])
+                node_id=step.step_id,
+                action_type="agent",
+                dependencies=[],
             )
             dag.add_node(node)
             
@@ -32,7 +32,7 @@ class PlaybookService:
         self.blackboards[work_item.work_id] = Blackboard()
         
         # Write initial context to blackboard
-        self.blackboards[work_item.work_id].write("input_context", work_item.context_ref, owner_node="system")
+        self.blackboards[work_item.work_id].write("input_context_ref", work_item.product_context_ref, owner_node="system")
         work_item.status = WorkStatus.RUNNING
         
         if self.storage:

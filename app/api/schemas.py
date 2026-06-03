@@ -18,8 +18,13 @@ class CreateTaskRequest(BaseModel):
     goal: Optional[str] = None
     feature: Optional[str] = None
     business_goal: Optional[str] = None
+    business_intent: Optional[str] = None
     module_name: Optional[str] = None
     instructions: Optional[str] = None
+    machine_spec: Optional[str] = None
+    acceptance_protocol: Optional[str] = None
+    implementation_summary: Optional[str] = None
+    diff: Optional[str] = None
     constraints: List[str] = []
     preferences: List[str] = []
     material_ids: List[str] = []

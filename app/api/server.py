@@ -103,13 +103,19 @@ def create_app(task_service: TaskService | None = None):
 
     @app.post("/api/tasks")
     def create_task(request: CreateTaskRequest) -> Dict[str, Any]:
-        payload = request.dict(exclude_none=True) if hasattr(request, "dict") else dict(request)  # pydantic v1 fallback
+        payload = request.model_dump(exclude_none=True) if hasattr(request, "model_dump") else request.dict(exclude_none=True)  # pydantic v1 fallback
         normalized = _normalize_create_payload(payload)
         try:
             task = service.create_task(normalized.pop("type"), normalized)
             
             def update_title_async():
-                prompt = (payload.get("prompt") or payload.get("goal") or payload.get("business_goal") or "").strip()
+                prompt = (
+                    payload.get("prompt")
+                    or payload.get("goal")
+                    or payload.get("business_goal")
+                    or payload.get("business_intent")
+                    or ""
+                ).strip()
                 if not prompt: return
                 res = service.engine.llm.invoke("System", f"请为以下任务目标取一个精简的名字（不超过10个字），直接输出名字本身，不要带标点和前缀：\n{prompt[:500]}", {})
                 if res.content and not "失败" in res.content:
@@ -127,6 +133,34 @@ def create_app(task_service: TaskService | None = None):
     @app.get("/api/tasks")
     def list_tasks() -> Dict[str, Any]:
         return {"tasks": [_frontend_task(item) for item in service.storage.list_tasks(service.registry) if not getattr(item, "is_deleted", False)]}
+
+    @app.get("/api/work-items")
+    def list_work_items() -> Dict[str, Any]:
+        tasks = [
+            item for item in service.storage.list_tasks(service.registry)
+            if not getattr(item, "is_deleted", False)
+        ]
+        return {
+            "work_items": [
+                service.get_work_item(task.task_id).to_dict()
+                for task in tasks
+            ]
+        }
+
+    @app.get("/api/work-items/{work_id}")
+    def get_work_item(work_id: str) -> Dict[str, Any]:
+        _load_task_or_404(service, work_id)
+        return service.get_work_item(work_id).to_dict()
+
+    @app.get("/api/work-items/{work_id}/product-context")
+    def get_work_item_product_context(work_id: str) -> Dict[str, Any]:
+        _load_task_or_404(service, work_id)
+        return service.get_product_context(work_id).to_dict()
+
+    @app.get("/api/work-items/{work_id}/artifact-graph")
+    def get_work_item_artifact_graph(work_id: str) -> Dict[str, Any]:
+        _load_task_or_404(service, work_id)
+        return service.get_artifact_graph(work_id).to_dict()
 
     @app.get("/api/tasks/{task_id}")
     def get_task(task_id: str) -> Dict[str, Any]:
@@ -418,6 +452,19 @@ def _normalize_create_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if task_type == "manual":
         normalized["module_name"] = payload.get("module_name") or payload.get("title") or _title_from_prompt(prompt, "操作手册")
         normalized["goal"] = payload.get("goal") or prompt or f"生成{normalized['module_name']}操作手册"
+    elif task_type == "spec_to_agent":
+        normalized["business_intent"] = (
+            payload.get("business_intent")
+            or payload.get("prompt")
+            or payload.get("goal")
+            or payload.get("business_goal")
+            or ""
+        )
+    elif task_type == "acceptance_review":
+        normalized["machine_spec"] = payload.get("machine_spec") or ""
+        normalized["acceptance_protocol"] = payload.get("acceptance_protocol") or ""
+        normalized["implementation_summary"] = payload.get("implementation_summary") or ""
+        normalized["diff"] = payload.get("diff") or ""
     else:
         normalized["feature"] = payload.get("feature") or payload.get("title") or _title_from_prompt(prompt, "PRD")
         normalized["business_goal"] = payload.get("business_goal") or payload.get("goal") or prompt or f"梳理{normalized['feature']}业务诉求"

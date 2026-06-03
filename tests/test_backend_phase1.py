@@ -1,10 +1,13 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+import json
 
 from fastapi.testclient import TestClient
 
-from app.api.server import create_app
+from app.api.server import build_default_task_service, create_app
+from app.core.artifact_graph import ArtifactNodeType
 from app.core.ports import LLMResult
 from app.core.task import TaskStatus
 from app.core.tools import ToolCall
@@ -13,6 +16,7 @@ from app.services.task_service import TaskService
 from app.services.tool_service import ToolService
 from app.workflows.definitions import build_task_registry
 from app.workflows.engine import WorkflowEngine
+from app.mcp.tools import register_tools
 
 
 class BackendPhase1Tests(unittest.TestCase):
@@ -26,6 +30,230 @@ class BackendPhase1Tests(unittest.TestCase):
         service = TaskService(registry=registry, engine=engine, storage=storage)
         self.addCleanup(temp.cleanup)
         return service, storage, tool_service
+
+    def test_default_registry_exposes_native_3_0_playbooks(self):
+        registry = build_task_registry()
+
+        self.assertIn("spec_to_agent", registry)
+        self.assertIn("acceptance_review", registry)
+
+    def test_default_task_service_can_create_native_tasks(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        service = build_default_task_service(root=Path(temp.name))
+
+        task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "编译登录需求",
+            },
+        )
+
+        self.assertEqual(task.definition.type, "spec_to_agent")
+
+    def test_create_task_api_accepts_spec_to_agent_business_intent(self):
+        service, _, _ = self.make_service()
+        client = TestClient(create_app(service))
+
+        response = client.post(
+            "/api/tasks",
+            json={
+                "type": "spec_to_agent",
+                "username": "alice",
+                "business_intent": "编译登录需求",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        task = service.get_task(response.json()["task_id"])
+        self.assertEqual(task.definition.type, "spec_to_agent")
+        self.assertEqual(task.context.inputs["business_intent"], "编译登录需求")
+
+    def test_create_task_api_accepts_acceptance_review_payload(self):
+        service, _, _ = self.make_service()
+        client = TestClient(create_app(service))
+
+        response = client.post(
+            "/api/tasks",
+            json={
+                "type": "acceptance_review",
+                "username": "alice",
+                "machine_spec": "req_login: 用户必须能登录",
+                "acceptance_protocol": "case_login: 校验登录成功",
+                "implementation_summary": "已完成登录接口与前端流程",
+                "diff": "+ add login handler",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        task = service.get_task(response.json()["task_id"])
+        self.assertEqual(task.definition.type, "acceptance_review")
+        self.assertEqual(task.context.inputs["machine_spec"], "req_login: 用户必须能登录")
+        self.assertEqual(task.context.inputs["acceptance_protocol"], "case_login: 校验登录成功")
+        self.assertEqual(task.context.inputs["implementation_summary"], "已完成登录接口与前端流程")
+        self.assertEqual(task.context.inputs["diff"], "+ add login handler")
+
+    def test_default_app_wiring_accepts_native_spec_to_agent_post(self):
+        class FakeDefaultLLM(FakeLLM):
+            def __init__(self, api_key="", base_url=""):
+                self.api_key = api_key
+                self.base_url = base_url
+
+        class FakeDefaultKnowledge(FakeKnowledge):
+            def __init__(self, repo_path, timeout_seconds=5):
+                self.repo_path = repo_path
+                self.timeout_seconds = timeout_seconds
+
+        with patch("app.api.server.OpenAILLM", FakeDefaultLLM), patch("app.api.server.GBrainKnowledge", FakeDefaultKnowledge):
+            client = TestClient(create_app())
+            response = client.post(
+                "/api/tasks",
+                json={
+                    "type": "spec_to_agent",
+                    "username": "alice",
+                    "business_intent": "编译登录需求",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("task_id", payload)
+        self.assertEqual(payload["status"], "created")
+
+    def test_product_context_and_mcp_context_serialize_native_requirements(self):
+        service, _, _ = self.make_service()
+        task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "将登录需求编译成 agent 可执行任务包",
+            },
+        )
+        context = service.get_product_context(task.task_id)
+        self.assertEqual(context.requirements[0].statement, "将登录需求编译成 agent 可执行任务包")
+
+        class DummyMCP:
+            def __init__(self):
+                self.funcs = {}
+
+            def tool(self):
+                def decorator(fn):
+                    self.funcs[fn.__name__] = fn
+                    return fn
+                return decorator
+
+        dummy = DummyMCP()
+        register_tools(dummy)
+        with patch("app.mcp.tools.get_service", return_value=service):
+            payload = json.loads(dummy.funcs["get_project_context"](task.task_id))
+
+        self.assertEqual(payload["requirements"][0]["statement"], "将登录需求编译成 agent 可执行任务包")
+
+    def test_native_artifact_graph_uses_native_node_types(self):
+        service, _, _ = self.make_service()
+        task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "将登录需求编译成 agent 可执行任务包",
+            },
+        )
+        service.run_task(task.task_id)
+
+        graph = service.get_artifact_graph(task.task_id)
+        node_types_by_name = {node.artifact_ref.name: node.type for node in graph.nodes}
+
+        self.assertEqual(node_types_by_name["machine_spec.yaml"], ArtifactNodeType.MACHINE_SPEC)
+        self.assertEqual(node_types_by_name["human_brief.md"], ArtifactNodeType.HUMAN_BRIEF)
+        self.assertEqual(node_types_by_name["agent_package_codex.md"], ArtifactNodeType.AGENT_PACKAGE)
+        self.assertEqual(node_types_by_name["acceptance.md"], ArtifactNodeType.ACCEPTANCE_PROTOCOL)
+        self.assertEqual(node_types_by_name["review_checklist.md"], ArtifactNodeType.REVIEW_CHECKLIST)
+        self.assertEqual(node_types_by_name["traceability.json"], ArtifactNodeType.TRACEABILITY_MAP)
+
+    def test_work_items_api_lists_native_and_legacy_work(self):
+        service, _, _ = self.make_service()
+        native_task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "将登录需求编译成 agent 可执行任务包",
+            },
+        )
+        legacy_task = service.create_task(
+            "prd",
+            {
+                "username": "alice",
+                "feature": "积分防刷网关",
+                "business_goal": "降低异常积分套利",
+            },
+        )
+
+        client = TestClient(create_app(service))
+        response = client.get("/api/work-items")
+
+        self.assertEqual(response.status_code, 200)
+        work_items = {item["work_id"]: item for item in response.json()["work_items"]}
+        self.assertEqual(work_items[native_task.task_id]["work_type"], "spec_to_agent")
+        self.assertEqual(work_items[legacy_task.task_id]["work_type"], "legacy_prd")
+
+    def test_work_item_detail_api_returns_frozen_contract_payload(self):
+        service, _, _ = self.make_service()
+        task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "将登录需求编译成 agent 可执行任务包",
+            },
+        )
+
+        client = TestClient(create_app(service))
+        response = client.get(f"/api/work-items/{task.task_id}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["work_id"], task.task_id)
+        self.assertEqual(payload["work_type"], "spec_to_agent")
+        self.assertEqual(payload["product_context_ref"], f"ctx_{task.task_id}")
+
+    def test_work_item_product_context_api_returns_native_requirement(self):
+        service, _, _ = self.make_service()
+        task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "将登录需求编译成 agent 可执行任务包",
+            },
+        )
+
+        client = TestClient(create_app(service))
+        response = client.get(f"/api/work-items/{task.task_id}/product-context")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["requirements"][0]["statement"], "将登录需求编译成 agent 可执行任务包")
+
+    def test_work_item_artifact_graph_api_returns_native_node_types(self):
+        service, _, _ = self.make_service()
+        task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "将登录需求编译成 agent 可执行任务包",
+            },
+        )
+        service.run_task(task.task_id)
+
+        client = TestClient(create_app(service))
+        response = client.get(f"/api/work-items/{task.task_id}/artifact-graph")
+
+        self.assertEqual(response.status_code, 200)
+        node_types_by_name = {
+            node["artifact_ref"]["name"]: node["type"]
+            for node in response.json()["nodes"]
+        }
+        self.assertEqual(node_types_by_name["machine_spec.yaml"], "machine_spec")
+        self.assertEqual(node_types_by_name["agent_package_codex.md"], "agent_package")
 
     def test_workflow_step_status_flow_completes_prd(self):
         service, storage, _ = self.make_service()

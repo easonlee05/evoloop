@@ -17,6 +17,7 @@ from app.core.review import (
     ReviewResult, RequirementCoverage, ReviewIssue, ReviewFixTask,
     ReviewVerdict, ReviewIssueSeverity
 )
+from app.services.playbook_service import PlaybookService
 
 
 class TestContractsLane(unittest.TestCase):
@@ -228,6 +229,37 @@ class TestContractsLane(unittest.TestCase):
         with self.assertRaises(ArtifactGraphValidationError) as context:
             graph.validate()
         self.assertIn("is invalid because the source of truth cannot derive from", str(context.exception))
+
+    def test_playbook_service_uses_frozen_contract_field_names(self):
+        item = WorkItem(
+            work_type=WorkType.SPEC_TO_AGENT,
+            playbook_id="playbook_v3_spec",
+            title="Spec Work",
+            objective="Compile intent",
+            workspace_id="workspace_1",
+            product_context_ref="ctx_ref_001",
+            artifact_graph_ref="graph_ref_001",
+        )
+        playbook = Playbook(
+            playbook_id="playbook_v3_spec",
+            version="3.0",
+            trigger_types=["intent"],
+            steps=[
+                PlaybookStep(
+                    step_id="step_1",
+                    title="Step One",
+                    purpose="Generate Spec",
+                    next_step_ids=["step_2"],
+                )
+            ],
+        )
+
+        service = PlaybookService()
+        service.start_playbook(item, playbook)
+
+        self.assertIn(item.work_id, service.active_dags)
+        self.assertIn(item.work_id, service.blackboards)
+        self.assertEqual(item.status, WorkStatus.RUNNING)
 
 
 if __name__ == "__main__":

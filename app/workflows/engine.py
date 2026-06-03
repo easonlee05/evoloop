@@ -1,6 +1,7 @@
 """Generic WorkflowEngine for TaskDefinition-driven task execution."""
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -10,6 +11,7 @@ from app.core.errors import DomainError
 from app.core.events import Event
 from app.core.task import StepResult, StepStatus, Task, TaskStatus, WorkflowStep
 from app.core.tools import ToolCall
+from app.workflows.acceptance_review import render_review_result_artifact
 
 
 class WorkflowEngine:
@@ -266,6 +268,26 @@ class WorkflowEngine:
         return StepResult(step.id, StepStatus.SUCCEEDED, "context ready", outputs={"goal": task.context.goal})
 
     def _run_agent_step(self, task: Task, step: WorkflowStep, is_parallel: bool = False, run_id: Optional[str] = None) -> StepResult:
+        custom_handler = task.definition.metadata.get("custom_agent_handlers", {}).get(step.id)
+        if callable(custom_handler):
+            result = custom_handler(task, step)
+            if result.status == StepStatus.SUCCEEDED:
+                content = str(result.outputs.get("content", result.summary))
+                structured = result.outputs.get("structured", {"role": step.role})
+                task.context.round_history.append(
+                    {"step_id": step.id, "role": step.role, "content": content, "structured": structured}
+                )
+                self.storage.append_event(
+                    Event(
+                        task_id=task.task_id,
+                        type="agent.message.completed",
+                        role=step.role,
+                        status="completed",
+                        payload={"step_id": step.id, "summary": content[:160], "content": content},
+                    )
+                )
+            return result
+
         full_content = ""
         structured = {"role": step.role, "title": task.context.title, "goal": task.context.goal}
         telemetry = self._llm_telemetry(task.task_id, step, run_id)
@@ -433,13 +455,19 @@ class WorkflowEngine:
         }
 
     def _run_artifact_step(self, task: Task, step: WorkflowStep) -> StepResult:
-        output = task.context.step_outputs.get("writer_final_prd" if task.definition.type == "prd" else "writer_scene_docs", {})
-        if output.get("artifact_name") and output.get("artifact_content"):
-            name, content = output["artifact_name"], output["artifact_content"]
-        elif task.definition.type == "prd":
-            name, content = "PRD.md", self._render_prd(task)
+        if task.definition.metadata.get("is_native_3_0"):
+            try:
+                name, content = self._native_artifact_payload(task, step)
+            except DomainError as error:
+                return StepResult(step.id, StepStatus.FAILED, error=error)
         else:
-            name, content = "模块概览.md", self._render_manual(task)
+            output = task.context.step_outputs.get("writer_final_prd" if task.definition.type == "prd" else "writer_scene_docs", {})
+            if output.get("artifact_name") and output.get("artifact_content"):
+                name, content = output["artifact_name"], output["artifact_content"]
+            elif task.definition.type == "prd":
+                name, content = "PRD.md", self._render_prd(task)
+            else:
+                name, content = "模块概览.md", self._render_manual(task)
         call = ToolCall(task_id=task.task_id, step_id=step.id, agent_role=step.role, tool_name="artifact.write", arguments={"name": name, "content": content})
         result = self.tool_service.invoke(task.definition, task.context, call)
         if result.status != "succeeded":
@@ -554,3 +582,107 @@ class WorkflowEngine:
 
     def _render_manual(self, task: Task) -> str:
         return f"# {task.context.title} 操作手册\n\n## 模块目标\n{task.context.goal}\n\n## 操作路径\n- 按用户材料和平台知识补全。\n"
+
+    def _native_artifact_payload(self, task: Task, step: WorkflowStep) -> tuple[str, str]:
+        if len(step.output_keys) != 1:
+            raise DomainError(
+                "workflow.native_artifact_contract_invalid",
+                f"Native artifact step {step.id} must declare exactly one output_key.",
+            )
+        artifact_key = step.output_keys[0]
+        artifact_name = task.definition.output_spec.get(artifact_key)
+        if not artifact_name:
+            raise DomainError(
+                "workflow.native_artifact_contract_missing_name",
+                f"Native artifact key {artifact_key} is missing from output_spec for {task.definition.type}.",
+            )
+        renderers = {
+            "machine_spec": self._render_machine_spec,
+            "human_brief": self._render_human_brief,
+            "agent_package": self._render_agent_package,
+            "acceptance": self._render_acceptance,
+            "review_checklist": self._render_review_checklist,
+            "traceability": self._render_traceability,
+            "review_result": render_review_result_artifact,
+        }
+        renderer = renderers.get(artifact_key)
+        if not renderer:
+            raise DomainError(
+                "workflow.native_artifact_renderer_missing",
+                f"No native renderer registered for artifact key {artifact_key}.",
+            )
+        return artifact_name, renderer(task)
+
+    def _render_machine_spec(self, task: Task) -> str:
+        business_intent = task.context.inputs.get("business_intent") or task.context.goal
+        constraints = task.context.user_constraints or ["none"]
+        return "\n".join(
+            [
+                f"work_id: {task.task_id}",
+                f"title: {json.dumps(task.context.title, ensure_ascii=False)}",
+                f"objective: {json.dumps(task.context.goal, ensure_ascii=False)}",
+                f"business_intent: {json.dumps(business_intent, ensure_ascii=False)}",
+                "requirements:",
+                f"  - id: req_primary",
+                f"    statement: {json.dumps(str(business_intent), ensure_ascii=False)}",
+                "constraints:",
+                *[f"  - {json.dumps(str(item), ensure_ascii=False)}" for item in constraints],
+            ]
+        ) + "\n"
+
+    def _render_human_brief(self, task: Task) -> str:
+        return (
+            f"# Human Brief\n\n"
+            f"## Title\n{task.context.title}\n\n"
+            f"## Objective\n{task.context.goal}\n\n"
+            f"## Business Intent\n{task.context.inputs.get('business_intent', task.context.goal)}\n"
+        )
+
+    def _render_agent_package(self, task: Task) -> str:
+        return (
+            f"# Agent Package For Codex\n\n"
+            f"- Work ID: {task.task_id}\n"
+            f"- Source of Truth: `machine_spec.yaml`\n"
+            f"- Objective: {task.context.goal}\n"
+            f"- Primary Requirement: {task.context.inputs.get('business_intent', task.context.goal)}\n"
+        )
+
+    def _render_acceptance(self, task: Task) -> str:
+        return (
+            f"# Acceptance Protocol\n\n"
+            f"## Required Outcome\n{task.context.goal}\n\n"
+            f"## Checks\n"
+            f"- Machine spec can be traced to the stated business intent.\n"
+            f"- Agent package stays aligned with the machine spec.\n"
+            f"- Reviewer can validate the delivered work against this protocol.\n"
+        )
+
+    def _render_review_checklist(self, task: Task) -> str:
+        return (
+            f"# Review Checklist\n\n"
+            f"- [ ] `machine_spec.yaml` reflects `{task.context.inputs.get('business_intent', task.context.goal)}`.\n"
+            f"- [ ] `human_brief.md` is readable by stakeholders.\n"
+            f"- [ ] `agent_package_codex.md` is executable by downstream workers.\n"
+            f"- [ ] `acceptance.md` defines clear pass/fail checks.\n"
+            f"- [ ] `traceability.json` anchors outputs back to `req_primary`.\n"
+        )
+
+    def _render_traceability(self, task: Task) -> str:
+        payload = {
+            "work_id": task.task_id,
+            "source_of_truth": "machine_spec.yaml",
+            "requirements": [
+                {
+                    "requirement_id": "req_primary",
+                    "statement": task.context.inputs.get("business_intent", task.context.goal),
+                    "artifacts": [
+                        "machine_spec.yaml",
+                        "human_brief.md",
+                        "agent_package_codex.md",
+                        "acceptance.md",
+                        "review_checklist.md",
+                    ],
+                }
+            ],
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)

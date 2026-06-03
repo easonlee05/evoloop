@@ -197,12 +197,16 @@ class TaskService:
         ))
         
         requirements = []
-        primary_feature = ctx.inputs.get("feature") or ctx.inputs.get("module_name")
+        primary_feature = (
+            ctx.inputs.get("feature")
+            or ctx.inputs.get("module_name")
+            or ctx.inputs.get("business_intent")
+        )
         if primary_feature:
             requirements.append(
                 Requirement(
                     requirement_id="req_primary",
-                    statement=f"Feature/Module: {primary_feature}",
+                    statement=str(primary_feature),
                     priority="must",
                     rationale=ctx.goal
                 )
@@ -284,28 +288,62 @@ class TaskService:
         
         nodes = []
         edges = []
-        
-        spec_node_id = f"node_spec_{task.task_id}"
-        nodes.append(ArtifactNode(
-            node_id=spec_node_id,
-            type=ArtifactNodeType.MACHINE_SPEC,
-            artifact_ref=ArtifactRef(
-                name="machine_spec",
-                storage_uri=f"memory://tasks/{task.task_id}/inputs"
-            ),
-            summary="Original task inputs and specifications",
-            created_by="system"
-        ))
-        
-        projection_type_str = task.definition.metadata.get("legacy_projection")
-        node_type = ArtifactNodeType.OPTIONAL_PRD
-        if projection_type_str == "optional_prd":
-            node_type = ArtifactNodeType.OPTIONAL_PRD
-        elif projection_type_str == "optional_manual":
-            node_type = ArtifactNodeType.OPTIONAL_MANUAL
-            
+
+        native_type_map = {
+            "machine_spec.yaml": ArtifactNodeType.MACHINE_SPEC,
+            "human_brief.md": ArtifactNodeType.HUMAN_BRIEF,
+            "agent_package_codex.md": ArtifactNodeType.AGENT_PACKAGE,
+            "acceptance.md": ArtifactNodeType.ACCEPTANCE_PROTOCOL,
+            "review_checklist.md": ArtifactNodeType.REVIEW_CHECKLIST,
+            "traceability.json": ArtifactNodeType.TRACEABILITY_MAP,
+            "review_result.md": ArtifactNodeType.REVIEW_RESULT,
+            "PRD.md": ArtifactNodeType.OPTIONAL_PRD,
+            "模块概览.md": ArtifactNodeType.OPTIONAL_MANUAL,
+        }
+        edge_type_map = {
+            ArtifactNodeType.ACCEPTANCE_PROTOCOL: ArtifactEdgeType.VALIDATES,
+            ArtifactNodeType.REVIEW_RESULT: ArtifactEdgeType.REVIEWS,
+        }
+
+        spec_node_id = None
+        spec_artifact = next((art for art in ctx.artifacts if native_type_map.get(art.name) == ArtifactNodeType.MACHINE_SPEC), None)
+        if spec_artifact:
+            spec_node_id = f"node_art_{spec_artifact.artifact_id}"
+            nodes.append(ArtifactNode(
+                node_id=spec_node_id,
+                type=ArtifactNodeType.MACHINE_SPEC,
+                artifact_ref=ArtifactRef(
+                    name=spec_artifact.name,
+                    version=spec_artifact.version,
+                    storage_uri=f"file://artifacts/{spec_artifact.artifact_id}",
+                    checksum=getattr(spec_artifact, "checksum", None),
+                ),
+                summary="Native machine spec artifact",
+                created_by=spec_artifact.created_by or "system",
+            ))
+        else:
+            spec_node_id = f"node_spec_{task.task_id}"
+            nodes.append(ArtifactNode(
+                node_id=spec_node_id,
+                type=ArtifactNodeType.MACHINE_SPEC,
+                artifact_ref=ArtifactRef(
+                    name="machine_spec",
+                    storage_uri=f"memory://tasks/{task.task_id}/inputs"
+                ),
+                summary="Original task inputs and specifications",
+                created_by="system"
+            ))
+
         for art in ctx.artifacts:
+            if spec_artifact and art.artifact_id == spec_artifact.artifact_id:
+                continue
             art_node_id = f"node_art_{art.artifact_id}"
+            node_type = native_type_map.get(art.name)
+            if node_type is None:
+                projection_type_str = task.definition.metadata.get("legacy_projection")
+                node_type = ArtifactNodeType.OPTIONAL_PRD
+                if projection_type_str == "optional_manual":
+                    node_type = ArtifactNodeType.OPTIONAL_MANUAL
             nodes.append(ArtifactNode(
                 node_id=art_node_id,
                 type=node_type,
@@ -315,7 +353,7 @@ class TaskService:
                     storage_uri=f"file://artifacts/{art.artifact_id}",
                     checksum=getattr(art, "checksum", None)
                 ),
-                summary=f"Legacy artifact: {art.name}",
+                summary=f"Artifact: {art.name}",
                 created_by=art.created_by or "system"
             ))
             
@@ -323,8 +361,8 @@ class TaskService:
                 edge_id=f"edge_derive_{art.artifact_id}",
                 from_node_id=art_node_id,
                 to_node_id=spec_node_id,
-                type=ArtifactEdgeType.DERIVES_FROM,
-                summary="Legacy projection derives from machine spec"
+                type=edge_type_map.get(node_type, ArtifactEdgeType.DERIVES_FROM),
+                summary=f"{art.name} is linked to machine spec"
             ))
             
         for idx, dec in enumerate(ctx.user_decisions):
