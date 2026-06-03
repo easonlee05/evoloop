@@ -14,7 +14,9 @@
 
 ```text
 AGENT_MAP.md
-docs/refactor/api-contract.md
+docs/evoloop-3.0/architecture/00-global-architecture.md
+docs/evoloop-3.0/technical/00-evolution-roadmap.md
+docs/evoloop-3.0/technical/01-parallel-development-boundaries.md
 app/core/task.py
 app/workflows/engine.py
 app/workflows/definitions.py
@@ -34,10 +36,11 @@ app/格式.md       # manual 格式规范迁移资产
 
 ## 前端/Antigravity 对接
 
-前端只消费 API/SSE 契约：
+前端和实现方应优先参考 3.0 主线文档：
 
 ```text
-docs/refactor/api-contract.md
+docs/evoloop-3.0/architecture/00-global-architecture.md
+docs/evoloop-3.0/technical/00-evolution-roadmap.md
 ```
 
 首期接口：

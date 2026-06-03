@@ -1,6 +1,6 @@
 # PM-Agent Platform Backend
 
-这是后端重构 worktree。目标是把项目重构为以 PM-Agent 为核心的双产品线平台，首批支持：
+这是后端重构 worktree。目标是把项目重构为 Evoloop 3.0 数字产品经理系统。现有能力仍以 1.0 基线为主：
 
 1. `manual`：操作手册编写
 2. `prd`：PRD 编写
@@ -18,8 +18,8 @@ app/
   格式.md              # manual 格式规范资产，后续迁移到受控资产层
 
 docs/
-  architecture/        # 目标架构文档
-  refactor/            # 重构计划和 API/SSE 契约
+  architecture/        # 1.0 / 历史架构参考
+  evoloop-3.0/         # 3.0 主架构与技术路线
 
 tests/                 # Phase 1 后端单元测试
 ```
@@ -33,12 +33,14 @@ tests/                 # Phase 1 后端单元测试
 - 前端只消费结构化 API/SSE 事件，不解析后端日志文本。
 - Diff 只能生成候选法则，不直接写入 approved 可信法则区。
 
-## API/SSE 契约
+## 当前主线文档
 
-后端主维护：
+优先阅读：
 
 ```text
-docs/refactor/api-contract.md
+docs/evoloop-3.0/architecture/00-global-architecture.md
+docs/evoloop-3.0/technical/00-evolution-roadmap.md
+docs/evoloop-3.0/technical/01-parallel-development-boundaries.md
 ```
 
 Antigravity 前端应优先对接：
@@ -73,4 +75,4 @@ Phase 1 已完成新后端内核骨架：
 - API skeleton
 - 单元测试覆盖状态流转、仲裁暂停恢复、checkpoint 恢复、ToolPolicy、artifact 幂等和 prd 最小工作流
 
-后续阶段再接真实 LLM、真实存储、GBrain、本地材料解析和完整 manual/prd 业务生成策略。
+后续阶段再接真实 LLM、真实存储、GBrain、本地材料解析、Spec-to-Agent、Acceptance Review 和 Worker Adapter。

@@ -50,7 +50,7 @@ npm run dev   # 默认端口 4000
 | `pages/RecycleBin/index.jsx` | `items` 数组 | `GET /api/recycle` |
 | `components/layout/Sidebar.jsx` | `recentChats`、`yesterdayChats` | `GET /api/conversations/recent` |
 
-后端 contract 以 `docs/refactor/api-contract.md` 为准。默认前端 API Base 为 `http://127.0.0.1:8000`，可用 `VITE_API_BASE` 覆盖。
+后端主线以 `docs/evoloop-3.0/architecture/00-global-architecture.md` 和 `docs/evoloop-3.0/technical/00-evolution-roadmap.md` 为准。默认前端 API Base 为 `http://127.0.0.1:8000`，可用 `VITE_API_BASE` 覆盖。
 
 ---
 
