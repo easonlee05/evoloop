@@ -186,6 +186,28 @@ WorkerAdapter
   result intake policy
 ```
 
+### 5.7 Frozen Contract Modules
+
+为了支持 lane 并行，3.0 的最小共享合同冻结在以下模块：
+
+- `app/core/work.py`
+- `app/core/playbook.py`
+- `app/core/artifact_graph.py`
+- `app/core/review.py`
+
+这些模块的职责是：
+
+- 冻结共享对象命名和最小字段
+- 冻结 `machine_spec` 作为 source of truth 的约束
+- 给 legacy bridge、native playbook、review 和 adapter lane 提供统一 import 边界
+
+这些模块明确不负责：
+
+- 不负责 runtime 执行
+- 不负责 service 编排
+- 不负责 API surface
+- 不负责 MCP / CLI 的具体接线
+
 ## 6. 分层架构
 
 ```text
@@ -232,6 +254,9 @@ Knowledge & Storage Layer
 - CLI：给本地自动化和开发流程使用。
 - MCP：给 Codex / Claude Code / Cursor 等 AI worker 使用。
 
+**情绪与挫败感侦测 (Frustration Detection)**：
+在 CLI 与 Web 通道中加入极其轻量的本地正则表达式匹配（如检测 `"wtf"`, `"not working"`, `"fails again"`, 或连续多次相同的编译/测试报错）。一旦侦测到人类用户的受挫情绪，系统会自动拦截当前 Loop，在下一轮向大模型发起请求时尾部静默追加情绪调停指令（微调沟通姿态、提供 step-by-step 澄清引导），或者直接触发 `DecisionGate` 挂起任务，防止 AI 盲目重试而陷入死循环。
+
 ### 6.2 Digital PM Control Plane
 
 这是 3.0 的核心。
@@ -245,6 +270,9 @@ Knowledge & Storage Layer
 - 生成 acceptance protocol
 - 回收执行结果并 review
 
+**对抗性校验子 Agent (Adversarial Verification Agent)**：
+在 Control Plane 的 Review 和验收阶段，系统会隐式派生出一个**只读的校验子 Agent**。该 Agent 采用对抗性设定（Adversarial Framing），默认假定主 Agent/Worker 提交的代码和产物存在逻辑缺陷、幻觉或边界漏洞。该子 Agent 不执行代码修改，仅负责“找茬”与“跑单测”，强制在 Sandbox 环境中验证被审资产对 `acceptance_protocol` 的覆盖程度。
+
 ### 6.3 State & Memory Layer
 
 2.0 中的 `TaskContext` / `Blackboard` 思想在 3.0 中继续保留，但要升级语义。
@@ -253,6 +281,12 @@ Knowledge & Storage Layer
 - `WorkingMemory`：单次 playbook / run 的工作态
 - `ArtifactGraph`：产品资产关系图
 - `LearningEvidence`：用于后续学习与知识治理
+
+**三层持久化内存架构 (Three-Layer Memory System)**：
+为了防止上下文膨胀，降低 API 费用并保证注意力聚焦，3.0 内存层划分为三级结构：
+1. **L1 - 临时工作内存 (Session Context)**：存储当前 Playbook 运行时的单轮交互记录与临时任务包 TODO。
+2. **L2 - 局部项目内存 (MEMORY.md 指针索引)**：项目根目录下维护一份严格限制在 200 行以内的全局主索引文件 `MEMORY.md`。一旦项目复杂度上升、规则增多，系统将触发 **Memory Splitting (内存切分)** 机制，强迫 Agent 将接口契约、设计规范等大块细节拆分至子目录中的细分文件（如 `memory/api-specs.md`），而在主索引中仅保留链接指针。
+3. **L3 - 全局不可变规则 (CLAUDE.md)**：项目根目录下的全局指令库，用于每次会话启动时首读，规定核心构建、测试命令和全局代码风格。
 
 ### 6.4 Tool & Governance Layer
 
@@ -299,6 +333,8 @@ implementation result
   -> acceptance verdict
   -> fix tasks
 ```
+
+在 Acceptance Review 运行阶段，链路的核心控制逻辑会加载 `acceptance_protocol`，并隐式分发给 **Adversarial Reviewer**。Reviewer 将依据规格要求，采用“默认失败”原则对 `implementation result` 与 `diff` 进行对抗式推演和安全扫描，强制运行回归单测以验证覆盖完整度。若存在偏差，则输出 `review_result.md` 与包含具体修复要求的 `fix_tasks.md`。
 
 ### 7.4 Change Impact 链路
 
@@ -371,6 +407,7 @@ decisions + artifacts + review findings
 - agent package 由它生成
 - acceptance review 以它和 `acceptance_protocol` 为准
 - `optional_prd` / `optional_manual` 只能是它的派生产物
+- `review_result`、`traceability_map` 和后续 change impact 也必须能回溯到它
 
 ### 9.3 Governance Artifact
 
@@ -423,3 +460,17 @@ decisions + artifacts + review findings
 4. 先做 AI-facing artifact，再补全文档型 artifact。
 5. MCP / CLI / Web 都只是 adapter，不得反向定义内核。
 6. 任何新增能力都要回答：它属于 control plane、state/memory、tool/governance 还是 adapter。
+
+## 12. 上下文与缓存工程原则 (Context & Cache Engineering)
+
+在设计 3.0 系统与下游 AI worker 协同的 `WorkerAdapter` 以及运行时 `WorkingMemory` 时，必须严格遵循以下上下文与缓存工程原则，以降低 API 开销、降低首字延迟并提高交互稳定性：
+
+### 12.1 粘性锁存 (Sticky Latch) 与前缀缓存最大化
+1. **静态前缀锁定**：将不可变的 `machine_spec` 框架定义、System Prompt 指令集和全局白名单工具定义（Tool Spec）作为整个消息队列的首部。
+2. **状态变动尾插**：将频繁变化的用户输入、临时决策记录 `DecisionGate` 结果及最近一轮的出错报错，严格放置在交互消息流的最末端。
+3. **Sticky Latch 状态控制**：利用 Boolean 锁存器，在整个会话中锁定前缀结构。除非遇到迫不得已的全局重置（如配置变更），否则决不微调、改动消息前半部的任何字符，以此保证大模型 Prompt Caching 的 100% 命中率。
+
+### 12.2 多级上下文压缩 (Context Compaction) 与复水 (Rehydration)
+1. **Tool Result Budget (工具输出预算)**：对所有执行的受控工具输出进行严格的字符/Token 长度限制。若发现输出溢出（例如大段测试错误、冗长文件读取或 grep 结果），自动启动 `Microcompact` 折叠，只采样头尾部分，将未压缩的原始文本持久化至本地或内存引用中。
+2. **Auto-Compaction (自动脱水总结)**：当会话整体 Token 占用率达到当前模型窗口的 90% 时，触发 LLM 总结。把以往庞杂的多轮冗长对话压缩至小于 1000 Token 的 `Session State`，交代已完成、进行中及已达成的技术规范共识。
+3. **Rehydration (上下文复水复原)**：在下一次向大模型发起新请求时，底层 adapter 重新将不可变规则（`CLAUDE.md`）、最新的 TODO 任务看板以及活跃文件快照与脱水后的 `Session State` 拼装，重构一份紧凑但信息完整的全新上下文，实现 Agent 的记忆复原。

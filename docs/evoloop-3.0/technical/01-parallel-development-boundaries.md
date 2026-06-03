@@ -46,6 +46,12 @@ freeze contracts
 - `WorkerAdapter`
 - 核心 artifact 命名：`machine_spec`、`human_brief`、`optional_prd`
 
+额外强约束：
+
+- `machine_spec` 是唯一 source of truth
+- `optional_prd` / `optional_manual` 只能作为 projection
+- `review_result` 必须可追溯回 `machine_spec`
+
 ### 2.3 worktree 隔离
 
 每个并行 agent 必须使用独立 worktree / branch。
@@ -128,6 +134,17 @@ freeze contracts
 - `app/core/review.py`
 - `docs/evoloop-3.0/**`
 
+Lane A 冻结交付物：
+
+- `WorkItem`
+- `Playbook`
+- `ProductContext`
+- `DecisionGate`
+- `ArtifactGraph`
+- `WorkerAdapter`
+- `ReviewResult`
+- `machine_spec` source-of-truth 约束
+
 禁止修改：
 
 - `app/workflows/engine.py`
@@ -184,6 +201,25 @@ freeze contracts
 
 - runtime
 - shared schema
+- legacy bridge
+
+### Lane F：Runtime & Context Optimization
+
+目标：
+
+- 实现 Sticky Latch 提示词锁定和 L1/L2 多级上下文压缩与复水，优化 Token 费用与 Prompt Caching 命中率。
+
+可写范围：
+
+- `app/services/llm.py`
+- `app/workflows/engine.py` (对 LLM 传输部分的微调优化)
+- `tests/test_runtime_optimization.py`
+
+禁止修改：
+
+- CLI
+- MCP
+- 3.0 core schema
 - legacy bridge
 
 ### Lane E：Acceptance Review

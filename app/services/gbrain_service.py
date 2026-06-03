@@ -147,3 +147,41 @@ class GBrainKnowledge:
             "items": [],
             "error": error,
         }
+
+    def learn(self, title: str, summary: str, scope: Optional[str] = None) -> bool:
+        """Store new experience rules into GBrain."""
+        try:
+            gbrain_bin = self._resolve_gbrain_bin()
+            if not gbrain_bin:
+                logger.warning("gbrain binary not found, skipping learning.")
+                return False
+
+            cmd = [gbrain_bin, "add", "--title", title, "--summary", summary]
+            if scope:
+                cmd.extend(["--scope", scope])
+                
+            result = subprocess.run(
+                cmd,
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self.timeout_seconds,
+            )
+            if result.returncode != 0:
+                logger.error(f"GBrain learn failed: {result.stderr}")
+                return False
+            return True
+        except Exception as exc:
+            logger.error(f"GBrain learn exception: {exc}")
+            return False
+
+    def learn_from_review(self, review_result: Any) -> int:
+        """Extract issues from ReviewResult and inject them as adversarial experience into GBrain."""
+        count = 0
+        for issue in getattr(review_result, "issues", []):
+            title = f"Adversarial Review Finding: {issue.summary}"
+            summary = f"Rule derived from failed review: {issue.recommendation}. Relates to: {', '.join(issue.related_requirement_ids)}"
+            if self.learn(title, summary, scope="adversarial"):
+                count += 1
+        return count

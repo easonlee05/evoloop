@@ -48,6 +48,19 @@ freeze 3.0 contracts
 
 这一阶段的目标不是全部实现，而是确保后续重构不会围绕 2.0 的旧中心反复返工。
 
+当前冻结模块：
+
+- `app/core/work.py`
+- `app/core/playbook.py`
+- `app/core/artifact_graph.py`
+- `app/core/review.py`
+
+当前冻结原则：
+
+- `machine_spec` 是唯一 source of truth
+- `human_brief` / `optional_prd` / `optional_manual` 都是 projection 或 optional artifact
+- 本阶段不实现 MCP、CLI 或 legacy workflow 重写
+
 ## 4. Phase 0：文档和路由对齐
 
 ### 目标
@@ -88,6 +101,7 @@ WorkItem facade
 - `TaskDefinition` 继续保留，但外部逐步改叫 `legacy playbook`
 - `TaskContext` 继续保留，但通过 facade 对外映射到 `ProductContext`
 - `manual` / `prd` 改以 `legacy_manual` / `legacy_prd` 视角被消费
+- `machine_spec` 作为统一锚点进入 `ArtifactGraph`
 
 ### 不要做
 
@@ -136,6 +150,7 @@ input
 - 必产出 `machine_spec.yaml`
 - 推荐同时产出 `human_brief.md`
 - `PRD.md` 和 `manual` 视场景按需渲染，不再默认充当真相源
+- 输出之间的关系必须写入 `ArtifactGraph`，并以 `machine_spec` 为锚点
 
 ### 关键原因
 
@@ -157,6 +172,7 @@ input
 - 建立轻量 `ArtifactGraph`
 - 建立 requirement / decision / acceptance / task 的基础映射
 - 为后续 review 和 change impact 提供结构基础
+- 建立 `ReviewResult` 最小 schema，但不在本阶段接 API/runtime
 
 ### 最小节点类型
 

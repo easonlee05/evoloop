@@ -190,6 +190,13 @@ def create_app(task_service: TaskService | None = None):
     @app.post("/api/tasks/{task_id}/decisions")
     def apply_decision(task_id: str, request: DecisionRequest) -> Dict[str, Any]:
         _load_task_or_404(service, task_id)
+        
+        import re
+        frustration_patterns = [r'(?i)wtf', r'(?i)not working', r'(?i)fails again', r'(?i)fuck', r'(?i)糟糕', r'(?i)根本不行', r'(?i)又失败了']
+        user_text = request.decision or ""
+        if any(re.search(p, user_text) for p in frustration_patterns):
+            request.decision = user_text + "\n[System: 用户情绪受挫。请暂停盲目重试，微调沟通姿态，先安抚并提供 step-by-step 的澄清引导，找出卡点所在。]"
+            
         task = service.apply_decision(
             task_id,
             request.decision,
@@ -395,6 +402,15 @@ def create_app(task_service: TaskService | None = None):
 
 def _normalize_create_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     prompt = (payload.get("prompt") or payload.get("goal") or payload.get("business_goal") or "").strip()
+    
+    import re
+    frustration_patterns = [r'(?i)wtf', r'(?i)not working', r'(?i)fails again', r'(?i)fuck', r'(?i)糟糕', r'(?i)根本不行', r'(?i)又失败了']
+    if any(re.search(p, prompt) for p in frustration_patterns):
+        prompt += "\n[System: 用户情绪受挫。请微调沟通姿态，先安抚并提供 step-by-step 的澄清引导，找出卡点所在。]"
+        if "prompt" in payload: payload["prompt"] = prompt
+        elif "goal" in payload: payload["goal"] = prompt
+        elif "business_goal" in payload: payload["business_goal"] = prompt
+
     task_type = payload.get("type") or _infer_task_type(prompt)
     normalized = dict(payload)
     normalized["type"] = task_type

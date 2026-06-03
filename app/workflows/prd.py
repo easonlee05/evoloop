@@ -1,13 +1,13 @@
-"""PRD TaskDefinition built on the generic workflow engine."""
+"""Legacy PRD TaskDefinition built on the generic workflow engine."""
 from __future__ import annotations
 
 from app.core.task import TaskDefinition, WorkflowSpec, WorkflowStep
 from app.workflows.policies import build_default_tool_policy
 
 
-def build_prd_definition() -> TaskDefinition:
+def build_prd_definition(public_task_type: str = "legacy_prd") -> TaskDefinition:
     workflow = WorkflowSpec(
-        name="prd.minimum.v1",
+        name="legacy_prd.minimum.v1",
         version="1.0",
         steps=[
             WorkflowStep(id="build_context", type="context", title="构建 PRD 任务上下文"),
@@ -46,7 +46,7 @@ def build_prd_definition() -> TaskDefinition:
     )
     return TaskDefinition(
         type="prd",
-        display_name="PRD 编写",
+        display_name="Legacy PRD 投影",
         input_schema={
             "required": ["username", "feature", "business_goal"],
             "properties": {
@@ -65,4 +65,12 @@ def build_prd_definition() -> TaskDefinition:
         round_policy={"max_rounds": 3},
         gate_policy={"gates": ["目标一致性", "架构完整性", "异常完整性", "风险透明度", "可交付性"]},
         output_spec={"primary_artifact": "PRD.md"},
+        metadata={
+            "legacy_bridge": True,
+            "legacy_playbook_id": public_task_type,
+            "canonical_task_type": "prd",
+            "public_task_type": public_task_type,
+            "legacy_projection": "optional_prd",
+            "legacy_aliases": [public_task_type, "prd"],
+        },
     )

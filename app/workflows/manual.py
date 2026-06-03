@@ -1,13 +1,13 @@
-"""Manual TaskDefinition built on the generic workflow engine."""
+"""Legacy manual TaskDefinition built on the generic workflow engine."""
 from __future__ import annotations
 
 from app.core.task import TaskDefinition, WorkflowSpec, WorkflowStep
 from app.workflows.policies import build_default_tool_policy
 
 
-def build_manual_definition() -> TaskDefinition:
+def build_manual_definition(public_task_type: str = "legacy_manual") -> TaskDefinition:
     workflow = WorkflowSpec(
-        name="manual.skeleton.v1",
+        name="legacy_manual.skeleton.v1",
         version="1.0",
         steps=[
             WorkflowStep(id="ingest_materials", type="context", title="解析上传材料", allowed_tools=["material.parse"]),
@@ -26,7 +26,7 @@ def build_manual_definition() -> TaskDefinition:
     )
     return TaskDefinition(
         type="manual",
-        display_name="操作手册编写",
+        display_name="Legacy 操作手册投影",
         input_schema={
             "required": ["username", "module_name"],
             "properties": {
@@ -43,5 +43,13 @@ def build_manual_definition() -> TaskDefinition:
         round_policy={"max_rounds": 3},
         gate_policy={"gates": ["格式红线", "材料映射", "去内部痕迹", "重复章节"]},
         output_spec={"primary_artifact": "模块概览.md"},
-        metadata={"format_spec_asset": "app/格式.md"},
+        metadata={
+            "format_spec_asset": "app/格式.md",
+            "legacy_bridge": True,
+            "legacy_playbook_id": public_task_type,
+            "canonical_task_type": "manual",
+            "public_task_type": public_task_type,
+            "legacy_projection": "optional_manual",
+            "legacy_aliases": [public_task_type, "manual"],
+        },
     )

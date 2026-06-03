@@ -155,7 +155,7 @@ class AdversarialVerificationAgent:
         else:
             verdict = ReviewVerdict.PASS
 
-        return ReviewResult(
+        result = ReviewResult(
             work_id=self.work_id,
             machine_spec_ref=self.machine_spec_ref,
             verdict=verdict,
@@ -165,6 +165,18 @@ class AdversarialVerificationAgent:
             fix_tasks=fix_tasks,
             acceptance_protocol_ref=self.acceptance_protocol_ref,
         )
+
+        if is_failed:
+            try:
+                import os
+                import logging
+                from app.services.gbrain_service import GBrainKnowledge
+                gbrain = GBrainKnowledge(repo_path=os.environ.get("EVOLOOP_WORKSPACE", os.getcwd()))
+                gbrain.learn_from_review(result)
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"Adversarial Learning loop failed: {e}")
+
+        return result
 
 
 def serialize_review_result(result: ReviewResult) -> str:
