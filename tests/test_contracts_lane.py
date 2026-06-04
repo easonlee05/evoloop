@@ -249,6 +249,43 @@ class TestContractsLane(unittest.TestCase):
             graph.validate()
         self.assertIn("contains a dependency loop/cycle", str(context.exception))
 
+    def test_artifact_graph_edge_type_constraints(self):
+        from app.core.artifact_graph import (
+            ArtifactGraph, ArtifactNode, ArtifactEdge, ArtifactRef,
+            ArtifactNodeType, ArtifactEdgeType, ArtifactGraphValidationError
+        )
+        
+        spec_ref = ArtifactRef(name="machine_spec.yaml")
+        req_ref = ArtifactRef(name="req_1")
+        review_ref = ArtifactRef(name="review.md")
+        
+        spec_node = ArtifactNode(node_id="n_spec", type=ArtifactNodeType.MACHINE_SPEC, artifact_ref=spec_ref)
+        req_node = ArtifactNode(node_id="n_req", type=ArtifactNodeType.REQUIREMENT, artifact_ref=req_ref)
+        review_node = ArtifactNode(node_id="n_review", type=ArtifactNodeType.REVIEW_RESULT, artifact_ref=review_ref)
+        
+        # 1. 错误的依赖：将 reviews 边错误地从 requirement 指向 spec_node（reviews 应该从 review_result 出发）
+        bad_edge = ArtifactEdge(
+            edge_id="e_bad_review",
+            from_node_id="n_req",
+            to_node_id="n_spec",
+            type=ArtifactEdgeType.REVIEWS
+        )
+        graph = ArtifactGraph(work_id="work_1", nodes=[spec_node, req_node], edges=[bad_edge])
+        with self.assertRaises(ArtifactGraphValidationError) as context:
+            graph.validate()
+        self.assertIn("Edge 'e_bad_review' type 'reviews' is incompatible", str(context.exception))
+        
+        # 2. 正确的依赖：从 review_node 指向 spec_node 应该是 reviews 关系
+        good_edge = ArtifactEdge(
+            edge_id="e_good_review",
+            from_node_id="n_review",
+            to_node_id="n_spec",
+            type=ArtifactEdgeType.REVIEWS
+        )
+        # 应该成功，不抛出异常
+        graph_ok = ArtifactGraph(work_id="work_2", nodes=[spec_node, review_node], edges=[good_edge])
+        graph_ok.validate()
+
     def test_playbook_service_uses_frozen_contract_field_names(self):
         item = WorkItem(
             work_type=WorkType.SPEC_TO_AGENT,

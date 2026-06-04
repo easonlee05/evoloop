@@ -211,6 +211,62 @@ class ArtifactGraph:
                             f"of type '{to_node.type.value}'."
                         )
 
+        # 4. 有向图环路检测 (Cycle Detection)
+        # 构建有向邻接表
+        from collections import defaultdict
+        digraph = defaultdict(list)
+        for edge in self.edges:
+            digraph[edge.from_node_id].append(edge.to_node_id)
+            
+        visited_states = {}  # node_id -> 0 (visiting), 1 (visited)
+        
+        def has_cycle(node_id: str) -> bool:
+            visited_states[node_id] = 0  # 标记为访问中
+            for neighbor in digraph[node_id]:
+                state = visited_states.get(neighbor)
+                if state == 0:
+                    return True  # 发现返祖边，有环
+                elif state is None:
+                    if has_cycle(neighbor):
+                        return True
+            visited_states[node_id] = 1  # 标记为已访问
+            return False
+
+        for node in self.nodes:
+            if node.node_id not in visited_states:
+                if has_cycle(node.node_id):
+                    raise ArtifactGraphValidationError(
+                        f"ArtifactGraph contains a dependency loop/cycle involving node '{node.node_id}'."
+                    )
+
+        # 5. 边类型与节点类型强规则匹配矩阵校验
+        nodes_by_id = {node.node_id: node for node in self.nodes}
+        for edge in self.edges:
+            from_node = nodes_by_id.get(edge.from_node_id)
+            to_node = nodes_by_id.get(edge.to_node_id)
+            if not from_node or not to_node:
+                continue
+                
+            if edge.type == ArtifactEdgeType.REVIEWS:
+                if from_node.type != ArtifactNodeType.REVIEW_RESULT:
+                    raise ArtifactGraphValidationError(
+                        f"Edge '{edge.edge_id}' type 'reviews' is incompatible: source must be review_result, got '{from_node.type.value}'."
+                    )
+            elif edge.type == ArtifactEdgeType.VALIDATES:
+                if from_node.type not in {ArtifactNodeType.ACCEPTANCE_PROTOCOL, ArtifactNodeType.REVIEW_CHECKLIST}:
+                    raise ArtifactGraphValidationError(
+                        f"Edge '{edge.edge_id}' type 'validates' is incompatible: source must be acceptance_protocol or review_checklist, got '{from_node.type.value}'."
+                    )
+            elif edge.type == ArtifactEdgeType.ADDRESSES_REQUIREMENT:
+                if to_node.type != ArtifactNodeType.REQUIREMENT:
+                    raise ArtifactGraphValidationError(
+                        f"Edge '{edge.edge_id}' type 'addresses_requirement' is incompatible: target must be requirement, got '{to_node.type.value}'."
+                    )
+            elif edge.type == ArtifactEdgeType.RESOLVES_DECISION:
+                if to_node.type != ArtifactNodeType.DECISION:
+                    raise ArtifactGraphValidationError(
+                        f"Edge '{edge.edge_id}' type 'resolves_decision' is incompatible: target must be decision, got '{to_node.type.value}'."
+                    )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -230,3 +286,17 @@ class ArtifactGraph:
             edges=[ArtifactEdge.from_dict(item) for item in data.get("edges", [])],
             metadata=dict(data.get("metadata", {})),
         )
+
+    def save_to_file(self, file_path: str) -> None:
+        """Save the artifact graph to a JSON file."""
+        import json
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load_from_file(cls, file_path: str) -> "ArtifactGraph":
+        """Load an artifact graph from a JSON file."""
+        import json
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return cls.from_dict(data)
