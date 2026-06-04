@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from app.core.events import utc_now_iso
+from app.core.persistence import FilePersistenceMixin
 
 
 class WorkType(str, Enum):
@@ -31,7 +32,7 @@ class WorkStatus(str, Enum):
 
 
 @dataclass
-class WorkItem:
+class WorkItem(FilePersistenceMixin):
     """Minimal 3.0 work unit boundary (Evoloop 3.0 Frozen Contract).
 
     This object represents the unified work identity. It intentionally carries
@@ -80,28 +81,4 @@ class WorkItem:
             metadata=dict(data.get("metadata", {})),
         )
 
-    def save_to_file(self, file_path: str) -> None:
-        """Save the contract instance to a JSON or YAML file based on file extension."""
-        import json
-        import yaml
-        data = self.to_dict()
-        if file_path.endswith((".yaml", ".yml")):
-            with open(file_path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-        else:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-
-    @classmethod
-    def load_from_file(cls, file_path: str) -> "WorkItem":
-        """Load a contract instance from a JSON or YAML file based on file extension."""
-        import json
-        import yaml
-        if file_path.endswith((".yaml", ".yml")):
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-        else:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        return cls.from_dict(data)
 

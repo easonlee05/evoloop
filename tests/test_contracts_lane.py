@@ -769,49 +769,161 @@ class TestContractsLane(unittest.TestCase):
     def test_contract_persistence_helpers(self):
         import tempfile
         import os
-        from app.core.work import WorkItem, WorkType
-        from app.core.review import ReviewResult, ReviewVerdict
-        
-        # 1. 验证 WorkItem 持久化与从文件加载
-        item = WorkItem(
-            work_type=WorkType.SPEC_TO_AGENT,
-            playbook_id="playbook_v3_spec",
-            title="Spec Work",
-            objective="Compile intent",
-            workspace_id="workspace_1",
-            product_context_ref="ctx_ref_001",
-            artifact_graph_ref="graph_ref_001",
+        from app.core.errors import DomainError
+        from app.core.work import WorkItem, WorkType, WorkStatus
+        from app.core.playbook import (
+            Playbook, PlaybookStep, ProductContext, SourceInput, Requirement,
+            ProductConstraint, ProductAssumption, KnowledgeRef, WorkerFeedback,
+            DecisionOption, DecisionGate, GateResolution
+        )
+        from app.core.review import (
+            ReviewResult, ReviewVerdict, RequirementCoverage, ReviewIssue,
+            ReviewIssueSeverity, ReviewFixTask
+        )
+        from app.core.dag import TaskDAG, DAGNode, NodeStatus
+        from app.core.artifact_graph import (
+            ArtifactGraph, ArtifactNode, ArtifactEdge, ArtifactRef,
+            ArtifactNodeType, ArtifactEdgeType
         )
         
-        # 2. 验证 ReviewResult 持久化与从文件加载
-        review = ReviewResult(
-            work_id="work_123",
-            machine_spec_ref="spec_123",
-            verdict=ReviewVerdict.PASS,
-            summary="All clear"
-        )
-        
-        fd_w, temp_path_w = tempfile.mkstemp(suffix=".yaml")
-        fd_r, temp_path_r = tempfile.mkstemp(suffix=".json")
-        os.close(fd_w)
-        os.close(fd_r)
-        
+        # Helper to create temporary files and clean them up automatically
+        temp_files = []
+        def get_temp_path(suffix):
+            fd, path = tempfile.mkstemp(suffix=suffix)
+            os.close(fd)
+            temp_files.append(path)
+            return path
+
         try:
-            # 保存为 YAML 和 JSON 格式
-            item.save_to_file(temp_path_w)
-            review.save_to_file(temp_path_r)
+            # 1. WorkItem
+            original_work_item = WorkItem(
+                work_type=WorkType.SPEC_TO_AGENT,
+                playbook_id="playbook_v3_spec",
+                title="Spec Work",
+                objective="Compile intent",
+                workspace_id="workspace_1",
+                product_context_ref="ctx_ref_001",
+                artifact_graph_ref="graph_ref_001",
+                status=WorkStatus.RUNNING
+            )
             
-            # 加载并检验
-            loaded_item = WorkItem.load_from_file(temp_path_w)
-            loaded_review = ReviewResult.load_from_file(temp_path_r)
+            # 2. Playbook
+            step = PlaybookStep(
+                step_id="step_1",
+                title="Step One",
+                purpose="Generate Spec",
+                allowed_tools=["material.read"],
+                produces_artifact_types=["machine_spec"],
+                next_step_ids=["step_2"]
+            )
+            original_playbook = Playbook(
+                playbook_id="playbook_v3_spec",
+                version="3.0",
+                trigger_types=["intent"],
+                steps=[step],
+                allowed_tools=["material.read", "artifact.write"],
+                output_artifact_types=["machine_spec", "agent_package"]
+            )
             
-            self.assertEqual(loaded_item.title, "Spec Work")
-            self.assertEqual(loaded_review.summary, "All clear")
+            # 3. ProductContext
+            option = DecisionOption(option_id="opt_1", label="Opt 1", summary="summary opt")
+            resolution = GateResolution(selected_option_id="opt_1", rationale="rat")
+            gate = DecisionGate(
+                gate_id="gate_1",
+                work_id="work_1",
+                question="Q?",
+                options=[option],
+                impact_summary="impact",
+                resolution=resolution
+            )
+            original_product_context = ProductContext(
+                objective="Test Objective",
+                source_inputs=[SourceInput(input_id="in_1", kind="brief", summary="Brief details")],
+                requirements=[Requirement(requirement_id="req_1", statement="Must support SSO")],
+                constraints=[ProductConstraint(constraint_id="const_1", statement="No external DBs")],
+                assumptions=[ProductAssumption(assumption_id="asmp_1", statement="Internet is up")],
+                user_decisions=[gate],
+                knowledge_refs=[KnowledgeRef(knowledge_id="kn_1", kind="api", summary="API spec")],
+                worker_feedback=[WorkerFeedback(feedback_id="fb_1", worker_id="codex", summary="Done")]
+            )
+            
+            # 4. ReviewResult
+            coverage = RequirementCoverage(requirement_id="req_1", covered=True, evidence_refs=["log_1"])
+            issue = ReviewIssue(issue_id="issue_1", severity=ReviewIssueSeverity.MAJOR, summary="Security leak")
+            fix_task = ReviewFixTask(task_id="fix_1", title="Sanitize input", source_issue_ids=["issue_1"])
+            original_review_result = ReviewResult(
+                work_id="work_1",
+                machine_spec_ref="spec_1",
+                verdict=ReviewVerdict.CHANGES_REQUIRED,
+                summary="Needs changes",
+                coverage=[coverage],
+                issues=[issue],
+                fix_tasks=[fix_task],
+                acceptance_protocol_ref="protocol_1"
+            )
+            
+            # 5. TaskDAG
+            original_task_dag = TaskDAG(graph_id="dag_test")
+            node_a = DAGNode(node_id="A", action_type="agent", status=NodeStatus.COMPLETED)
+            node_b = DAGNode(node_id="B", action_type="agent", dependencies=["A"], conditions={"key": "val"})
+            original_task_dag.add_node(node_a)
+            original_task_dag.add_node(node_b)
+            
+            # 6. ArtifactGraph
+            spec_ref = ArtifactRef(name="machine_spec.yaml", storage_uri="s3://specs/1")
+            prd_ref = ArtifactRef(name="PRD.md", storage_uri="s3://prds/1")
+            spec_node = ArtifactNode(node_id="n_spec", type=ArtifactNodeType.MACHINE_SPEC, artifact_ref=spec_ref)
+            prd_node = ArtifactNode(node_id="n_prd", type=ArtifactNodeType.OPTIONAL_PRD, artifact_ref=prd_ref)
+            edge = ArtifactEdge(edge_id="e1", from_node_id="n_prd", to_node_id="n_spec", type=ArtifactEdgeType.DERIVES_FROM)
+            original_artifact_graph = ArtifactGraph(
+                work_id="work_1",
+                nodes=[spec_node, prd_node],
+                edges=[edge]
+            )
+
+            # Test save and load for JSON and YAML for all objects
+            targets = [
+                ("WorkItem", original_work_item, WorkItem),
+                ("Playbook", original_playbook, Playbook),
+                ("ProductContext", original_product_context, ProductContext),
+                ("ReviewResult", original_review_result, ReviewResult),
+                ("TaskDAG", original_task_dag, TaskDAG),
+                ("ArtifactGraph", original_artifact_graph, ArtifactGraph),
+            ]
+            
+            for name, original_obj, cls in targets:
+                for ext in [".json", ".yaml"]:
+                    path = get_temp_path(ext)
+                    original_obj.save_to_file(path)
+                    loaded_obj = cls.load_from_file(path)
+                    self.assertEqual(
+                        loaded_obj.to_dict(), 
+                        original_obj.to_dict(),
+                        f"Mismatch after saving/loading {name} with extension {ext}"
+                    )
+            
+            # 7. Verify exception throwing for non-existent file
+            non_existent_path = "/non_existent_dir/no_file.json"
+            with self.assertRaises(DomainError) as context_none:
+                WorkItem.load_from_file(non_existent_path)
+            self.assertEqual(context_none.exception.code, "persistence.load_failed")
+            
+            # 8. Verify exception throwing for invalid YAML/JSON content
+            invalid_content_path = get_temp_path(".yaml")
+            with open(invalid_content_path, "w", encoding="utf-8") as f:
+                f.write("invalid: [unclosed bracket")
+                
+            with self.assertRaises(DomainError) as context_invalid:
+                WorkItem.load_from_file(invalid_content_path)
+            self.assertEqual(context_invalid.exception.code, "persistence.load_failed")
+
         finally:
-            if os.path.exists(temp_path_w):
-                os.remove(temp_path_w)
-            if os.path.exists(temp_path_r):
-                os.remove(temp_path_r)
+            for path in temp_files:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
 
 if __name__ == "__main__":

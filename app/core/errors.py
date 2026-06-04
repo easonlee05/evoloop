@@ -6,10 +6,13 @@ from typing import Any, Dict, Optional
 
 
 @dataclass
-class DomainError:
+class DomainError(Exception):
     code: str
     message: str
     details: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        super().__init__(self.message)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from app.core.errors import DomainError
+from app.core.persistence import FilePersistenceMixin
 
 
 class NodeStatus(Enum):
@@ -59,7 +60,7 @@ class DAGNode:
 
 
 @dataclass
-class TaskDAG:
+class TaskDAG(FilePersistenceMixin):
     graph_id: str
     nodes: Dict[str, DAGNode] = field(default_factory=dict)
 
@@ -90,29 +91,6 @@ class TaskDAG:
             graph_id=data["graph_id"],
             nodes=nodes
         )
-
-    def save_to_file(self, file_path: str) -> None:
-        import json
-        import yaml
-        data = self.to_dict()
-        if file_path.endswith((".yaml", ".yml")):
-            with open(file_path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-        else:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-
-    @classmethod
-    def load_from_file(cls, file_path: str) -> "TaskDAG":
-        import json
-        import yaml
-        if file_path.endswith((".yaml", ".yml")):
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-        else:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        return cls.from_dict(data)
 
     def validate_dag(self) -> None:
         """Validate DAG constraints including dangling dependencies and cycles."""

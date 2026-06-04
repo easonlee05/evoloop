@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+from app.core.persistence import FilePersistenceMixin
 
 
 SOURCE_OF_TRUTH_ARTIFACT = "machine_spec"
@@ -125,7 +126,7 @@ class ArtifactEdge:
 
 
 @dataclass
-class ArtifactGraph:
+class ArtifactGraph(FilePersistenceMixin):
     work_id: str
     nodes: List[ArtifactNode] = field(default_factory=list)
     edges: List[ArtifactEdge] = field(default_factory=list)
@@ -299,16 +300,3 @@ class ArtifactGraph:
             metadata=dict(data.get("metadata", {})),
         )
 
-    def save_to_file(self, file_path: str) -> None:
-        """Save the artifact graph to a JSON file."""
-        import json
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
-
-    @classmethod
-    def load_from_file(cls, file_path: str) -> "ArtifactGraph":
-        """Load an artifact graph from a JSON file."""
-        import json
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return cls.from_dict(data)

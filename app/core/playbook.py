@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from app.core.events import utc_now_iso
+from app.core.persistence import FilePersistenceMixin
 
 
 class DecisionGateStatus(str, Enum):
@@ -198,7 +199,7 @@ class GateResolution:
 
 
 @dataclass
-class DecisionGate:
+class DecisionGate(FilePersistenceMixin):
     """Decision Gate (Evoloop 3.0 Frozen Contract).
 
     Exposes questions that require human arbitration rather than letting AI make assumptions.
@@ -236,35 +237,10 @@ class DecisionGate:
             metadata=dict(data.get("metadata", {})),
         )
 
-    def save_to_file(self, file_path: str) -> None:
-        """Save the contract instance to a JSON or YAML file based on file extension."""
-        import json
-        import yaml
-        data = self.to_dict()
-        if file_path.endswith((".yaml", ".yml")):
-            with open(file_path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-        else:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-
-    @classmethod
-    def load_from_file(cls, file_path: str) -> "DecisionGate":
-        """Load a contract instance from a JSON or YAML file based on file extension."""
-        import json
-        import yaml
-        if file_path.endswith((".yaml", ".yml")):
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-        else:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        return cls.from_dict(data)
-
 
 
 @dataclass
-class ProductContext:
+class ProductContext(FilePersistenceMixin):
     """Product Context (Evoloop 3.0 Frozen Contract).
 
     Serves as the cross-run, cross-adapter single source of product requirements,
@@ -308,20 +284,6 @@ class ProductContext:
             metadata=dict(data.get("metadata", {})),
         )
 
-    def save_to_file(self, file_path: str) -> None:
-        """Save the product context to a JSON file."""
-        import json
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
-
-    @classmethod
-    def load_from_file(cls, file_path: str) -> "ProductContext":
-        """Load a product context from a JSON file."""
-        import json
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return cls.from_dict(data)
-
 
 @dataclass
 class PlaybookStep:
@@ -350,7 +312,7 @@ class PlaybookStep:
 
 
 @dataclass
-class Playbook:
+class Playbook(FilePersistenceMixin):
     """Playbook (Evoloop 3.0 Frozen Contract).
 
     Defines the work playbook of the digital product manager, specifying steps,
@@ -391,35 +353,10 @@ class Playbook:
             metadata=dict(data.get("metadata", {})),
         )
 
-    def save_to_file(self, file_path: str) -> None:
-        """Save the contract instance to a JSON or YAML file based on file extension."""
-        import json
-        import yaml
-        data = self.to_dict()
-        if file_path.endswith((".yaml", ".yml")):
-            with open(file_path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-        else:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-
-    @classmethod
-    def load_from_file(cls, file_path: str) -> "Playbook":
-        """Load a contract instance from a JSON or YAML file based on file extension."""
-        import json
-        import yaml
-        if file_path.endswith((".yaml", ".yml")):
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-        else:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        return cls.from_dict(data)
-
 
 
 @dataclass
-class WorkerAdapter:
+class WorkerAdapter(FilePersistenceMixin):
     """Worker Adapter (Evoloop 3.0 Frozen Contract).
 
     Defines the interface and invocation policies to hand off tasks to downstream
@@ -448,29 +385,4 @@ class WorkerAdapter:
             result_intake_policy=dict(data.get("result_intake_policy", {})),
             metadata=dict(data.get("metadata", {})),
         )
-
-    def save_to_file(self, file_path: str) -> None:
-        """Save the contract instance to a JSON or YAML file based on file extension."""
-        import json
-        import yaml
-        data = self.to_dict()
-        if file_path.endswith((".yaml", ".yml")):
-            with open(file_path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-        else:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-
-    @classmethod
-    def load_from_file(cls, file_path: str) -> "WorkerAdapter":
-        """Load a contract instance from a JSON or YAML file based on file extension."""
-        import json
-        import yaml
-        if file_path.endswith((".yaml", ".yml")):
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-        else:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        return cls.from_dict(data)
 

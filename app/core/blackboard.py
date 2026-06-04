@@ -29,16 +29,32 @@ class BlackboardSlot:
         if self.data_type is Any or self.data_type is None:
             return
         
-        from typing import get_origin
+        from typing import get_origin, get_args, Union
         origin = get_origin(self.data_type)
-        check_type = origin if origin is not None else self.data_type
-        if check_type is Any:
-            return
         
-        try:
-            is_valid = isinstance(value, check_type)
-        except TypeError:
-            is_valid = True
+        if origin is Union:
+            is_valid = False
+            for arg in get_args(self.data_type):
+                arg_origin = get_origin(arg)
+                arg_check = arg_origin if arg_origin is not None else arg
+                if arg_check is Any or arg_check is None:
+                    is_valid = True
+                    break
+                try:
+                    if isinstance(value, arg_check):
+                        is_valid = True
+                        break
+                except TypeError:
+                    pass
+        else:
+            check_type = origin if origin is not None else self.data_type
+            if check_type is Any:
+                return
+            
+            try:
+                is_valid = isinstance(value, check_type)
+            except TypeError:
+                is_valid = True
         
         if not is_valid:
             raise TypeError(f"Value for slot '{self.key}' must be of type {self.data_type}, got {type(value)}")
