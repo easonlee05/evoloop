@@ -158,3 +158,130 @@ class TestAcceptanceReviewWorkflow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLLMBackedAcceptanceReview(unittest.TestCase):
+    def test_llm_adversarial_review_parses_structured_changes_required(self):
+        from app.core.ports import LLMResult
+        from app.workflows.acceptance_review import LLMAdversarialReviewAgent
+
+        class ReviewLLM:
+            def __init__(self):
+                self.prompt = ""
+                self.context = {}
+
+            def invoke(self, role, prompt, context):
+                self.prompt = prompt
+                self.context = context
+                return LLMResult(
+                    content='''{
+                      "verdict": "changes_required",
+                      "summary": "手机号格式校验缺失，验收不能通过",
+                      "coverage": [
+                        {"requirement_id": "req_login", "covered": false, "evidence_refs": ["diff"], "notes": "未覆盖格式校验"}
+                      ],
+                      "issues": [
+                        {"severity": "major", "summary": "缺少手机号格式校验", "related_requirement_ids": ["req_login"], "recommendation": "补充格式校验和测试"}
+                      ],
+                      "fix_tasks": [
+                        {"title": "补充手机号格式校验", "source_issue_indices": [0], "priority": "must"}
+                      ]
+                    }''',
+                    structured={},
+                )
+
+        llm = ReviewLLM()
+        result = LLMAdversarialReviewAgent(
+            work_id="work_llm",
+            machine_spec_ref="memory://tasks/work_llm/machine_spec",
+            acceptance_protocol_ref="memory://tasks/work_llm/acceptance_protocol",
+            llm=llm,
+        ).verify(
+            machine_spec="req_login: 用户必须能使用手机号登录",
+            acceptance_protocol="case_login: 校验手机号格式",
+            implementation_summary="完成登录流程",
+            diff="+ add login handler",
+        )
+
+        self.assertEqual(result.verdict, ReviewVerdict.CHANGES_REQUIRED)
+        self.assertEqual(result.coverage[0].requirement_id, "req_login")
+        self.assertEqual(result.issues[0].summary, "缺少手机号格式校验")
+        self.assertEqual(result.fix_tasks[0].source_issue_ids, [result.issues[0].issue_id])
+        self.assertEqual(result.metadata["review_mode"], "llm_adversarial")
+        self.assertIn("JSON", llm.prompt)
+        self.assertNotIn("API_KEY", str(llm.context))
+
+    def test_llm_adversarial_review_falls_back_on_malformed_json(self):
+        from app.core.ports import LLMResult
+        from app.workflows.acceptance_review import LLMAdversarialReviewAgent
+
+        class MalformedLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(content="not json", structured={})
+
+        result = LLMAdversarialReviewAgent(
+            work_id="work_fallback",
+            machine_spec_ref="memory://tasks/work_fallback/machine_spec",
+            llm=MalformedLLM(),
+        ).verify(
+            machine_spec="req_login: 用户必须能使用手机号登录",
+            acceptance_protocol="case_login: 校验登录成功",
+            implementation_summary="missing validation",
+            diff="+ // TODO validation",
+        )
+
+        self.assertEqual(result.verdict, ReviewVerdict.CHANGES_REQUIRED)
+        self.assertEqual(result.metadata["review_mode"], "heuristic_fallback")
+        self.assertEqual(result.metadata["fallback_reason"], "llm_parse_failed")
+
+    def test_runtime_custom_handler_uses_engine_llm_for_acceptance_review(self):
+        from app.core.ports import LLMResult
+
+        class PassingReviewLLM(FakeLLM):
+            def __init__(self):
+                self.review_calls = 0
+
+            def invoke(self, role, prompt, context):
+                if role == "AdversarialReviewer":
+                    self.review_calls += 1
+                    return LLMResult(
+                        content='''{
+                          "verdict": "pass",
+                          "summary": "LLM adversarial review passed",
+                          "coverage": [
+                            {"requirement_id": "req_login", "covered": true, "evidence_refs": ["diff"], "notes": "covered"}
+                          ],
+                          "issues": [],
+                          "fix_tasks": []
+                        }''',
+                        structured={},
+                    )
+                return super().invoke(role, prompt, context)
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        registry = build_task_registry()
+        storage = FakeStorage(root)
+        tool_service = ToolService.default(root=root, knowledge=FakeKnowledge())
+        llm = PassingReviewLLM()
+        engine = WorkflowEngine(tool_service=tool_service, llm=llm, storage=storage)
+        service = TaskService(registry=registry, engine=engine, storage=storage)
+        task = service.create_task(
+            "acceptance_review",
+            {
+                "username": "alice",
+                "machine_spec": "req_login: 用户必须能使用手机号登录",
+                "acceptance_protocol": "case_login: 输入手机号后应登录成功",
+                "implementation_summary": "已完成手机号登录接口与页面联调",
+                "diff": "+ add phone login flow",
+            },
+        )
+
+        result = service.run_task(task.task_id)
+
+        self.assertEqual(result.status, TaskStatus.COMPLETED)
+        self.assertEqual(llm.review_calls, 1)
+        structured_review = result.context.step_outputs["adversarial_verify"]["review_result"]
+        self.assertEqual(structured_review["summary"], "LLM adversarial review passed")
+        self.assertEqual(structured_review["metadata"]["review_mode"], "llm_adversarial")

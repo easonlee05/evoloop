@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 from app.core.artifact_graph import (
@@ -184,12 +185,139 @@ class AdversarialVerificationAgent:
         return result
 
 
-def build_review_result_from_inputs(task_id: str, inputs: dict[str, object]) -> ReviewResult:
+class LLMAdversarialReviewAgent:
+    """LLM-backed read-only adversarial acceptance reviewer."""
+
+    def __init__(self, work_id: str, machine_spec_ref: str, llm: Any, acceptance_protocol_ref: Optional[str] = None):
+        self.work_id = work_id
+        self.machine_spec_ref = machine_spec_ref
+        self.acceptance_protocol_ref = acceptance_protocol_ref
+        self.llm = llm
+        self.fallback = AdversarialVerificationAgent(work_id, machine_spec_ref, acceptance_protocol_ref)
+
+    def verify(
+        self,
+        machine_spec: str,
+        acceptance_protocol: str,
+        implementation_summary: str,
+        diff: str,
+    ) -> ReviewResult:
+        prompt = self._prompt()
+        context = self._context(machine_spec, acceptance_protocol, implementation_summary, diff)
+        try:
+            response = self.llm.invoke("AdversarialReviewer", prompt, context)
+            payload = self._parse_json(response.structured if getattr(response, "structured", None) else response.content)
+            result = self._result_from_payload(payload)
+            result.metadata["review_mode"] = "llm_adversarial"
+            return result
+        except Exception:
+            result = self.fallback.verify(machine_spec, acceptance_protocol, implementation_summary, diff)
+            result.metadata["review_mode"] = "heuristic_fallback"
+            result.metadata["fallback_reason"] = "llm_parse_failed"
+            return result
+
+    @staticmethod
+    def _prompt() -> str:
+        return (
+            "You are Evoloop's adversarial acceptance reviewer. "
+            "Assume the implementation may be subtly wrong. Return strict JSON only with keys: "
+            "verdict (pass|pass_with_notes|changes_required|blocked), summary, coverage, issues, fix_tasks. "
+            "coverage items require requirement_id, covered, evidence_refs, notes. "
+            "issues require severity (info|warning|major|critical), summary, related_requirement_ids, recommendation. "
+            "fix_tasks require title, source_issue_indices, priority, optional owner_hint. Do not include markdown."
+        )
+
+    @staticmethod
+    def _context(machine_spec: str, acceptance_protocol: str, implementation_summary: str, diff: str) -> dict[str, str]:
+        return {
+            "machine_spec": machine_spec,
+            "acceptance_protocol": acceptance_protocol,
+            "implementation_summary": implementation_summary,
+            "diff": diff,
+        }
+
+    @staticmethod
+    def _parse_json(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict) and "verdict" in value:
+            return value
+        if isinstance(value, dict) and "review_result" in value and isinstance(value["review_result"], dict):
+            return value["review_result"]
+        text = str(value or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        return json.loads(text)
+
+    def _result_from_payload(self, payload: dict[str, Any]) -> ReviewResult:
+        issues: list[ReviewIssue] = []
+        for item in payload.get("issues", []):
+            issue_id = str(item.get("issue_id") or f"issue_{uuid4().hex[:8]}")
+            issues.append(
+                ReviewIssue(
+                    issue_id=issue_id,
+                    severity=ReviewIssueSeverity(str(item.get("severity", "major"))),
+                    summary=str(item.get("summary", "")),
+                    related_requirement_ids=[str(req) for req in item.get("related_requirement_ids", [])],
+                    related_artifact_ids=[str(artifact) for artifact in item.get("related_artifact_ids", [])],
+                    recommendation=str(item.get("recommendation", "")),
+                    metadata=dict(item.get("metadata", {})),
+                )
+            )
+
+        coverage = [
+            RequirementCoverage(
+                requirement_id=str(item.get("requirement_id", "req_default")),
+                covered=bool(item.get("covered", False)),
+                evidence_refs=[str(ref) for ref in item.get("evidence_refs", [])],
+                notes=str(item.get("notes", "")),
+                metadata=dict(item.get("metadata", {})),
+            )
+            for item in payload.get("coverage", [])
+        ]
+        if not coverage:
+            requirements = re.findall(r"(req_\w+)", json.dumps(payload, ensure_ascii=False)) or ["req_default"]
+            coverage = [RequirementCoverage(requirement_id=req, covered=False, notes="LLM omitted coverage details") for req in requirements]
+
+        fix_tasks: list[ReviewFixTask] = []
+        for item in payload.get("fix_tasks", []):
+            source_issue_ids = [str(issue_id) for issue_id in item.get("source_issue_ids", [])]
+            if not source_issue_ids:
+                for index in item.get("source_issue_indices", []):
+                    if isinstance(index, int) and 0 <= index < len(issues):
+                        source_issue_ids.append(issues[index].issue_id)
+            fix_tasks.append(
+                ReviewFixTask(
+                    task_id=str(item.get("task_id") or f"fix_{uuid4().hex[:8]}"),
+                    title=str(item.get("title", "Address adversarial review issue")),
+                    source_issue_ids=source_issue_ids,
+                    priority=str(item.get("priority", "must")),
+                    owner_hint=item.get("owner_hint"),
+                    metadata=dict(item.get("metadata", {})),
+                )
+            )
+
+        verdict = ReviewVerdict(str(payload.get("verdict", ReviewVerdict.CHANGES_REQUIRED.value)))
+        return ReviewResult(
+            work_id=self.work_id,
+            machine_spec_ref=self.machine_spec_ref,
+            acceptance_protocol_ref=self.acceptance_protocol_ref,
+            verdict=verdict,
+            summary=str(payload.get("summary", "LLM adversarial review completed.")),
+            coverage=coverage,
+            issues=issues,
+            fix_tasks=fix_tasks,
+        )
+
+
+def build_review_result_from_inputs(task_id: str, inputs: dict[str, object], llm: Any = None) -> ReviewResult:
     """Build a ReviewResult from acceptance-review task inputs."""
-    return AdversarialVerificationAgent(
+    agent_cls = LLMAdversarialReviewAgent if llm is not None else AdversarialVerificationAgent
+    kwargs = {"llm": llm} if llm is not None else {}
+    return agent_cls(
         work_id=task_id,
         machine_spec_ref=f"memory://tasks/{task_id}/machine_spec",
         acceptance_protocol_ref=f"memory://tasks/{task_id}/acceptance_protocol",
+        **kwargs,
     ).verify(
         machine_spec=str(inputs.get("machine_spec", "")),
         acceptance_protocol=str(inputs.get("acceptance_protocol", "")),
@@ -198,9 +326,9 @@ def build_review_result_from_inputs(task_id: str, inputs: dict[str, object]) -> 
     )
 
 
-def run_adversarial_review_step(task: Task, step: WorkflowStep) -> StepResult:
+def run_adversarial_review_step(task: Task, step: WorkflowStep, llm: Any = None) -> StepResult:
     """Build structured review output for the acceptance-review agent step."""
-    review_result = build_review_result_from_inputs(task.task_id, task.context.inputs)
+    review_result = build_review_result_from_inputs(task.task_id, task.context.inputs, llm=llm)
     return StepResult(
         step.id,
         StepStatus.SUCCEEDED,
