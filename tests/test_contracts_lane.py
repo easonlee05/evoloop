@@ -766,7 +766,55 @@ class TestContractsLane(unittest.TestCase):
             if os.path.exists(temp_path_yaml):
                 os.remove(temp_path_yaml)
 
+    def test_contract_persistence_helpers(self):
+        import tempfile
+        import os
+        from app.core.work import WorkItem, WorkType
+        from app.core.review import ReviewResult, ReviewVerdict
+        
+        # 1. 验证 WorkItem 持久化与从文件加载
+        item = WorkItem(
+            work_type=WorkType.SPEC_TO_AGENT,
+            playbook_id="playbook_v3_spec",
+            title="Spec Work",
+            objective="Compile intent",
+            workspace_id="workspace_1",
+            product_context_ref="ctx_ref_001",
+            artifact_graph_ref="graph_ref_001",
+        )
+        
+        # 2. 验证 ReviewResult 持久化与从文件加载
+        review = ReviewResult(
+            work_id="work_123",
+            machine_spec_ref="spec_123",
+            verdict=ReviewVerdict.PASS,
+            summary="All clear"
+        )
+        
+        fd_w, temp_path_w = tempfile.mkstemp(suffix=".yaml")
+        fd_r, temp_path_r = tempfile.mkstemp(suffix=".json")
+        os.close(fd_w)
+        os.close(fd_r)
+        
+        try:
+            # 保存为 YAML 和 JSON 格式
+            item.save_to_file(temp_path_w)
+            review.save_to_file(temp_path_r)
+            
+            # 加载并检验
+            loaded_item = WorkItem.load_from_file(temp_path_w)
+            loaded_review = ReviewResult.load_from_file(temp_path_r)
+            
+            self.assertEqual(loaded_item.title, "Spec Work")
+            self.assertEqual(loaded_review.summary, "All clear")
+        finally:
+            if os.path.exists(temp_path_w):
+                os.remove(temp_path_w)
+            if os.path.exists(temp_path_r):
+                os.remove(temp_path_r)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
