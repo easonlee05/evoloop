@@ -27,3 +27,4 @@
 2. `technical/00-evolution-roadmap.md`
 3. `technical/01-parallel-development-boundaries.md`
 4. `technical/02-contracts-minimum-boundaries.md`
+5. `technical/04-engineering-evolution.md`

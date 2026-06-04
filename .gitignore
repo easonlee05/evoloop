@@ -37,3 +37,5 @@ logs/
 
 # GBrain
 knowledge_repo/
+
+.evoloop_storage/
