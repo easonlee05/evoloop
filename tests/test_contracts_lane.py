@@ -258,10 +258,16 @@ class TestContractsLane(unittest.TestCase):
         spec_ref = ArtifactRef(name="machine_spec.yaml")
         req_ref = ArtifactRef(name="req_1")
         review_ref = ArtifactRef(name="review.md")
+        decision_ref = ArtifactRef(name="dec_1")
+        acceptance_ref = ArtifactRef(name="acc_1")
+        checklist_ref = ArtifactRef(name="chk_1")
         
         spec_node = ArtifactNode(node_id="n_spec", type=ArtifactNodeType.MACHINE_SPEC, artifact_ref=spec_ref)
         req_node = ArtifactNode(node_id="n_req", type=ArtifactNodeType.REQUIREMENT, artifact_ref=req_ref)
         review_node = ArtifactNode(node_id="n_review", type=ArtifactNodeType.REVIEW_RESULT, artifact_ref=review_ref)
+        decision_node = ArtifactNode(node_id="n_dec", type=ArtifactNodeType.DECISION, artifact_ref=decision_ref)
+        acceptance_node = ArtifactNode(node_id="n_acc", type=ArtifactNodeType.ACCEPTANCE_PROTOCOL, artifact_ref=acceptance_ref)
+        checklist_node = ArtifactNode(node_id="n_chk", type=ArtifactNodeType.REVIEW_CHECKLIST, artifact_ref=checklist_ref)
         
         # 1. 错误的依赖：将 reviews 边错误地从 requirement 指向 spec_node（reviews 应该从 review_result 出发）
         bad_edge = ArtifactEdge(
@@ -285,6 +291,135 @@ class TestContractsLane(unittest.TestCase):
         # 应该成功，不抛出异常
         graph_ok = ArtifactGraph(work_id="work_2", nodes=[spec_node, review_node], edges=[good_edge])
         graph_ok.validate()
+
+        # 3. VALIDATES 约束验证
+        # 3a. 错误情况：VALIDATES 从 requirement 出发（VALIDATES source 必须是 acceptance_protocol 或 review_checklist）
+        bad_validate_edge = ArtifactEdge(
+            edge_id="e_bad_validate",
+            from_node_id="n_req",
+            to_node_id="n_spec",
+            type=ArtifactEdgeType.VALIDATES
+        )
+        graph_bad_validate = ArtifactGraph(work_id="work_3a", nodes=[spec_node, req_node], edges=[bad_validate_edge])
+        with self.assertRaises(ArtifactGraphValidationError) as context:
+            graph_bad_validate.validate()
+        self.assertIn("Edge 'e_bad_validate' type 'validates' is incompatible", str(context.exception))
+
+        # 3b. 正确情况：VALIDATES 从 acceptance_protocol 出发
+        good_validate_edge_1 = ArtifactEdge(
+            edge_id="e_good_validate_1",
+            from_node_id="n_acc",
+            to_node_id="n_spec",
+            type=ArtifactEdgeType.VALIDATES
+        )
+        graph_good_validate_1 = ArtifactGraph(work_id="work_3b", nodes=[spec_node, acceptance_node], edges=[good_validate_edge_1])
+        graph_good_validate_1.validate()
+
+        # 3c. 正确情况：VALIDATES 从 review_checklist 出发
+        good_validate_edge_2 = ArtifactEdge(
+            edge_id="e_good_validate_2",
+            from_node_id="n_chk",
+            to_node_id="n_spec",
+            type=ArtifactEdgeType.VALIDATES
+        )
+        graph_good_validate_2 = ArtifactGraph(work_id="work_3c", nodes=[spec_node, checklist_node], edges=[good_validate_edge_2])
+        graph_good_validate_2.validate()
+
+        # 4. ADDRESSES_REQUIREMENT 约束验证
+        # 4a. 错误情况：ADDRESSES_REQUIREMENT 指向 decision 节点（ADDRESSES_REQUIREMENT target 必须是 requirement）
+        bad_addr_edge = ArtifactEdge(
+            edge_id="e_bad_addr",
+            from_node_id="n_spec",
+            to_node_id="n_dec",
+            type=ArtifactEdgeType.ADDRESSES_REQUIREMENT
+        )
+        graph_bad_addr = ArtifactGraph(work_id="work_4a", nodes=[spec_node, decision_node], edges=[bad_addr_edge])
+        with self.assertRaises(ArtifactGraphValidationError) as context:
+            graph_bad_addr.validate()
+        self.assertIn("Edge 'e_bad_addr' type 'addresses_requirement' is incompatible", str(context.exception))
+
+        # 4b. 正确情况：ADDRESSES_REQUIREMENT 指向 requirement
+        good_addr_edge = ArtifactEdge(
+            edge_id="e_good_addr",
+            from_node_id="n_spec",
+            to_node_id="n_req",
+            type=ArtifactEdgeType.ADDRESSES_REQUIREMENT
+        )
+        graph_good_addr = ArtifactGraph(work_id="work_4b", nodes=[spec_node, req_node], edges=[good_addr_edge])
+        graph_good_addr.validate()
+
+        # 5. RESOLVES_DECISION 约束验证
+        # 5a. 错误情况：RESOLVES_DECISION 指向 requirement 节点（RESOLVES_DECISION target 必须是 decision）
+        bad_resol_edge = ArtifactEdge(
+            edge_id="e_bad_resol",
+            from_node_id="n_spec",
+            to_node_id="n_req",
+            type=ArtifactEdgeType.RESOLVES_DECISION
+        )
+        graph_bad_resol = ArtifactGraph(work_id="work_5a", nodes=[spec_node, req_node], edges=[bad_resol_edge])
+        with self.assertRaises(ArtifactGraphValidationError) as context:
+            graph_bad_resol.validate()
+        self.assertIn("Edge 'e_bad_resol' type 'resolves_decision' is incompatible", str(context.exception))
+
+        # 5b. 正确情况：RESOLVES_DECISION 指向 decision
+        good_resol_edge = ArtifactEdge(
+            edge_id="e_good_resol",
+            from_node_id="n_spec",
+            to_node_id="n_dec",
+            type=ArtifactEdgeType.RESOLVES_DECISION
+        )
+        graph_good_resol = ArtifactGraph(work_id="work_5b", nodes=[spec_node, decision_node], edges=[good_resol_edge])
+        graph_good_resol.validate()
+
+        # 6. SUPERSEDES 约束验证
+        # 6a. 错误情况：SUPERSEDES 的两个节点类型不一致（一个 requirement，一个 decision）
+        bad_supersedes_edge = ArtifactEdge(
+            edge_id="e_bad_supersedes",
+            from_node_id="n_req",
+            to_node_id="n_dec",
+            type=ArtifactEdgeType.SUPERSEDES
+        )
+        graph_bad_supersedes = ArtifactGraph(work_id="work_6a", nodes=[spec_node, req_node, decision_node], edges=[bad_supersedes_edge])
+        with self.assertRaises(ArtifactGraphValidationError) as context:
+            graph_bad_supersedes.validate()
+        self.assertIn("Edge 'e_bad_supersedes' type 'supersedes' is incompatible", str(context.exception))
+
+        # 6b. 正确情况：SUPERSEDES 的两个节点类型一致（都是 requirement）
+        req_ref_2 = ArtifactRef(name="req_2")
+        req_node_2 = ArtifactNode(node_id="n_req_2", type=ArtifactNodeType.REQUIREMENT, artifact_ref=req_ref_2)
+        good_supersedes_edge = ArtifactEdge(
+            edge_id="e_good_supersedes",
+            from_node_id="n_req_2",
+            to_node_id="n_req",
+            type=ArtifactEdgeType.SUPERSEDES
+        )
+        graph_good_supersedes = ArtifactGraph(work_id="work_6b", nodes=[spec_node, req_node, req_node_2], edges=[good_supersedes_edge])
+        graph_good_supersedes.validate()
+
+        # 7. 悬挂边 (Dangling Edge) 校验
+        # 7a. from_node 不存在
+        dangling_from_edge = ArtifactEdge(
+            edge_id="e_dangling_from",
+            from_node_id="n_non_existent",
+            to_node_id="n_spec",
+            type=ArtifactEdgeType.DERIVES_FROM
+        )
+        graph_dangling_from = ArtifactGraph(work_id="work_7a", nodes=[spec_node], edges=[dangling_from_edge])
+        with self.assertRaises(ArtifactGraphValidationError) as context:
+            graph_dangling_from.validate()
+        self.assertIn("referencing non-existent node", str(context.exception))
+
+        # 7b. to_node 不存在
+        dangling_to_edge = ArtifactEdge(
+            edge_id="e_dangling_to",
+            from_node_id="n_spec",
+            to_node_id="n_non_existent",
+            type=ArtifactEdgeType.DERIVES_FROM
+        )
+        graph_dangling_to = ArtifactGraph(work_id="work_7b", nodes=[spec_node], edges=[dangling_to_edge])
+        with self.assertRaises(ArtifactGraphValidationError) as context:
+            graph_dangling_to.validate()
+        self.assertIn("referencing non-existent node", str(context.exception))
 
     def test_playbook_service_uses_frozen_contract_field_names(self):
         item = WorkItem(

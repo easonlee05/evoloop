@@ -148,6 +148,16 @@ class ArtifactGraph:
         3. No reverse dependency: The machine_spec cannot have a derives_from edge
            pointing to any projection or derived node.
         """
+        nodes_by_id = {node.node_id: node for node in self.nodes}
+
+        # 1. 悬挂边/未定义节点依赖拦截
+        for edge in self.edges:
+            if edge.from_node_id not in nodes_by_id or edge.to_node_id not in nodes_by_id:
+                raise ArtifactGraphValidationError(
+                    f"ArtifactGraph contains a dangling edge '{edge.edge_id}' referencing "
+                    f"non-existent node: from_node_id='{edge.from_node_id}', to_node_id='{edge.to_node_id}'."
+                )
+
         spec_nodes = [node for node in self.nodes if node.is_source_of_truth]
         
         project_or_derived_types = {
@@ -204,7 +214,7 @@ class ArtifactGraph:
             for edge in self.edges:
                 if edge.type == ArtifactEdgeType.DERIVES_FROM:
                     if edge.from_node_id == spec_node_id and edge.to_node_id in projection_node_ids:
-                        to_node = next(n for n in self.nodes if n.node_id == edge.to_node_id)
+                        to_node = nodes_by_id[edge.to_node_id]
                         raise ArtifactGraphValidationError(
                             f"Edge '{edge.edge_id}' is invalid because the source of truth "
                             f"cannot derive from projection/derived node '{to_node.node_id}' "
@@ -240,12 +250,9 @@ class ArtifactGraph:
                     )
 
         # 5. 边类型与节点类型强规则匹配矩阵校验
-        nodes_by_id = {node.node_id: node for node in self.nodes}
         for edge in self.edges:
-            from_node = nodes_by_id.get(edge.from_node_id)
-            to_node = nodes_by_id.get(edge.to_node_id)
-            if not from_node or not to_node:
-                continue
+            from_node = nodes_by_id[edge.from_node_id]
+            to_node = nodes_by_id[edge.to_node_id]
                 
             if edge.type == ArtifactEdgeType.REVIEWS:
                 if from_node.type != ArtifactNodeType.REVIEW_RESULT:
@@ -266,6 +273,11 @@ class ArtifactGraph:
                 if to_node.type != ArtifactNodeType.DECISION:
                     raise ArtifactGraphValidationError(
                         f"Edge '{edge.edge_id}' type 'resolves_decision' is incompatible: target must be decision, got '{to_node.type.value}'."
+                    )
+            elif edge.type == ArtifactEdgeType.SUPERSEDES:
+                if from_node.type != to_node.type:
+                    raise ArtifactGraphValidationError(
+                        f"Edge '{edge.edge_id}' type 'supersedes' is incompatible: source type '{from_node.type.value}' must equal target type '{to_node.type.value}'."
                     )
 
     def to_dict(self) -> Dict[str, Any]:
