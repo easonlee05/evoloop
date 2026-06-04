@@ -16,6 +16,7 @@ class StepExecutor(Protocol):
     """Protocol implemented by concrete workflow step executors."""
 
     step_type: str
+    step_id: Optional[str] = None
 
     def run(self, task: Task, step: WorkflowStep, *, run_id: Optional[str] = None, is_parallel: bool = False) -> StepResult:
         ...
@@ -23,31 +24,39 @@ class StepExecutor(Protocol):
 
 @dataclass
 class StepExecutionRegistry:
-    """Dispatches workflow steps to registered executors by `WorkflowStep.type`."""
+    """Dispatches workflow steps to registered executors by `WorkflowStep.type` or `WorkflowStep.id`."""
 
     executors: Iterable[StepExecutor] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._executors: Dict[str, StepExecutor] = {}
+        self._id_executors: Dict[str, StepExecutor] = {}
         for executor in self.executors:
             self.register(executor)
 
     def register(self, executor: StepExecutor) -> None:
+        step_id = getattr(executor, "step_id", None)
+        if step_id:
+            self._id_executors[step_id] = executor
+            return
+
         step_type = getattr(executor, "step_type", "")
         if not step_type:
-            raise DomainError("workflow.executor_missing_type", "Step executor must declare a non-empty step_type.")
+            raise DomainError("workflow.executor_missing_type", "Step executor must declare a non-empty step_type or step_id.")
         self._executors[step_type] = executor
 
-    def get(self, step_type: str) -> Optional[StepExecutor]:
+    def get(self, step_type: str, step_id: Optional[str] = None) -> Optional[StepExecutor]:
+        if step_id and step_id in self._id_executors:
+            return self._id_executors[step_id]
         return self._executors.get(step_type)
 
     def run(self, task: Task, step: WorkflowStep, *, run_id: Optional[str] = None, is_parallel: bool = False) -> StepResult:
-        executor = self.get(step.type)
+        executor = self.get(step.type, step.id)
         if executor is None:
             return StepResult(
                 step.id,
                 StepStatus.FAILED,
-                error=DomainError("workflow.unknown_step_type", f"Unknown step type: {step.type}"),
+                error=DomainError("workflow.unknown_step_type", f"Unknown step type: {step.type} (id: {step.id})"),
             )
         return executor.run(task, step, run_id=run_id, is_parallel=is_parallel)
 
@@ -210,6 +219,22 @@ class DefaultStepExecutorRegistryFactory:
     arbitration_handlers: Dict[str, Any] = field(default_factory=dict)
 
     def build(self) -> StepExecutionRegistry:
+        from app.workflows.spec_to_agent import (
+            ContextNormalizerExecutor,
+            OpenQuestionIdentifierExecutor,
+            HumanDecisionGateExecutor,
+            MachineSpecCompilerExecutor,
+            AgentPackageGeneratorExecutor,
+            AcceptanceProtocolGeneratorExecutor
+        )
+        from app.workflows.acceptance_review import (
+            IngestAcceptanceContextExecutor,
+            RequirementCoverageExecutor,
+            DiffImpactAnalyzerExecutor,
+            ReviewResultCompilerExecutor,
+            ReviewGateExecutor
+        )
+
         executors: list[StepExecutor] = [
             ContextStepExecutor(
                 tool_service=self.tool_service,
@@ -219,6 +244,19 @@ class DefaultStepExecutorRegistryFactory:
             ArtifactStepExecutor(tool_service=self.tool_service, context_compiler=self.context_compiler, storage=self.storage),
             DiffStepExecutor(),
             CheckpointStepExecutor(),
+            # spec_to_agent steps
+            ContextNormalizerExecutor(),
+            OpenQuestionIdentifierExecutor(llm=self.llm),
+            HumanDecisionGateExecutor(),
+            MachineSpecCompilerExecutor(llm=self.llm),
+            AgentPackageGeneratorExecutor(llm=self.llm),
+            AcceptanceProtocolGeneratorExecutor(llm=self.llm),
+            # acceptance_review steps
+            IngestAcceptanceContextExecutor(),
+            RequirementCoverageExecutor(llm=self.llm),
+            DiffImpactAnalyzerExecutor(llm=self.llm),
+            ReviewResultCompilerExecutor(llm=self.llm),
+            ReviewGateExecutor(),
         ]
         executors.append(
             DelegatingStepExecutor(
