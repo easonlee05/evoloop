@@ -26,6 +26,46 @@ from app.core.task import StepResult, StepStatus, Task, TaskDefinition, Workflow
 from app.workflows.policies import build_default_tool_policy
 
 
+def ingest_acceptance_context_step(task: Task, step: WorkflowStep) -> StepResult:
+    machine_spec = str(task.context.inputs.get("machine_spec", ""))
+    acceptance_protocol = str(task.context.inputs.get("acceptance_protocol", ""))
+    implementation_summary = str(task.context.inputs.get("implementation_summary", ""))
+    diff = str(task.context.inputs.get("diff", ""))
+    requirement_ids = re.findall(r"(req_\w+)", machine_spec) or ["req_default"]
+    return StepResult(
+        step.id,
+        StepStatus.SUCCEEDED,
+        "acceptance context normalized",
+        outputs={
+            "machine_spec": machine_spec,
+            "acceptance_protocol": acceptance_protocol,
+            "implementation_summary": implementation_summary,
+            "diff": diff,
+            "requirement_ids": requirement_ids,
+        },
+    )
+
+
+def review_gate_step(task: Task, step: WorkflowStep) -> StepResult:
+    review_payload = task.context.step_outputs.get("adversarial_verify", {}).get("review_result")
+    if not isinstance(review_payload, dict):
+        raise DomainError(
+            "workflow.acceptance_review_missing_result",
+            "Acceptance review gate requires review_result output from adversarial_verify.",
+        )
+    review_result = ReviewResult.from_dict(review_payload)
+    gate = {
+        "step_id": step.id,
+        "status": "pass" if review_result.verdict == ReviewVerdict.PASS else "changes_required",
+        "checks": task.definition.gate_policy.get("gates", []),
+        "review_verdict": review_result.verdict.value,
+        "issue_count": len(review_result.issues),
+        "coverage_count": len(review_result.coverage),
+    }
+    task.context.gate_results.append(gate)
+    return StepResult(step.id, StepStatus.SUCCEEDED, "review gate evaluated", outputs={"gate": gate})
+
+
 def build_acceptance_review_definition(public_task_type: str = "acceptance_review") -> TaskDefinition:
     workflow = WorkflowSpec(
         name="acceptance_review.lane.v1",
@@ -84,8 +124,14 @@ def build_acceptance_review_definition(public_task_type: str = "acceptance_revie
             "public_task_type": public_task_type,
             "is_native_3_0": True,
             "source_of_truth": "machine_spec",
+            "custom_context_handlers": {
+                "ingest_acceptance_context": ingest_acceptance_context_step,
+            },
             "custom_agent_handlers": {
                 "adversarial_verify": run_adversarial_review_step,
+            },
+            "custom_gate_handlers": {
+                "review_gate": review_gate_step,
             },
         },
     )

@@ -35,6 +35,9 @@ class TestAcceptanceReviewWorkflow(unittest.TestCase):
         self.assertEqual(definition.type, "acceptance_review")
         self.assertEqual(definition.metadata["is_native_3_0"], True)
         self.assertEqual(definition.metadata["source_of_truth"], "machine_spec")
+        self.assertIn("ingest_acceptance_context", definition.metadata["custom_context_handlers"])
+        self.assertIn("adversarial_verify", definition.metadata["custom_agent_handlers"])
+        self.assertIn("review_gate", definition.metadata["custom_gate_handlers"])
 
         steps = definition.workflow.steps
         step_ids = [step.id for step in steps]
@@ -76,6 +79,9 @@ class TestAcceptanceReviewWorkflow(unittest.TestCase):
         self.assertIn("Adversarial check complete. All green.", review_result.content)
         self.assertIn("Review ID:", review_result.content)
         self.assertIn("req_login", review_result.content)
+        self.assertEqual(result.context.step_outputs["ingest_acceptance_context"]["requirement_ids"], ["req_login"])
+        self.assertEqual(result.context.step_outputs["review_gate"]["gate"]["review_verdict"], "pass")
+        self.assertEqual(result.context.step_outputs["review_gate"]["gate"]["issue_count"], 0)
 
     def test_runtime_writes_review_result_artifact_for_changes_required(self):
         service, storage = self.make_service()
@@ -100,6 +106,9 @@ class TestAcceptanceReviewWorkflow(unittest.TestCase):
         self.assertIn("Verdict: changes_required", review_result.content)
         self.assertIn("Address adversarial review issues", review_result.content)
         self.assertIn("Detected logic gap or missing implementation in diff", review_result.content)
+        self.assertEqual(result.context.step_outputs["review_gate"]["gate"]["review_verdict"], "changes_required")
+        self.assertEqual(result.context.step_outputs["review_gate"]["gate"]["issue_count"], 1)
+        self.assertEqual(result.context.step_outputs["review_gate"]["gate"]["coverage_count"], 1)
 
     def test_adversarial_verification_and_graph_validation(self):
         agent = AdversarialVerificationAgent(
