@@ -41,7 +41,8 @@ class WorkflowEngine:
     def run(self, task: Task, start_step_id: Optional[str] = None, until_step_id: Optional[str] = None) -> Task:
         if task.status not in (TaskStatus.CREATED, TaskStatus.RUNNING):
             return task
-            
+
+        self._bind_definition_handlers(task)
         run_id = f"run_{uuid4().hex[:12]}"
         run_started_at = time.monotonic()
         task.status = TaskStatus.RUNNING
@@ -163,6 +164,18 @@ class WorkflowEngine:
         self.storage.append_event(Event(task_id=task.task_id, type="task.completed", status=task.status.value, payload={"artifact_count": len(task.context.artifacts)}))
         self._emit_run_finished(task, run_id, run_started_at, task.status.value)
         return task
+
+    def _bind_definition_handlers(self, task: Task) -> None:
+        handler_groups = {
+            "context": dict(task.definition.metadata.get("custom_context_handlers", {})),
+            "agent": dict(task.definition.metadata.get("custom_agent_handlers", {})),
+            "gate": dict(task.definition.metadata.get("custom_gate_handlers", {})),
+            "arbitration": dict(task.definition.metadata.get("custom_arbitration_handlers", {})),
+        }
+        for step_type, handlers in handler_groups.items():
+            executor = self.step_executors.get(step_type)
+            if executor is not None and hasattr(executor, "custom_handlers"):
+                executor.custom_handlers = handlers
 
     @staticmethod
     def _duration_ms(started_at: float) -> int:
@@ -331,30 +344,6 @@ class WorkflowEngine:
         return StepResult(step.id, StepStatus.SUCCEEDED, "context ready", outputs={"goal": task.context.goal})
 
     def _run_agent_step(self, task: Task, step: WorkflowStep, is_parallel: bool = False, run_id: Optional[str] = None) -> StepResult:
-        custom_handler = task.definition.metadata.get("custom_agent_handlers", {}).get(step.id)
-        if callable(custom_handler):
-            handler_signature = inspect.signature(custom_handler)
-            if "llm" in handler_signature.parameters:
-                result = custom_handler(task, step, llm=self.llm)
-            else:
-                result = custom_handler(task, step)
-            if result.status == StepStatus.SUCCEEDED:
-                content = str(result.outputs.get("content", result.summary))
-                structured = result.outputs.get("structured", {"role": step.role})
-                task.context.round_history.append(
-                    {"step_id": step.id, "role": step.role, "content": content, "structured": structured}
-                )
-                self.storage.append_event(
-                    Event(
-                        task_id=task.task_id,
-                        type="agent.message.completed",
-                        role=step.role,
-                        status="completed",
-                        payload={"step_id": step.id, "summary": content[:160], "content": content},
-                    )
-                )
-            return result
-
         full_content = ""
         structured = {"role": step.role, "title": task.context.title, "goal": task.context.goal}
         telemetry = self._llm_telemetry(task.task_id, step, run_id)
@@ -389,20 +378,7 @@ class WorkflowEngine:
             
         task.context.round_history.append({"step_id": step.id, "role": step.role, "content": full_content, "structured": structured})
         self.storage.append_event(Event(task_id=task.task_id, type="agent.message.completed", role=step.role, status="completed", payload={"step_id": step.id, "summary": full_content[:160], "content": full_content}))
-        outputs = {"content": full_content, "structured": structured}
-        if step.id == "writer_final_prd":
-            outputs["artifact_name"] = "PRD.md"
-            if "背景" in full_content and "业务目标" in full_content:
-                outputs["artifact_content"] = full_content
-            else:
-                outputs["artifact_content"] = self.context_compiler.render_prd(task)
-        elif step.id in {"writer_overview", "writer_scene_docs"}:
-            outputs["artifact_name"] = "模块概览.md"
-            if "操作路径" in full_content or len(full_content) > 100:
-                outputs["artifact_content"] = full_content
-            else:
-                outputs["artifact_content"] = self.context_compiler.render_manual(task)
-        return StepResult(step.id, StepStatus.SUCCEEDED, f"{step.role} completed", outputs=outputs)
+        return StepResult(step.id, StepStatus.SUCCEEDED, f"{step.role} completed", outputs={"content": full_content, "structured": structured})
 
     def _llm_telemetry(self, task_id: str, step: WorkflowStep, run_id: Optional[str]):
         def emit(event_type: str, payload: Dict[str, Any]) -> None:
@@ -427,99 +403,12 @@ class WorkflowEngine:
         return safe
 
     def _run_gate_step(self, task: Task, step: WorkflowStep) -> StepResult:
-        if step.id == "convergence_gate":
-            if task.context.inputs.get("force_arbitration") is not None:
-                consensus_reached = not task.context.inputs.get("force_arbitration")
-            else:
-                llm_context = {
-                    **task.context.inputs,
-                    "title": task.context.title,
-                    "goal": task.context.goal,
-                    "round_history": [
-                        {"role": h["role"], "content": h["content"]}
-                        for h in task.context.round_history
-                    ]
-                }
-                gate_prompt = "请作为严格的 Reviewer，评估历史记录中近期 Tech 和 QA 对 PM 方案的二审反馈。如果他们对方案基本认可且没有要求重大重构或修改（允许有轻微建议），请只回复“PASS”；如果存在未解决的严重异议或明确要求 PM 重新修改，请只回复“FAIL”。必须只回复这两个词之一。"
-                try:
-                    result = self.llm.invoke("Reviewer", gate_prompt, llm_context)
-                    normalized = (result.content or "").strip().upper()
-                    consensus_reached = normalized == "PASS"
-                except Exception:
-                    consensus_reached = False
-            
-            if not consensus_reached and not task.context.user_decisions:
-                max_rounds = task.definition.round_policy.get("max_rounds", 3)
-                task.context.round_count += 1
-                
-                if task.context.round_count >= max_rounds:
-                    return StepResult(
-                        step.id,
-                        StepStatus.NEEDS_ARBITRATION,
-                        f"convergence requires human arbitration (max rounds {max_rounds} reached)",
-                        outputs={"dispute_package": self._build_convergence_dispute_package(task, task.context.round_count)},
-                        next_step_id="arbitration_business_tradeoff",
-                        resume_step_id="pm_after_arbitration",
-                    )
-                else:
-                    gate = {"step_id": step.id, "status": "fail", "round": task.context.round_count}
-                    task.context.gate_results.append(gate)
-                    return StepResult(
-                        step.id,
-                        StepStatus.SUCCEEDED,
-                        f"convergence failed, looping back. Round {task.context.round_count}",
-                        outputs={"gate": gate},
-                        next_step_id="pm_first_draft"
-                    )
-
         gate = {"step_id": step.id, "status": "pass", "checks": task.definition.gate_policy.get("gates", [])}
         task.context.gate_results.append(gate)
         return StepResult(step.id, StepStatus.SUCCEEDED, "gate passed", outputs={"gate": gate})
 
     def _run_arbitration_step(self, task: Task, step: WorkflowStep) -> StepResult:
-        if not task.context.inputs.get("force_arbitration") or task.context.user_decisions:
-            return StepResult(step.id, StepStatus.SUCCEEDED, "arbitration skipped", outputs={})
-        dispute_package = {
-            "title": "业务取舍需要裁决",
-            "background": task.context.goal,
-            "decision_needed": "请选择一致性、性能和交付速度之间的首期取舍。",
-            "options": [
-                {"label": "A", "pm_position": "同步强一致", "tech_position": "成本较高", "qa_position": "异常更少", "benefit": "结果确定", "cost": "性能成本", "risk": "发布慢", "recommended": False},
-                {"label": "B", "pm_position": "异步加对账", "tech_position": "解耦更好", "qa_position": "需补偿机制", "benefit": "易交付", "cost": "短时不一致", "risk": "需审计", "recommended": True},
-            ],
-            "impact_after_decision": "PM 将按用户裁决重写主流程、风险和验收标准。",
-        }
-        return StepResult(step.id, StepStatus.NEEDS_ARBITRATION, "waiting for user decision", outputs={"dispute_package": dispute_package}, resume_step_id=step.pause_policy.get("resume_step_id"))
-
-    def _build_convergence_dispute_package(self, task: Task, round_count: int) -> Dict[str, Any]:
-        return {
-            "title": "多轮评审后仍未收敛",
-            "background": task.context.goal,
-            "decision_needed": f"Tech 与 QA 在第 {round_count} 轮后仍有实质分歧，需要你决定这版 PRD 先按哪种取舍继续推进。",
-            "options": [
-                {
-                    "label": "A",
-                    "pm_position": "优先交付，接受可控风险，先保证本期落地。",
-                    "tech_position": "保留部分技术债，后续再补架构增强。",
-                    "qa_position": "异常路径先覆盖高风险部分，降低当前返工成本。",
-                    "benefit": "更快交付",
-                    "cost": "后续补强",
-                    "risk": "残留部分稳健性风险",
-                    "recommended": False,
-                },
-                {
-                    "label": "B",
-                    "pm_position": "优先稳健，先补齐关键风险控制和异常闭环。",
-                    "tech_position": "允许当前版本延后，以换取更稳定的方案边界。",
-                    "qa_position": "把主要异常与验收条件补完整后再进入终稿。",
-                    "benefit": "方案更稳",
-                    "cost": "交付变慢",
-                    "risk": "首期范围可能缩小",
-                    "recommended": True,
-                },
-            ],
-            "impact_after_decision": "PM 将按你的取舍重写方案，再进入最终文档产出阶段。",
-        }
+        return StepResult(step.id, StepStatus.SUCCEEDED, "arbitration skipped", outputs={})
 
     def _run_artifact_step(self, task: Task, step: WorkflowStep) -> StepResult:
         try:
@@ -536,4 +425,3 @@ class WorkflowEngine:
                 task.context.artifacts.append(artifact)
             self.storage.append_event(Event(task_id=task.task_id, type="artifact.created", role=step.role, status="created", payload={"artifact_id": artifact.artifact_id, "name": artifact.name, "version": artifact.version}))
         return StepResult(step.id, StepStatus.SUCCEEDED, "artifact written", outputs={"artifacts": [artifact.to_dict() for artifact in result.artifacts]}, tool_calls=[call])
-

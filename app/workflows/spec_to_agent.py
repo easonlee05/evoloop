@@ -1,8 +1,138 @@
 """Native Spec-to-Agent TaskDefinition built on the generic workflow engine."""
 from __future__ import annotations
 
-from app.core.task import TaskDefinition, WorkflowSpec, WorkflowStep
+from typing import Any, Dict
+
+from app.core.task import StepResult, StepStatus, Task, TaskDefinition, WorkflowSpec, WorkflowStep
 from app.workflows.policies import build_default_tool_policy
+
+
+def _spec_inputs(task: Task) -> Dict[str, Any]:
+    normalized_intent = str(task.context.inputs.get("business_intent") or task.context.goal).strip()
+    context_scope = str(task.context.inputs.get("context_scope") or "default").strip()
+    constraints = [str(item) for item in task.context.user_constraints or task.context.inputs.get("constraints", [])]
+    return {
+        "normalized_intent": normalized_intent,
+        "context_scope": context_scope or "default",
+        "constraints": constraints,
+    }
+
+
+def ingest_requirements_step(task: Task, step: WorkflowStep) -> StepResult:
+    inputs = _spec_inputs(task)
+    return StepResult(
+        step.id,
+        StepStatus.SUCCEEDED,
+        "requirements normalized",
+        outputs=inputs,
+    )
+
+
+def pm_draft_machine_spec_step(task: Task, step: WorkflowStep, llm: Any = None) -> StepResult:
+    inputs = _spec_inputs(task)
+    content = f"PM machine spec draft for {task.context.title}: {inputs['normalized_intent']}"
+    if llm is not None:
+        response = llm.invoke(
+            step.role,
+            step.title,
+            {
+                "title": task.context.title,
+                "goal": task.context.goal,
+                "business_intent": inputs["normalized_intent"],
+                "context_scope": inputs["context_scope"],
+            },
+        )
+        content = response.content
+    structured = {
+        "source_of_truth": "machine_spec",
+        "primary_requirement": inputs["normalized_intent"],
+        "context_scope": inputs["context_scope"],
+        "constraints": inputs["constraints"],
+    }
+    return StepResult(
+        step.id,
+        StepStatus.SUCCEEDED,
+        "machine spec drafted",
+        outputs={"content": content, "structured": structured},
+    )
+
+
+def tech_review_spec_step(task: Task, step: WorkflowStep, llm: Any = None) -> StepResult:
+    inputs = _spec_inputs(task)
+    content = f"Tech review for {task.context.title}: architecture feasible"
+    if llm is not None:
+        response = llm.invoke(
+            step.role,
+            step.title,
+            {
+                "title": task.context.title,
+                "goal": task.context.goal,
+                "business_intent": inputs["normalized_intent"],
+            },
+        )
+        content = response.content
+    structured = {
+        "technical_review": "architecture feasible",
+        "focus": ["dependencies", "integration", "rollback"],
+        "context_scope": inputs["context_scope"],
+    }
+    return StepResult(
+        step.id,
+        StepStatus.SUCCEEDED,
+        "technical review completed",
+        outputs={"content": content, "structured": structured},
+    )
+
+
+def qa_draft_acceptance_step(task: Task, step: WorkflowStep, llm: Any = None) -> StepResult:
+    inputs = _spec_inputs(task)
+    content = f"QA acceptance draft for {task.context.title}: cover happy path and failures"
+    if llm is not None:
+        response = llm.invoke(
+            step.role,
+            step.title,
+            {
+                "title": task.context.title,
+                "goal": task.context.goal,
+                "business_intent": inputs["normalized_intent"],
+            },
+        )
+        content = response.content
+    structured = {
+        "acceptance_inputs": [
+            "Trace to machine_spec requirement",
+            "Validate downstream worker package",
+            "Verify acceptance protocol coverage",
+        ],
+        "critical_checks": ["happy_path", "error_path", "traceability"],
+    }
+    return StepResult(
+        step.id,
+        StepStatus.SUCCEEDED,
+        "acceptance draft completed",
+        outputs={"content": content, "structured": structured},
+    )
+
+
+def spec_gate_step(task: Task, step: WorkflowStep) -> StepResult:
+    evidence_step_ids = ["pm_draft_machine_spec", "tech_review_spec", "qa_draft_acceptance"]
+    missing = [step_id for step_id in evidence_step_ids if step_id not in task.context.step_outputs]
+    if missing:
+        return StepResult(
+            step.id,
+            StepStatus.FAILED,
+            error=None,
+            summary="spec gate missing evidence",
+            outputs={"gate": {"step_id": step.id, "status": "fail", "missing_evidence": missing}},
+        )
+    gate = {
+        "step_id": step.id,
+        "status": "pass",
+        "checks": task.definition.gate_policy.get("gates", []),
+        "evidence_step_ids": evidence_step_ids,
+    }
+    task.context.gate_results.append(gate)
+    return StepResult(step.id, StepStatus.SUCCEEDED, "spec gate passed", outputs={"gate": gate})
 
 
 def build_spec_to_agent_definition(public_task_type: str = "spec_to_agent") -> TaskDefinition:
@@ -54,6 +184,17 @@ def build_spec_to_agent_definition(public_task_type: str = "spec_to_agent") -> T
             "canonical_task_type": "spec_to_agent",
             "public_task_type": public_task_type,
             "is_native_3_0": True,
-            "source_of_truth": "machine_spec.yaml"
+            "source_of_truth": "machine_spec.yaml",
+            "custom_context_handlers": {
+                "ingest_requirements": ingest_requirements_step,
+            },
+            "custom_agent_handlers": {
+                "pm_draft_machine_spec": pm_draft_machine_spec_step,
+                "tech_review_spec": tech_review_spec_step,
+                "qa_draft_acceptance": qa_draft_acceptance_step,
+            },
+            "custom_gate_handlers": {
+                "spec_gate": spec_gate_step,
+            },
         },
     )

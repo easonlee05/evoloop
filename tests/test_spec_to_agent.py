@@ -51,6 +51,15 @@ class TestSpecToAgentWorkflow(unittest.TestCase):
         self.assertEqual(definition.output_spec["review_checklist"], "review_checklist.md")
         self.assertEqual(definition.output_spec["traceability"], "traceability.json")
 
+    def test_spec_to_agent_registers_playbook_step_handlers(self):
+        definition = build_spec_to_agent_definition()
+
+        self.assertIn("ingest_requirements", definition.metadata["custom_context_handlers"])
+        self.assertIn("pm_draft_machine_spec", definition.metadata["custom_agent_handlers"])
+        self.assertIn("tech_review_spec", definition.metadata["custom_agent_handlers"])
+        self.assertIn("qa_draft_acceptance", definition.metadata["custom_agent_handlers"])
+        self.assertIn("spec_gate", definition.metadata["custom_gate_handlers"])
+
     def test_runtime_writes_native_artifacts_in_order(self):
         service, storage = self.make_service()
         task = service.create_task(
@@ -81,6 +90,39 @@ class TestSpecToAgentWorkflow(unittest.TestCase):
         self.assertIn("business_intent:", machine_spec.content)
         self.assertIn("requirements:", machine_spec.content)
         self.assertIn('"source_of_truth": "machine_spec.yaml"', traceability.content)
+
+    def test_runtime_compiles_structured_spec_outputs_for_gate_and_artifacts(self):
+        service, storage = self.make_service()
+        task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "把登录能力编译为可执行任务包",
+                "context_scope": "auth",
+            },
+        )
+
+        result = service.run_task(task.task_id)
+
+        self.assertEqual(result.status, TaskStatus.COMPLETED)
+        self.assertEqual(
+            result.context.step_outputs["ingest_requirements"]["normalized_intent"],
+            "把登录能力编译为可执行任务包",
+        )
+        self.assertEqual(
+            result.context.step_outputs["pm_draft_machine_spec"]["structured"]["source_of_truth"],
+            "machine_spec",
+        )
+        self.assertEqual(
+            result.context.step_outputs["spec_gate"]["gate"]["evidence_step_ids"],
+            ["pm_draft_machine_spec", "tech_review_spec", "qa_draft_acceptance"],
+        )
+
+        machine_spec = storage.read_artifact(storage.list_artifacts(task.task_id)[0].artifact_id)
+        acceptance = storage.read_artifact(storage.list_artifacts(task.task_id)[3].artifact_id)
+        self.assertIn("technical_review:", machine_spec.content)
+        self.assertIn("acceptance_inputs:", machine_spec.content)
+        self.assertIn("Trace to machine_spec requirement", acceptance.content)
 
 
 if __name__ == "__main__":

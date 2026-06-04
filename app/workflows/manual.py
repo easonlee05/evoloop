@@ -1,8 +1,57 @@
 """Legacy manual TaskDefinition built on the generic workflow engine."""
 from __future__ import annotations
 
-from app.core.task import TaskDefinition, WorkflowSpec, WorkflowStep
+from typing import Optional
+
+from app.core.task import StepResult, StepStatus, Task, TaskDefinition, WorkflowSpec, WorkflowStep
+from app.workflows.context_compiler import ContextCompilerService
 from app.workflows.policies import build_default_tool_policy
+
+
+def _manual_writer_outputs(
+    task: Task,
+    content: str,
+    *,
+    context_compiler: Optional[ContextCompilerService] = None,
+) -> dict:
+    compiler = context_compiler or ContextCompilerService()
+    artifact_content = content if ("操作路径" in content or len(content) > 100) else compiler.render_manual(task)
+    return {
+        "artifact_name": "模块概览.md",
+        "artifact_content": artifact_content,
+    }
+
+
+def writer_overview_step(
+    task: Task,
+    step: WorkflowStep,
+    llm=None,
+    content: Optional[str] = None,
+    context_compiler: Optional[ContextCompilerService] = None,
+) -> StepResult:
+    body = content or f"Writer overview for {task.context.title}"
+    outputs = {
+        "content": body,
+        "structured": {"role": step.role, "title": task.context.title, "goal": task.context.goal},
+        **_manual_writer_outputs(task, body, context_compiler=context_compiler),
+    }
+    return StepResult(step.id, StepStatus.SUCCEEDED, f"{step.role} completed", outputs=outputs)
+
+
+def writer_scene_docs_step(
+    task: Task,
+    step: WorkflowStep,
+    llm=None,
+    content: Optional[str] = None,
+    context_compiler: Optional[ContextCompilerService] = None,
+) -> StepResult:
+    body = content or f"Writer scene docs for {task.context.title}"
+    outputs = {
+        "content": body,
+        "structured": {"role": step.role, "title": task.context.title, "goal": task.context.goal},
+        **_manual_writer_outputs(task, body, context_compiler=context_compiler),
+    }
+    return StepResult(step.id, StepStatus.SUCCEEDED, f"{step.role} completed", outputs=outputs)
 
 
 def build_manual_definition(public_task_type: str = "legacy_manual") -> TaskDefinition:
@@ -51,5 +100,9 @@ def build_manual_definition(public_task_type: str = "legacy_manual") -> TaskDefi
             "public_task_type": public_task_type,
             "legacy_projection": "optional_manual",
             "legacy_aliases": [public_task_type, "manual"],
+            "custom_agent_handlers": {
+                "writer_overview": writer_overview_step,
+                "writer_scene_docs": writer_scene_docs_step,
+            },
         },
     )

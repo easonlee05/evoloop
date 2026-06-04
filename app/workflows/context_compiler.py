@@ -145,6 +145,9 @@ class ContextCompilerService:
     def render_machine_spec(self, task: Task) -> str:
         business_intent = task.context.inputs.get("business_intent") or task.context.goal
         constraints = task.context.user_constraints or ["none"]
+        pm_structured = dict(task.context.step_outputs.get("pm_draft_machine_spec", {}).get("structured", {}))
+        tech_structured = dict(task.context.step_outputs.get("tech_review_spec", {}).get("structured", {}))
+        qa_structured = dict(task.context.step_outputs.get("qa_draft_acceptance", {}).get("structured", {}))
         return "\n".join(
             [
                 "# source of truth: machine_spec",
@@ -157,6 +160,15 @@ class ContextCompilerService:
                 f"    statement: {json.dumps(str(business_intent), ensure_ascii=False)}",
                 "constraints:",
                 *[f"  - {json.dumps(str(item), ensure_ascii=False)}" for item in constraints],
+                f"technical_review: {json.dumps(tech_structured.get('technical_review', ''), ensure_ascii=False)}",
+                "acceptance_inputs:",
+                *[
+                    f"  - {json.dumps(str(item), ensure_ascii=False)}"
+                    for item in qa_structured.get("acceptance_inputs", [])
+                ],
+                "playbook_context:",
+                f"  source_of_truth: {json.dumps(str(pm_structured.get('source_of_truth', 'machine_spec')), ensure_ascii=False)}",
+                f"  context_scope: {json.dumps(str(pm_structured.get('context_scope', 'default')), ensure_ascii=False)}",
             ]
         ) + "\n"
 
@@ -178,6 +190,9 @@ class ContextCompilerService:
         )
 
     def render_acceptance(self, task: Task) -> str:
+        qa_structured = dict(task.context.step_outputs.get("qa_draft_acceptance", {}).get("structured", {}))
+        acceptance_inputs = qa_structured.get("acceptance_inputs", [])
+        acceptance_lines = "".join(f"- {item}\n" for item in acceptance_inputs)
         return (
             f"# Acceptance Protocol\n\n"
             f"## Required Outcome\n{task.context.goal}\n\n"
@@ -185,6 +200,7 @@ class ContextCompilerService:
             f"- Machine spec can be traced to the stated business intent.\n"
             f"- Agent package stays aligned with the machine spec.\n"
             f"- Reviewer can validate the delivered work against this protocol.\n"
+            f"{acceptance_lines}"
         )
 
     def render_review_checklist(self, task: Task) -> str:

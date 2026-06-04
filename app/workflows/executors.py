@@ -58,9 +58,13 @@ class ContextStepExecutor:
 
     tool_service: Any = None
     storage: Any = None
+    custom_handlers: Dict[str, Any] = field(default_factory=dict)
     step_type: str = "context"
 
     def run(self, task: Task, step: WorkflowStep, *, run_id: Optional[str] = None, is_parallel: bool = False) -> StepResult:
+        custom_handler = self.custom_handlers.get(step.id)
+        if callable(custom_handler):
+            return custom_handler(task, step)
         if step.id == "retrieve_knowledge" and self.tool_service is not None:
             query_parts = [
                 task.context.title,
@@ -166,8 +170,20 @@ class DelegatingStepExecutor:
 
     step_type: str
     callback: Any
+    custom_handlers: Dict[str, Any] = field(default_factory=dict)
 
     def run(self, task: Task, step: WorkflowStep, *, run_id: Optional[str] = None, is_parallel: bool = False) -> StepResult:
+        custom_handler = self.custom_handlers.get(step.id)
+        if callable(custom_handler):
+            signature = inspect.signature(custom_handler)
+            kwargs: Dict[str, Any] = {}
+            if "run_id" in signature.parameters:
+                kwargs["run_id"] = run_id
+            if "is_parallel" in signature.parameters:
+                kwargs["is_parallel"] = is_parallel
+            if "llm" in signature.parameters and hasattr(self.callback, "__self__"):
+                kwargs["llm"] = getattr(self.callback.__self__, "llm", None)
+            return custom_handler(task, step, **kwargs)
         signature = inspect.signature(self.callback)
         kwargs: Dict[str, Any] = {}
         if "run_id" in signature.parameters:
@@ -188,17 +204,43 @@ class DefaultStepExecutorRegistryFactory:
     agent_callback: Any = None
     gate_callback: Any = None
     arbitration_callback: Any = None
+    context_handlers: Dict[str, Any] = field(default_factory=dict)
+    agent_handlers: Dict[str, Any] = field(default_factory=dict)
+    gate_handlers: Dict[str, Any] = field(default_factory=dict)
+    arbitration_handlers: Dict[str, Any] = field(default_factory=dict)
 
     def build(self) -> StepExecutionRegistry:
         executors: list[StepExecutor] = [
-            ContextStepExecutor(tool_service=self.tool_service, storage=self.storage),
+            ContextStepExecutor(
+                tool_service=self.tool_service,
+                storage=self.storage,
+                custom_handlers=self.context_handlers,
+            ),
             ArtifactStepExecutor(tool_service=self.tool_service, context_compiler=self.context_compiler, storage=self.storage),
             DiffStepExecutor(),
             CheckpointStepExecutor(),
         ]
-        executors.append(DelegatingStepExecutor("agent", self.agent_callback or self._missing_delegate("agent")))
-        executors.append(DelegatingStepExecutor("gate", self.gate_callback or self._missing_delegate("gate")))
-        executors.append(DelegatingStepExecutor("arbitration", self.arbitration_callback or self._missing_delegate("arbitration")))
+        executors.append(
+            DelegatingStepExecutor(
+                "agent",
+                self.agent_callback or self._missing_delegate("agent"),
+                custom_handlers=self.agent_handlers,
+            )
+        )
+        executors.append(
+            DelegatingStepExecutor(
+                "gate",
+                self.gate_callback or self._missing_delegate("gate"),
+                custom_handlers=self.gate_handlers,
+            )
+        )
+        executors.append(
+            DelegatingStepExecutor(
+                "arbitration",
+                self.arbitration_callback or self._missing_delegate("arbitration"),
+                custom_handlers=self.arbitration_handlers,
+            )
+        )
         return StepExecutionRegistry(executors)
 
     @staticmethod
