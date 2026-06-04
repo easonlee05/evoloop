@@ -497,7 +497,7 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(audit_events[0], ("system", "write", "some_key", True))
         self.assertEqual(audit_events[1], ("system", "read", "some_key", True))
 
-        # 2. 测试复杂 Union 类型不崩溃（Union[int, str]）
+        # 2. 测试复杂 Union 类型不崩溃且有效拦截无效类型（Union[int, str]）
         slot_union = BlackboardSlot(
             key="union_slot",
             data_type=Union[int, str]
@@ -507,6 +507,9 @@ class TestContractsLane(unittest.TestCase):
         blackboard.write("union_slot", 42)
         blackboard.write("union_slot", "hello")
         self.assertEqual(blackboard.read("union_slot"), "hello")
+        # 应该拦截无效的类型写入
+        with self.assertRaises(TypeError):
+            blackboard.write("union_slot", 4.5)
 
         # 3. 严格模式 (strict=True) 拦截未注册 slot 的读写
         strict_bb = Blackboard(strict=True)
@@ -534,6 +537,64 @@ class TestContractsLane(unittest.TestCase):
         blackboard.write("registered_key", "new_value")
         self.assertEqual(blackboard.read("registered_key"), "new_value")
 
+    def test_task_dag_conditions_and_serialization(self):
+        from app.core.dag import TaskDAG, DAGNode, NodeStatus
+        import tempfile
+        import os
+        
+        # 1. 验证条件边属性
+        node = DAGNode(
+            node_id="step_conditional",
+            action_type="agent",
+            conditions={"blackboard.decision": "agree"}
+        )
+        self.assertEqual(node.conditions.get("blackboard.decision"), "agree")
+        
+        # 2. 验证 DAG 的 to_dict / from_dict / save_to_file / load_from_file
+        dag = TaskDAG(graph_id="dag_serial_test")
+        node_a = DAGNode(node_id="A", action_type="agent", status=NodeStatus.COMPLETED)
+        node_b = DAGNode(
+            node_id="B",
+            action_type="agent",
+            dependencies=["A"],
+            conditions={"key": "val"}
+        )
+        dag.add_node(node_a)
+        dag.add_node(node_b)
+        
+        d = dag.to_dict()
+        self.assertEqual(d["graph_id"], "dag_serial_test")
+        self.assertEqual(len(d["nodes"]), 2)
+        self.assertEqual(d["nodes"]["B"]["dependencies"], ["A"])
+        self.assertEqual(d["nodes"]["B"]["conditions"], {"key": "val"})
+        
+        # 文件读写 (JSON & YAML)
+        fd_json, temp_path_json = tempfile.mkstemp(suffix=".json")
+        fd_yaml, temp_path_yaml = tempfile.mkstemp(suffix=".yaml")
+        os.close(fd_json)
+        os.close(fd_yaml)
+        
+        try:
+            # 保存 JSON 并加载
+            dag.save_to_file(temp_path_json)
+            loaded_dag_json = TaskDAG.load_from_file(temp_path_json)
+            self.assertEqual(loaded_dag_json.graph_id, "dag_serial_test")
+            self.assertEqual(loaded_dag_json.nodes["B"].conditions, {"key": "val"})
+            self.assertEqual(loaded_dag_json.nodes["A"].status, NodeStatus.COMPLETED)
+            
+            # 保存 YAML 并加载
+            dag.save_to_file(temp_path_yaml)
+            loaded_dag_yaml = TaskDAG.load_from_file(temp_path_yaml)
+            self.assertEqual(loaded_dag_yaml.graph_id, "dag_serial_test")
+            self.assertEqual(loaded_dag_yaml.nodes["B"].conditions, {"key": "val"})
+            self.assertEqual(loaded_dag_yaml.nodes["A"].status, NodeStatus.COMPLETED)
+        finally:
+            if os.path.exists(temp_path_json):
+                os.remove(temp_path_json)
+            if os.path.exists(temp_path_yaml):
+                os.remove(temp_path_yaml)
+
 
 if __name__ == "__main__":
     unittest.main()
+
