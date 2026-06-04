@@ -230,6 +230,25 @@ class TestContractsLane(unittest.TestCase):
             graph.validate()
         self.assertIn("is invalid because the source of truth cannot derive from", str(context.exception))
 
+    def test_artifact_graph_cycle_detection(self):
+        spec_ref = ArtifactRef(name="machine_spec.yaml")
+        prd_ref = ArtifactRef(name="PRD.md")
+        brief_ref = ArtifactRef(name="human_brief.md")
+        
+        spec_node = ArtifactNode(node_id="n_spec", type=ArtifactNodeType.MACHINE_SPEC, artifact_ref=spec_ref)
+        prd_node = ArtifactNode(node_id="n_prd", type=ArtifactNodeType.OPTIONAL_PRD, artifact_ref=prd_ref)
+        brief_node = ArtifactNode(node_id="n_brief", type=ArtifactNodeType.HUMAN_BRIEF, artifact_ref=brief_ref)
+        
+        # 形成有向循环依赖（brief -> prd -> brief）并连上 n_spec
+        edge_init = ArtifactEdge(edge_id="e_init", from_node_id="n_brief", to_node_id="n_spec", type=ArtifactEdgeType.DERIVES_FROM)
+        edge1 = ArtifactEdge(edge_id="e1", from_node_id="n_prd", to_node_id="n_brief", type=ArtifactEdgeType.DERIVES_FROM)
+        edge2 = ArtifactEdge(edge_id="e2", from_node_id="n_brief", to_node_id="n_prd", type=ArtifactEdgeType.DERIVES_FROM)
+        
+        graph = ArtifactGraph(work_id="work_loop", nodes=[spec_node, prd_node, brief_node], edges=[edge_init, edge1, edge2])
+        with self.assertRaises(ArtifactGraphValidationError) as context:
+            graph.validate()
+        self.assertIn("contains a dependency loop/cycle", str(context.exception))
+
     def test_playbook_service_uses_frozen_contract_field_names(self):
         item = WorkItem(
             work_type=WorkType.SPEC_TO_AGENT,
@@ -260,6 +279,207 @@ class TestContractsLane(unittest.TestCase):
         self.assertIn(item.work_id, service.active_dags)
         self.assertIn(item.work_id, service.blackboards)
         self.assertEqual(item.status, WorkStatus.RUNNING)
+
+    def test_blackboard_slot_permission_and_type_safety(self):
+        from app.core.blackboard import Blackboard, BlackboardSlot
+
+        blackboard = Blackboard()
+        slot = BlackboardSlot(
+            key="config_slot",
+            data_type=dict,
+            allowed_writers=["admin_node"],
+            allowed_readers=["admin_node", "audit_node"]
+        )
+        blackboard.register_slot(slot)
+
+        # 1. 验证正常读写
+        blackboard.write("config_slot", {"theme": "dark"}, caller_id="admin_node")
+        val = blackboard.read("config_slot", caller_id="admin_node")
+        self.assertEqual(val, {"theme": "dark"})
+
+        # 2. 动态类型错误拦截
+        with self.assertRaises(TypeError):
+            blackboard.write("config_slot", "not-a-dict", caller_id="admin_node")
+
+        # 3. 越权写入校验
+        with self.assertRaises(PermissionError):
+            blackboard.write("config_slot", {"theme": "light"}, caller_id="guest_node")
+
+        # 4. 越权读取校验
+        with self.assertRaises(PermissionError):
+            blackboard.read("config_slot", caller_id="guest_node")
+
+        # 5. 审计节点可读但不可写
+        val_audit = blackboard.read("config_slot", caller_id="audit_node")
+        self.assertEqual(val_audit, {"theme": "dark"})
+        with self.assertRaises(PermissionError):
+            blackboard.write("config_slot", {"theme": "light"}, caller_id="audit_node")
+
+    def test_task_dag_deep_validation_and_topological_sort(self):
+        from app.core.dag import TaskDAG, DAGNode
+        from app.core.errors import DomainError
+
+        # 1. 验证正常 DAG 及其拓扑排序
+        dag = TaskDAG(graph_id="normal_dag")
+        node_a = DAGNode(node_id="A", action_type="agent")
+        node_b = DAGNode(node_id="B", action_type="agent", dependencies=["A"])
+        node_c = DAGNode(node_id="C", action_type="agent", dependencies=["B"])
+        
+        dag.add_node(node_a)
+        dag.add_node(node_b)
+        dag.add_node(node_c)
+
+        dag.validate_dag()
+        sort_order = dag.get_topological_sort()
+        self.assertEqual(sort_order, ["A", "B", "C"])
+
+        # 2. 验证悬挂边校验
+        dag_dangling = TaskDAG(graph_id="dangling_dag")
+        node_x = DAGNode(node_id="X", action_type="agent")
+        node_y = DAGNode(node_id="Y", action_type="agent", dependencies=["Z"])
+        dag_dangling.add_node(node_x)
+        dag_dangling.add_node(node_y)
+
+        with self.assertRaises(DomainError) as ctx:
+            dag_dangling.validate_dag()
+        self.assertEqual(ctx.exception.code, "dag.dangling_dependency")
+
+        with self.assertRaises(DomainError) as ctx_sort:
+            dag_dangling.get_topological_sort()
+        self.assertEqual(ctx_sort.exception.code, "dag.dangling_dependency")
+
+        # 3. 验证循环依赖校验
+        dag_cycle = TaskDAG(graph_id="cyclic_dag")
+        node_m = DAGNode(node_id="M", action_type="agent", dependencies=["N"])
+        node_n = DAGNode(node_id="N", action_type="agent", dependencies=["M"])
+        dag_cycle.add_node(node_m)
+        dag_cycle.add_node(node_n)
+
+        with self.assertRaises(DomainError) as ctx_cycle:
+            dag_cycle.validate_dag()
+        self.assertEqual(ctx_cycle.exception.code, "dag.cyclic_dependency")
+
+        with self.assertRaises(DomainError) as ctx_cycle_sort:
+            dag_cycle.get_topological_sort()
+        self.assertEqual(ctx_cycle_sort.exception.code, "dag.cyclic_dependency")
+
+    def test_strong_type_file_persistence(self):
+        import tempfile
+        import os
+        from app.core.playbook import (
+            ProductContext, SourceInput, Requirement, ProductConstraint,
+            ProductAssumption, KnowledgeRef, WorkerFeedback, DecisionOption,
+            DecisionGate, GateResolution
+        )
+        from app.core.artifact_graph import (
+            ArtifactGraph, ArtifactNode, ArtifactEdge, ArtifactRef,
+            ArtifactNodeType, ArtifactEdgeType
+        )
+
+        # 1. 构造一个包含丰富属性的 ProductContext
+        option = DecisionOption(option_id="opt_1", label="Opt 1", summary="summary opt")
+        resolution = GateResolution(selected_option_id="opt_1", rationale="rat")
+        gate = DecisionGate(
+            gate_id="gate_1",
+            work_id="work_1",
+            question="Q?",
+            options=[option],
+            impact_summary="impact",
+            resolution=resolution
+        )
+        ctx = ProductContext(
+            objective="Test Objective",
+            source_inputs=[SourceInput(input_id="in_1", kind="brief", summary="Brief details")],
+            requirements=[Requirement(requirement_id="req_1", statement="Must support SSO")],
+            constraints=[ProductConstraint(constraint_id="const_1", statement="No external DBs")],
+            assumptions=[ProductAssumption(assumption_id="asmp_1", statement="Internet is up")],
+            user_decisions=[gate],
+            knowledge_refs=[KnowledgeRef(knowledge_id="kn_1", kind="api", summary="API spec")],
+            worker_feedback=[WorkerFeedback(feedback_id="fb_1", worker_id="codex", summary="Done")]
+        )
+
+        # 2. 构造一个包含丰富属性的 ArtifactGraph
+        spec_ref = ArtifactRef(name="machine_spec.yaml", storage_uri="s3://specs/1")
+        prd_ref = ArtifactRef(name="PRD.md", storage_uri="s3://prds/1")
+        spec_node = ArtifactNode(node_id="n_spec", type=ArtifactNodeType.MACHINE_SPEC, artifact_ref=spec_ref)
+        prd_node = ArtifactNode(node_id="n_prd", type=ArtifactNodeType.OPTIONAL_PRD, artifact_ref=prd_ref)
+        edge = ArtifactEdge(edge_id="e1", from_node_id="n_prd", to_node_id="n_spec", type=ArtifactEdgeType.DERIVES_FROM)
+        
+        graph = ArtifactGraph(
+            work_id="work_1",
+            nodes=[spec_node, prd_node],
+            edges=[edge]
+        )
+
+        fd_ctx, temp_path_ctx = tempfile.mkstemp(suffix=".json")
+        fd_graph, temp_path_graph = tempfile.mkstemp(suffix=".json")
+        os.close(fd_ctx)
+        os.close(fd_graph)
+
+        try:
+            # 持久化
+            ctx.save_to_file(temp_path_ctx)
+            graph.save_to_file(temp_path_graph)
+
+            # 加载
+            loaded_ctx = ProductContext.load_from_file(temp_path_ctx)
+            loaded_graph = ArtifactGraph.load_from_file(temp_path_graph)
+
+            # 断言内容 100% 一致
+            self.assertEqual(ctx.to_dict(), loaded_ctx.to_dict())
+            self.assertEqual(graph.to_dict(), loaded_graph.to_dict())
+
+            # 验证类型
+            self.assertIsInstance(loaded_ctx, ProductContext)
+            self.assertIsInstance(loaded_graph, ArtifactGraph)
+
+        finally:
+            if os.path.exists(temp_path_ctx):
+                os.remove(temp_path_ctx)
+            if os.path.exists(temp_path_graph):
+                os.remove(temp_path_graph)
+
+    def test_blackboard_dynamic_loading_and_audit(self):
+        from app.core.blackboard import Blackboard
+        blackboard = Blackboard()
+        
+        # 1. 测试从字典动态加载槽定义
+        slot_data = [
+            {
+                "key": "dynamic_int",
+                "data_type": "int",
+                "allowed_writers": ["writer_a"],
+                "allowed_readers": ["reader_b"]
+            },
+            {
+                "key": "dynamic_list",
+                "data_type": "list",
+                "allowed_writers": ["writer_c"]
+            }
+        ]
+        blackboard.load_slots_from_dict(slot_data)
+        
+        # 验证是否正确解析并注册了槽
+        self.assertIn("dynamic_int", blackboard._slots)
+        self.assertEqual(blackboard._slots["dynamic_int"].data_type, int)
+        
+        # 2. 测试拦截审计回调
+        audit_events = []
+        def mock_audit_callback(caller_id, action, key, success, error_message=None):
+            audit_events.append((caller_id, action, key, success))
+            
+        blackboard.set_audit_callback(mock_audit_callback)
+        
+        # 正常写入
+        blackboard.write("dynamic_int", 42, caller_id="writer_a")
+        # 越权写入
+        with self.assertRaises(PermissionError):
+            blackboard.write("dynamic_int", 99, caller_id="malicious_user")
+            
+        # 校验审计日志中记录了上述尝试
+        self.assertEqual(len(audit_events), 2)
+        self.assertEqual(audit_events[0], ("writer_a", "write", "dynamic_int", True))
+        self.assertEqual(audit_events[1], ("malicious_user", "write", "dynamic_int", False))
 
 
 if __name__ == "__main__":
