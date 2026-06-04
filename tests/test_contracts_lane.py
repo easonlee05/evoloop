@@ -481,6 +481,59 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(audit_events[0], ("writer_a", "write", "dynamic_int", True))
         self.assertEqual(audit_events[1], ("malicious_user", "write", "dynamic_int", False))
 
+    def test_blackboard_improvements(self):
+        from app.core.blackboard import Blackboard, BlackboardSlot
+        from typing import Union
+
+        # 1. 测试匿名读取（caller_id=None）时，审计日志中记录 caller 为 "system"
+        blackboard = Blackboard()
+        audit_events = []
+        def mock_audit_callback(caller_id, action, key, success, error_message=None):
+            audit_events.append((caller_id, action, key, success))
+        blackboard.set_audit_callback(mock_audit_callback)
+
+        blackboard.write("some_key", "some_value")  # 默认 caller_id = None -> system
+        self.assertEqual(blackboard.read("some_key"), "some_value")
+        self.assertEqual(audit_events[0], ("system", "write", "some_key", True))
+        self.assertEqual(audit_events[1], ("system", "read", "some_key", True))
+
+        # 2. 测试复杂 Union 类型不崩溃（Union[int, str]）
+        slot_union = BlackboardSlot(
+            key="union_slot",
+            data_type=Union[int, str]
+        )
+        blackboard.register_slot(slot_union)
+        # 应该正常写入，不会触发 TypeError
+        blackboard.write("union_slot", 42)
+        blackboard.write("union_slot", "hello")
+        self.assertEqual(blackboard.read("union_slot"), "hello")
+
+        # 3. 严格模式 (strict=True) 拦截未注册 slot 的读写
+        strict_bb = Blackboard(strict=True)
+        # 写入未注册 key 应该抛出 KeyError
+        with self.assertRaises(KeyError):
+            strict_bb.write("unregistered_key", "value")
+        # 读取未注册 key 应该抛出 KeyError
+        with self.assertRaises(KeyError):
+            strict_bb.read("unregistered_key")
+
+        # 注册后再读写则正常
+        slot_ok = BlackboardSlot(key="registered_key", data_type=str)
+        strict_bb.register_slot(slot_ok)
+        strict_bb.write("registered_key", "value")
+        self.assertEqual(strict_bb.read("registered_key"), "value")
+
+        # 4. 测试审计回调异常不崩溃，并且不会中断主执行流
+        bad_events = []
+        def bad_audit_callback(caller_id, action, key, success, error_message=None):
+            bad_events.append((caller_id, action, key, success))
+            raise ValueError("Audit logger failed!")
+        
+        blackboard.set_audit_callback(bad_audit_callback)
+        # 即使 audit 触发 ValueError，这里的 write 也应该成功执行，不会抛出异常
+        blackboard.write("registered_key", "new_value")
+        self.assertEqual(blackboard.read("registered_key"), "new_value")
+
 
 if __name__ == "__main__":
     unittest.main()

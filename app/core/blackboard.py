@@ -1,8 +1,11 @@
 """Blackboard for shared working memory in 3.0 Playbook DAG."""
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class BlackboardContext:
@@ -32,13 +35,19 @@ class BlackboardSlot:
         if check_type is Any:
             return
         
-        if not isinstance(value, check_type):
+        try:
+            is_valid = isinstance(value, check_type)
+        except TypeError:
+            is_valid = True
+        
+        if not is_valid:
             raise TypeError(f"Value for slot '{self.key}' must be of type {self.data_type}, got {type(value)}")
 
 
 class Blackboard:
     """Shared state mechanism across DAG nodes."""
-    def __init__(self):
+    def __init__(self, strict: bool = False):
+        self.strict = strict
         self._store: Dict[str, BlackboardContext] = {}
         self._slots: Dict[str, BlackboardSlot] = {}
         self._audit_callback = None
@@ -52,8 +61,8 @@ class Blackboard:
         if self._audit_callback:
             try:
                 self._audit_callback(caller_id, action, key, success, error_message)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to execute audit callback: {e}")
 
     def load_slots_from_dict(self, data: List[Dict[str, Any]]) -> None:
         """Dynamically load slot definitions from a list of dicts."""
@@ -87,6 +96,9 @@ class Blackboard:
         actual_caller = caller_id or owner_node or "system"
         
         try:
+            if self.strict and key not in self._slots:
+                raise KeyError(f"Key '{key}' is not pre-registered in strict mode")
+                
             if key in self._slots:
                 slot = self._slots[key]
                 if slot.allowed_writers and actual_caller not in slot.allowed_writers:
@@ -101,18 +113,22 @@ class Blackboard:
 
     def read(self, key: str, caller_id: str = None) -> Any:
         """Read a slice from the blackboard with caller_id authorization checking."""
+        actual_caller = caller_id or "system"
         try:
+            if self.strict and key not in self._slots:
+                raise KeyError(f"Key '{key}' is not pre-registered in strict mode")
+
             if key in self._slots:
                 slot = self._slots[key]
-                if slot.allowed_readers and caller_id not in slot.allowed_readers:
-                    raise PermissionError(f"Caller '{caller_id}' is not authorized to read from slot '{key}'")
+                if slot.allowed_readers and actual_caller not in slot.allowed_readers:
+                    raise PermissionError(f"Caller '{actual_caller}' is not authorized to read from slot '{key}'")
                     
             ctx = self._store.get(key)
             val = ctx.value if ctx else None
-            self._audit(caller_id, "read", key, True)
+            self._audit(actual_caller, "read", key, True)
             return val
         except Exception as err:
-            self._audit(caller_id, "read", key, False, str(err))
+            self._audit(actual_caller, "read", key, False, str(err))
             raise
 
     def list_keys(self) -> List[str]:
