@@ -1,0 +1,3 @@
+# Claude Code / Codex / Cursor Ignore Patterns
+# 阻止 AI 自动扫描或读取此目录
+human_docs/

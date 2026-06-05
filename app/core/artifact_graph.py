@@ -1,4 +1,9 @@
-"""Frozen 3.0 artifact graph contracts with machine_spec as source of truth."""
+"""Evoloop 3.0 交付资产关系图（ArtifactGraph）核心契约定义。
+
+本模块构建了以机器规格书（machine_spec）为唯一真相源（Source of Truth），
+管理需求、决策、验收协议、代码包、评审结论等交付资产及其派生/覆盖/评审依赖关系的有向图。
+提供严格的结构合法性校验规则（如单 Truth 节点校验、不可逆向派生、有向环路检测等）。
+"""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -13,12 +18,12 @@ HUMAN_PROJECTION_ARTIFACTS = frozenset({"human_brief", "optional_prd", "optional
 
 
 class ArtifactGraphValidationError(ValueError):
-    """Artifact graph constraint validation error."""
+    """交付资产关系图约束条件校验失败时抛出的异常。"""
     pass
 
 
-
 class ArtifactNodeType(str, Enum):
+    """交付资产图中节点的类型枚举。"""
     REQUIREMENT = "requirement"
     DECISION = "decision"
     HUMAN_BRIEF = "human_brief"
@@ -34,6 +39,7 @@ class ArtifactNodeType(str, Enum):
 
 
 class ArtifactEdgeType(str, Enum):
+    """交付资产图中各节点之间依赖与指向关系的边类型枚举。"""
     DERIVES_FROM = "derives_from"
     ADDRESSES_REQUIREMENT = "addresses_requirement"
     RESOLVES_DECISION = "resolves_decision"
@@ -44,6 +50,15 @@ class ArtifactEdgeType(str, Enum):
 
 @dataclass
 class ArtifactRef:
+    """指向底层具体物理存储实体的引用信息描述类。
+
+    Attributes:
+        name: 资产引用名称（如 'app_core_task_py'）。
+        version: 资产引用版本号。
+        storage_uri: 该资产在持久化介质中的绝对/相对存储 URI（如 file:///...）。
+        checksum: 校验和签名（MD5 或 SHA256），用于防篡改完整性校验。
+        metadata: 其他扩展属性字典。
+    """
     name: str
     version: Optional[str] = None
     storage_uri: Optional[str] = None
@@ -51,10 +66,23 @@ class ArtifactRef:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        """将 ArtifactRef 转换为字典。
+
+        Returns:
+            Dict[str, Any]: 转换后的字典。
+        """
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ArtifactRef":
+        """从字典反序列化生成 ArtifactRef 实例。
+
+        Args:
+            data: 包含引用信息的元数据字典。
+
+        Returns:
+            ArtifactRef: 还原后的引用实体。
+        """
         return cls(
             name=data["name"],
             version=data.get("version"),
@@ -66,6 +94,16 @@ class ArtifactRef:
 
 @dataclass
 class ArtifactNode:
+    """交付资产图中的单个资产节点包装实体。
+
+    Attributes:
+        node_id: 节点唯一 ID。
+        type: 交付资产节点类型。
+        artifact_ref: 指向物理存储或详细元数据的 ArtifactRef 引用。
+        summary: 节点内容的简短中文说明。
+        created_by: 创建本节点的角色或 worker_id，默认为 'system'。
+        metadata: 其他元数据。
+    """
     node_id: str
     type: ArtifactNodeType
     artifact_ref: ArtifactRef
@@ -75,9 +113,19 @@ class ArtifactNode:
 
     @property
     def is_source_of_truth(self) -> bool:
+        """判断当前节点是否为全局真相源（machine_spec）节点。
+
+        Returns:
+            bool: 是则返回 True，否则返回 False。
+        """
         return self.type == ArtifactNodeType.MACHINE_SPEC
 
     def to_dict(self) -> Dict[str, Any]:
+        """将 ArtifactNode 序列化为字典。
+
+        Returns:
+            Dict[str, Any]: 序列化后的字典。
+        """
         return {
             "node_id": self.node_id,
             "type": self.type.value,
@@ -89,6 +137,14 @@ class ArtifactNode:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ArtifactNode":
+        """从字典反序列化重构 ArtifactNode 实例。
+
+        Args:
+            data: 包含资产节点元数据的字典.
+
+        Returns:
+            ArtifactNode: 反序列化出的资产节点包装实体。
+        """
         return cls(
             node_id=data["node_id"],
             type=ArtifactNodeType(data["type"]),
@@ -101,6 +157,16 @@ class ArtifactNode:
 
 @dataclass
 class ArtifactEdge:
+    """表示交付资产图中，两个节点之间关系的边描述实体。
+
+    Attributes:
+        edge_id: 边的唯一 ID。
+        from_node_id: 起始资产节点 ID。
+        to_node_id: 目标指向资产节点 ID。
+        type: 关系的具体边类型。
+        summary: 关系的文字描述摘要。
+        metadata: 额外附带的元数据。
+    """
     edge_id: str
     from_node_id: str
     to_node_id: str
@@ -109,12 +175,25 @@ class ArtifactEdge:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        """将 ArtifactEdge 序列化为字典。
+
+        Returns:
+            Dict[str, Any]: 序列化后的字典。
+        """
         data = asdict(self)
         data["type"] = self.type.value
         return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ArtifactEdge":
+        """从字典反序列化重构 ArtifactEdge 实例。
+
+        Args:
+            data: 边元数据字典。
+
+        Returns:
+            ArtifactEdge: 重构出的边关系实体。
+        """
         return cls(
             edge_id=data["edge_id"],
             from_node_id=data["from_node_id"],
@@ -127,6 +206,15 @@ class ArtifactEdge:
 
 @dataclass
 class ArtifactGraph(FilePersistenceMixin):
+    """交付资产依赖及派生有向无环图管理器。
+
+    Attributes:
+        work_id: 关联的工作项 ID。
+        nodes: 图中包含的所有资产节点列表。
+        edges: 图中包含的所有关系边列表。
+        graph_id: 图的唯一 ID，自动生成。
+        metadata: 图维度的元数据扩展项。
+    """
     work_id: str
     nodes: List[ArtifactNode] = field(default_factory=list)
     edges: List[ArtifactEdge] = field(default_factory=list)
@@ -134,20 +222,29 @@ class ArtifactGraph(FilePersistenceMixin):
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def source_of_truth_node(self) -> Optional[ArtifactNode]:
+        """获取当前交付资产关系图中的唯一真相源（machine_spec）节点。
+
+        Returns:
+            Optional[ArtifactNode]: 真相源节点，若不存在返回 None。
+        """
         for node in self.nodes:
             if node.is_source_of_truth:
                 return node
         return None
 
     def validate(self) -> None:
-        """Validate the artifact graph constraints to enforce machine_spec as source of truth.
+        """执行资产依赖图核心规则边界拦截校验。
 
-        1. Single source of truth: If the graph contains any projection or derived node,
-           it must contain exactly one machine_spec node.
-        2. Traceability: Every projection or derived node must be connected to the
-           machine_spec node.
-        3. No reverse dependency: The machine_spec cannot have a derives_from edge
-           pointing to any projection or derived node.
+        校验规则如下：
+        1. 悬挂边拦截：任何边的起始/目标节点必须在 nodes 列表中。
+        2. 真相源机器规格唯一性：如果图包含派生/投影节点，必须有且仅有一个 machine_spec 真相源节点。
+        3. 可追溯连通性：任何投影/派生节点必须与 machine_spec 节点在无向连通分量上可达（连通）。
+        4. 严禁反向派生：真相源 machine_spec 绝对不允许通过 derives_from 指向任何派生/投影节点。
+        5. 有向环路检测：交付资产依赖链路必须是有向无环图（DAG），严禁产生任何依赖闭环死循环。
+        6. 边类型与节点类型校验矩阵：验证 edge.type 的使用与其源节点、目标节点类型是否完美符合语义规范。
+
+        Raises:
+            ArtifactGraphValidationError: 当以上任何规则校验失败时抛出。
         """
         nodes_by_id = {node.node_id: node for node in self.nodes}
 

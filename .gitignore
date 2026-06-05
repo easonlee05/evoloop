@@ -39,3 +39,6 @@ logs/
 knowledge_repo/
 
 .evoloop_storage/
+
+# Human Only Documents (AI Ignored)
+/human_docs/

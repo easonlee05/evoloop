@@ -1,4 +1,9 @@
-"""Context and artifact rendering service for workflow execution."""
+"""Evoloop 3.0 工作流引擎上下文与产物渲染服务。
+
+该模块实现了 `ContextCompilerService`，负责将步骤执行中积累的动态上下文，
+渲染输出为系统所需的各种类型产物元数据与物理文档。它作为 2.0 遗留产物（如 PRD.md、模块操作手册）
+和 3.0 原资产物（如机器规范 machine_spec.yaml、人类简报 human_brief.md、下游执行包 agent_package_codex.md 等）的翻译与表达媒介。
+"""
 from __future__ import annotations
 
 import json
@@ -10,13 +15,23 @@ from app.workflows.acceptance_review import render_review_result_artifact
 
 
 class ContextCompilerService:
-    """Renders task context into workflow artifacts.
+    """上下文与产物渲染服务。
 
-    The workflow engine owns state transitions. This service owns data expression and
-    legacy/native artifact text generation.
+    该服务实现数据层表达，负责接收 Task 实例，渲染输出为标准的 markdown 或 YAML 文本格式。
     """
 
     def artifact_payload(self, task: Task, step: WorkflowStep) -> tuple[str, str]:
+        """获取需要落盘的产物文件名与对应的文本内容。
+
+        根据剧本版本自动分流至遗留逻辑或原生 3.0 逻辑。
+
+        Args:
+            task (Task): 任务实例。
+            step (WorkflowStep): 产物步骤定义。
+
+        Returns:
+            tuple[str, str]: (产物文件名称, 渲染出的文本内容)
+        """
         if task.definition.metadata.get("is_native_3_0"):
             return self.native_artifact_payload(task, step)
 
@@ -31,6 +46,20 @@ class ContextCompilerService:
         return "模块概览.md", self.render_manual(task)
 
     def native_artifact_payload(self, task: Task, step: WorkflowStep) -> tuple[str, str]:
+        """渲染 Evoloop 3.0 的原资产物元数据与内容。
+
+        验证步骤声明并匹配注册的特定渲染器。
+
+        Args:
+            task (Task): 任务实例。
+            step (WorkflowStep): 步骤定义。
+
+        Returns:
+            tuple[str, str]: (产物文件名称, 渲染出的文本内容)
+
+        Raises:
+            DomainError: 当产物契约或渲染器未定义时抛出。
+        """
         if len(step.output_keys) != 1:
             raise DomainError(
                 "workflow.native_artifact_contract_invalid",
@@ -61,6 +90,14 @@ class ContextCompilerService:
         return artifact_name, renderer(task)
 
     def render_prd(self, task: Task) -> str:
+        """为 2.0 遗留任务渲染标准的产品需求文档 (PRD.md)。
+
+        Args:
+            task (Task): 任务对象。
+
+        Returns:
+            str: 渲染完成的 Markdown 文本。
+        """
         decisions = "\n".join(f"- {item.decision}" for item in task.context.user_decisions) or "- 暂无用户裁决"
         evidence = self._extract_prd_evidence(task)
         is_points_gateway = "积分" in task.context.title or "积分" in task.context.goal
@@ -77,7 +114,7 @@ class ContextCompilerService:
         rule_requirements = [
             "频次规则：识别短时间高频签到、批量请求和异常设备聚集。",
             "订单规则：识别小号下单返积分、退款后保留积分和异常订单链路。",
-            "邀请规则：识别邀请链路作假、循环邀请和同设备多账号邀请。",
+            "邀请规则：识别邀请链路作假、循环邀请 and 同设备多账号邀请。",
             "策略配置：支持按活动、渠道和用户分层配置阈值、灰度比例和白名单。",
         ] if is_points_gateway else [
             "流转规则：按业务类型、优先级和处理时限分派任务。",
@@ -140,13 +177,30 @@ class ContextCompilerService:
 """
 
     def render_manual(self, task: Task) -> str:
+        """为遗留 2.0 任务渲染标准的模块操作手册。
+
+        Args:
+            task (Task): 任务对象。
+
+        Returns:
+            str: 渲染完成的 Markdown 文本。
+        """
         return f"# {task.context.title} 操作手册\n\n## 模块目标\n{task.context.goal}\n\n## 操作路径\n- 按用户材料和平台知识补全。\n"
 
     def render_machine_spec(self, task: Task) -> str:
+        """渲染生成 Evoloop 3.0 系统的核心机器可读规范文件（machine_spec.yaml）。
+
+        该文件是整个数字产品生命周期中的单事实来源（Source of Truth）。
+
+        Args:
+            task (Task): 任务对象。
+
+        Returns:
+            str: YAML 格式的规约文本内容。
+        """
         business_intent = task.context.inputs.get("business_intent") or task.context.goal
         constraints = task.context.user_constraints or ["none"]
         compiler_structured = dict(task.context.step_outputs.get("machine_spec_compiler", {}).get("structured", {}))
-        open_questions_structured = dict(task.context.step_outputs.get("open_question_identifier", {}).get("structured", {}))
         protocol_structured = dict(task.context.step_outputs.get("acceptance_protocol_generator", {}).get("structured", {}))
         context_normalizer_outputs = dict(task.context.step_outputs.get("context_normalizer", {}))
         return "\n".join(
@@ -174,6 +228,14 @@ class ContextCompilerService:
         ) + "\n"
 
     def render_human_brief(self, task: Task) -> str:
+        """渲染生成面向干系人阅读的人类简报文件（human_brief.md）。
+
+        Args:
+            task (Task): 任务对象。
+
+        Returns:
+            str: 简报文档文本。
+        """
         return (
             f"# Human Brief\n\n"
             f"## Title\n{task.context.title}\n\n"
@@ -182,6 +244,14 @@ class ContextCompilerService:
         )
 
     def render_agent_package(self, task: Task) -> str:
+        """渲染生成供下游 AI Worker（如 Codex 等）执行的任务包描述（agent_package_codex.md）。
+
+        Args:
+            task (Task): 任务对象。
+
+        Returns:
+            str: 执行包文档内容。
+        """
         return (
             f"# Agent Package For Codex\n\n"
             f"- Work ID: {task.task_id}\n"
@@ -191,6 +261,14 @@ class ContextCompilerService:
         )
 
     def render_acceptance(self, task: Task) -> str:
+        """根据验收协议生成步骤的输出，渲染验收协议文档（acceptance.md）。
+
+        Args:
+            task (Task): 任务对象。
+
+        Returns:
+            str: 验收协议文档内容。
+        """
         protocol_structured = dict(task.context.step_outputs.get("acceptance_protocol_generator", {}).get("structured", {}))
         acceptance_inputs = protocol_structured.get("test_vectors", [])
         acceptance_lines = "".join(f"- {item}\n" for item in acceptance_inputs)
@@ -205,6 +283,14 @@ class ContextCompilerService:
         )
 
     def render_review_checklist(self, task: Task) -> str:
+        """渲染交付产物评审检查清单（review_checklist.md）。
+
+        Args:
+            task (Task): 任务对象。
+
+        Returns:
+            str: 检查清单文档文本。
+        """
         return (
             f"# Review Checklist\n\n"
             f"- [ ] `machine_spec.yaml` reflects `{task.context.inputs.get('business_intent', task.context.goal)}`.\n"

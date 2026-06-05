@@ -1,3 +1,9 @@
+/**
+ * @file index.jsx
+ * @description 任务工作台页面组件。作为核心操作面板，它展示了多 Agent 协同讨论的实时过程，
+ * 支持用户与 Agent 进行交互、上传参考附件、打断正在推演的讨论，并能够在右侧拉出文档区进行 PRD 等文档的实时编辑与预览。
+ */
+
 import React, { useState, useRef, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
@@ -27,6 +33,11 @@ import {
   BookOpen, Pencil, PanelRightOpen
 } from 'lucide-react';
 
+/**
+ * 根据 Agent 类型返回对应的背景色、图标及文字样式的头像 DOM。
+ * @param {string} avatarStr - Agent 缩写或标识（如 PM, Tech, QA, Writer）
+ * @returns {React.ReactNode} 头像节点
+ */
 function getAgentAvatar(avatarStr) {
   let bgColor = '#f4f4f5'; 
   let iconColor = '#52525b';
@@ -300,19 +311,24 @@ function TiptapEditor({ content, onChange, onBlur, onQuoteSelection }) {
   );
 }
 
+/**
+ * Workspace 工作台主组件。负责处理和编排多 Agent 对话的事件流 (EventSource) 连接、
+ * 人工干预发送指令、文档修改同步及历史消息载入逻辑。
+ * @component
+ */
 export default function Workspace() {
-  const [messages, setMessages]     = useState([]);
-  const [input, setInput]           = useState('');
-  const [isLive, setIsLive]         = useState(true);
-  const [interrupted, setInterrupted] = useState(false);
-  const [typing, setTyping]           = useState(null);
-  const [toast, setToast]           = useState(null);
-  const [done, setDone]             = useState(false);
-  const [taskStatus, setTaskStatus] = useState(null);
-  const [docOpen, setDocOpen]       = useState(false);
-  const [docFullscreen, setDocFullscreen] = useState(false);
-  const [doc, setDoc]               = useState(DOC);
-  const { id: taskId }               = useParams();
+  const [messages, setMessages]     = useState([]); // 对话消息历史列表
+  const [input, setInput]           = useState(''); // 用户输入的待发送指令文本
+  const [isLive, setIsLive]         = useState(true); // 是否处于直播进行中状态
+  const [interrupted, setInterrupted] = useState(false); // 讨论是否已被打断/暂停
+  const [typing, setTyping]           = useState(null); // 当前正在打字/生成中的 Agent 状态
+  const [toast, setToast]           = useState(null); // 界面悬浮 Toast 消息提示
+  const [done, setDone]             = useState(false); // 任务是否已彻底完成
+  const [taskStatus, setTaskStatus] = useState(null); // 后端任务包的运行状态 (raw_status)
+  const [docOpen, setDocOpen]       = useState(false); // 文档面板是否开启
+  const [docFullscreen, setDocFullscreen] = useState(false); // 文档面板是否全屏展示
+  const [doc, setDoc]               = useState(DOC); // 当前文档的 Markdown 文本内容
+  const { id: taskId }               = useParams(); // 从 URL 路由中提取的任务 ID
   const [saved, setSaved]           = useState(true);
   const [taskTitle, setTaskTitle]   = useState('AI 协作直播');
   const [isEditing, setIsEditing]   = useState(false);

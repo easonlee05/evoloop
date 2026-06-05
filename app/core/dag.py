@@ -1,4 +1,8 @@
-"""DAG Execution Graph for Evoloop 3.0 Playbooks."""
+"""Evoloop 3.0 Playbook 的 DAG 任务图执行模型定义。
+
+提供静态有向无环图（DAG）的节点定义（DAGNode）与执行流管理器（TaskDAG），
+支持基于拓扑排序的节点排程、执行依赖验证、有向环路检测以及持久化读写。
+"""
 from __future__ import annotations
 
 from typing import Dict, List, Any, Optional
@@ -10,6 +14,7 @@ from app.core.persistence import FilePersistenceMixin
 
 
 class NodeStatus(Enum):
+    """DAG 节点的生命周期执行状态枚举。"""
     PENDING = "pending"
     RUNNING = "running"
     BLOCKED = "blocked"
@@ -19,6 +24,16 @@ class NodeStatus(Enum):
 
 @dataclass
 class DAGNode:
+    """DAG 图中的单个执行节点实体。
+
+    Attributes:
+        node_id: 节点的唯一 ID 标识。
+        action_type: 节点所对应的动作或引擎类型（如 'agent', 'gate', 'artifact', 'system'）。
+        status: 节点的当前执行状态。
+        dependencies: 该节点直接前置依赖的节点 ID 列表。
+        conditions: 该节点被激活触发的控制流条件约束字典。
+        result: 节点执行完成后返回的任意结果产物。
+    """
     node_id: str
     action_type: str  # e.g., 'agent', 'gate', 'artifact', 'system'
     status: NodeStatus = NodeStatus.PENDING
@@ -61,6 +76,12 @@ class DAGNode:
 
 @dataclass
 class TaskDAG(FilePersistenceMixin):
+    """表示一个完整任务有向无环图的执行流管理器，支持对其依赖进行静态及动态拓扑排序与校验。
+
+    Attributes:
+        graph_id: 有向无环图的唯一 ID 标识。
+        nodes: DAG 图中包含的所有节点，以键值对 node_id -> DAGNode 的形式进行映射存储。
+    """
     graph_id: str
     nodes: Dict[str, DAGNode] = field(default_factory=dict)
 

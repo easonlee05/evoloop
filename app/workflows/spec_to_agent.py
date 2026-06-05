@@ -1,53 +1,73 @@
-"""Native Spec-to-Agent TaskDefinition built on the generic workflow engine (Industrial Edition)."""
+"""Evoloop 3.0 原生规范编译（Spec-to-Agent）工作流任务定义模块（工业版）。
+
+该模块实现了 3.0 架构的控制面核心，旨在把非结构化的业务意图（Business Intent）
+通过三阶段编译器（Terminology Normalization -> LLM AST Gen -> AST Validation）
+编译为机器可读的单事实来源（machine_spec.yaml），并自动分派与生成下游 Agent 可执行的任务包（Agent Package）及 BDD 验收协议。
+"""
 from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
-import math
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union, Set, Callable
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from app.core.errors import DomainError
 from app.core.task import StepResult, StepStatus, Task, TaskDefinition, WorkflowSpec, WorkflowStep
 from app.workflows.policies import build_default_tool_policy
 
-
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 1. ENTERPRISE DATA MODELS (DDD Value Objects)
+# 1. 领域驱动设计值对象 (DDD Value Objects)
 # ==============================================================================
+
 
 @dataclass
 class EnvironmentConfig:
+    """部署目标环境配置值对象。"""
+
     os_target: str = "linux"
     node_version: str = "20.x"
     python_version: str = "3.10"
     env_vars: Dict[str, str] = field(default_factory=dict)
     
     def validate(self):
+        """校验操作系统目标是否合法。"""
         if self.os_target not in ["linux", "mac", "windows", "docker"]:
             raise ValueError(f"Invalid OS Target: {self.os_target}")
 
+
 @dataclass
 class SecurityConstraints:
+    """安全与权限控制约束值对象。"""
+
     require_auth: bool = True
     auth_method: str = "oauth2"
     encryption_at_rest: bool = True
     cors_allowed_origins: List[str] = field(default_factory=lambda: ["*"])
 
+
 @dataclass
 class NetworkPolicy:
+    """网络访问控制策略值对象。"""
+
     expose_public_port: bool = False
     rate_limit_rps: int = 100
     timeout_ms: int = 3000
 
+
 @dataclass
 class EvoloopMachineSpecAST:
+    """Evoloop 机器规范抽象语法树（AST）根节点定义。
+
+    代表了 3.0 系统中已编译、无歧义的最终规约事实。
+    """
+
     primary_requirement: str
     version: str = "1.0.0"
     dependencies: List[str] = field(default_factory=list)
@@ -57,6 +77,7 @@ class EvoloopMachineSpecAST:
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
     
     def to_dict(self) -> dict:
+        """将 AST 节点序列化为字典表示。"""
         return {
             "source_of_truth": "machine_spec",
             "version": self.version,
@@ -76,6 +97,7 @@ class EvoloopMachineSpecAST:
 
     @staticmethod
     def from_dict(data: dict) -> "EvoloopMachineSpecAST":
+        """从字典反序列化生成 AST 对象。"""
         env_data = data.get("environment", {})
         sec_data = data.get("security", {})
         return EvoloopMachineSpecAST(
@@ -91,24 +113,32 @@ class EvoloopMachineSpecAST:
             )
         )
 
+
 # ==============================================================================
-# 2. CORE UTILS: Retries, Extractors, Fallbacks
+# 2. 核心辅助工具: 重试机制、提取器与故障回退
 # ==============================================================================
 
 def _extract_json_from_markdown(text: str) -> str:
-    """Safely extract JSON block from markdown wrapped LLM output."""
+    """安全地从 Markdown 格式包裹的 LLM 输出中提取 JSON 文本。
+
+    Args:
+        text (str): 原始包含 markdown 代码块的 LLM 回答。
+
+    Returns:
+        str: 提取出的 JSON 字符串；若未找到代码块则尝试大括号提取或直接返回。
+    """
     if not text:
         return "{}"
-    # Advanced pattern matching for json blocks
+    # 高级正则表达式模式匹配 JSON 代码块
     match = re.search(r"```(?:json|JSON)?(.*?)```", text, re.DOTALL)
     if match:
         content = match.group(1).strip()
-        # Handle trailing commas
+        # 处理结尾可能残留的非法逗号
         content = re.sub(r",\s*}", "}", content)
         content = re.sub(r",\s*]", "]", content)
         return content
     
-    # Try finding first { and last }
+    # 回退方案：寻找第一个 { 和最后一个 }
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -126,7 +156,23 @@ def _invoke_llm_with_retry(
     fallback: Optional[Dict[str, Any]] = None,
     temperature: float = 0.2
 ) -> Tuple[str, Dict[str, Any]]:
-    """Robust LLM invocation with exponential backoff and dynamic prompt repair."""
+    """具有指数退避与提示词动态修复的健壮 LLM 调用工具。
+
+    Args:
+        llm (Any): 语言模型实例。
+        role (str): 调用角色名称。
+        prompt (str): 发送的提示词。
+        context (Dict[str, Any]): 上下文变量。
+        retries (int, optional): 最大重试次数。默认为 4。
+        fallback (Optional[Dict[str, Any]], optional): 重试失败后的降级回退数据。默认为 None。
+        temperature (float, optional): 温度。默认为 0.2。
+
+    Returns:
+        Tuple[str, Dict[str, Any]]: (LLM 回答的原始文本, 成功解析出的 JSON 字典)
+
+    Raises:
+        DomainError: 当重试耗尽且未配置 fallback，或者 LLM 服务完全不可用时。
+    """
     if not llm:
         if fallback is not None:
             return "No LLM available, using fallback.", fallback
@@ -136,6 +182,7 @@ def _invoke_llm_with_retry(
     for attempt in range(1, retries + 1):
         try:
             current_prompt = prompt
+            # 若不是第一次尝试，追加强力的修复提示词，提醒大模型避免废话
             if attempt > 1 and last_error:
                 current_prompt += f"\n\n[SYSTEM ALERT]: Previous attempt failed due to {last_error}. Ensure your output is EXCLUSIVELY raw JSON without any markdown or conversational filler."
                 
@@ -149,7 +196,7 @@ def _invoke_llm_with_retry(
             except json.JSONDecodeError as e:
                 last_error = f"JSONDecodeError: {e}"
                 logger.warning(f"Attempt {attempt} failed to parse JSON: {last_error}")
-                # Exponential backoff simulation
+                # 模拟指数退避延迟
                 time.sleep(0.1 * (2 ** attempt))
                 
         except Exception as e:
@@ -167,30 +214,35 @@ def _invoke_llm_with_retry(
 
 
 # ==============================================================================
-# 3. ENTERPRISE LEXICAL ANALYSIS
+# 3. 企业级词法分析与净化
 # ==============================================================================
 
 class LexicalTokenizer:
-    """Enterprise-grade input sanitizer and tokenizer. Deep filtering of intents."""
+    """企业级输入清洗器与意图检测器。过滤恶意注入和控制字符。"""
     
     DANGEROUS_PATTERNS = [
         re.compile(r"(rm\s+-rf\s+/)"),
-        re.compile(r"(:\(\)\{:|:&\};:)"), # fork bomb
+        re.compile(r"(:\(\)\{:|:&\};:)"), # 叉子炸弹
         re.compile(r"(DROP\s+TABLE)", re.IGNORECASE),
     ]
 
     @staticmethod
     def clean_input(text: str) -> str:
+        """去除控制字符，阻止 naked 终端命令注入并检测已知危险模式。
+
+        Args:
+            text (str): 原始用户输入文本。
+
+        Returns:
+            str: 过滤净化后的文本。
+        """
         if not text:
             return ""
         
-        # 1. Strip null bytes
+        # 1. 过滤空字符及不需要的 ASCII 控制字符
         text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
         
-        # 2. Prevent command injection attempts by escaping strict shell metacharacters
-        # if they appear naked outside of code blocks.
-        
-        # 3. Detect dangerous patterns
+        # 2. 检查系统危险指令
         for pattern in LexicalTokenizer.DANGEROUS_PATTERNS:
             if pattern.search(text):
                 logger.warning("Dangerous pattern detected in user input!")
@@ -200,18 +252,19 @@ class LexicalTokenizer:
 
 
 class ConstraintValidator:
-    """Strictly validates user constraints against a structural schema."""
+    """根据预设的架构规则对用户约束列表进行严格的格式和长度审计。"""
     
     ALLOWED_CATEGORIES = {"performance", "security", "architecture", "ui", "general"}
     
     @staticmethod
     def validate(constraints: List[str]) -> List[str]:
+        """校验并截断异常超长的约束说明。"""
         valid = []
         for c in constraints:
             c = str(c).strip()
             if not c:
                 continue
-            # Rule 1: No massive text dumps in single constraint
+            # 单行约束最多接受 2000 个字符
             if len(c) > 2000:
                 c = c[:1997] + "..."
             
@@ -220,14 +273,24 @@ class ConstraintValidator:
 
 
 class ContextChunker:
-    """Advanced sliding window chunker using simulated token awareness."""
+    """当意图输入极长时，利用滑动窗口算法进行 token 切片以防 LLM 上下文爆溢。"""
     
     @staticmethod
     def estimate_tokens(text: str) -> int:
+        """估算 token 占用数量。"""
         return len(text) // 4
         
     @staticmethod
     def chunk(text: str, max_tokens: int = 4000) -> List[str]:
+        """根据最大 token 限制将文本切分为带有重叠区域的多个片段。
+
+        Args:
+            text (str): 待切分长文本。
+            max_tokens (int, optional): 每个分片最大 token 数。默认为 4000。
+
+        Returns:
+            List[str]: 切分后的段落列表。
+        """
         if not text:
             return []
             
@@ -238,17 +301,17 @@ class ContextChunker:
         max_chars = max_tokens * 4
         chunks = []
         start = 0
-        overlap = 200 # Character overlap for continuity
+        overlap = 200 # 重叠字符宽度，保证语义连贯
         
         while start < len(text):
             end = min(start + max_chars, len(text))
             if end < len(text):
-                # Try to break at a double newline (paragraph)
+                # 尽量优先在段落分界处 (双换行) 拆分
                 newline_pos = text.rfind("\n\n", start, end)
                 if newline_pos != -1 and newline_pos > start + (max_chars // 2):
                     end = newline_pos
                 else:
-                    # Fallback to single newline
+                    # 其次在单换行处拆分
                     newline_pos = text.rfind("\n", start, end)
                     if newline_pos != -1 and newline_pos > start + (max_chars // 2):
                         end = newline_pos
@@ -260,6 +323,7 @@ class ContextChunker:
 
 
 def _spec_inputs(task: Task) -> Dict[str, Any]:
+    """提取并归一化当前任务的输入事实。"""
     raw_intent = str(task.context.inputs.get("business_intent") or task.context.goal)
     normalized_intent = LexicalTokenizer.clean_input(raw_intent)
     context_scope = LexicalTokenizer.clean_input(str(task.context.inputs.get("context_scope") or "default"))
@@ -274,9 +338,9 @@ def _spec_inputs(task: Task) -> Dict[str, Any]:
 
 
 class ContextNormalizerExecutor:
-    """
-    Analyzes initial user input, performs deep lexical normalization, applies 
-    constraint sanitization, and handles contextual sliding window chunking.
+    """上下文标准化处理器。
+
+    负责清洗并提取用户输入的业务意图与系统约束，并做分片规整。
     """
     step_type: str = "context"
     step_id: str = "context_normalizer"
@@ -289,7 +353,7 @@ class ContextNormalizerExecutor:
         if not inputs["normalized_intent"]:
             raise DomainError("workflow.missing_intent", "Business intent cannot be empty after normalization.")
             
-        # Execute Sliding Window Chunking
+        # 执行长文本切分
         chunks = ContextChunker.chunk(inputs["normalized_intent"])
         inputs["intent_chunks_count"] = len(chunks)
         inputs["intent_chunks"] = chunks
@@ -303,15 +367,20 @@ class ContextNormalizerExecutor:
 
 
 # ==============================================================================
-# 4. DEEP AMBIGUITY MATRIX ANALYSIS
+# 4. 深度歧义诊断矩阵分析 (Ambiguity Matrix Analysis)
 # ==============================================================================
 
 class BaseDiagnoser(ABC):
+    """诊断矩阵分析器的抽象基类。"""
+
     @abstractmethod
     def analyze(self, intent: str, llm: Any, fallback: Dict) -> Dict:
         pass
 
+
 class DomainModelDiagnoser(BaseDiagnoser):
+    """用于扫描业务意图中 DDD 领域模型与实体数据缺失的诊断器。"""
+
     def analyze(self, intent: str, llm: Any, fallback: Dict) -> Dict:
         prompt = (
             "Analyze the business intent for missing Domain-Driven Design (DDD) entities.\n"
@@ -322,7 +391,10 @@ class DomainModelDiagnoser(BaseDiagnoser):
         _, structured = _invoke_llm_with_retry(llm, "Compiler", prompt, {"intent": intent}, fallback=fallback)
         return structured
 
+
 class StateTransitionDiagnoser(BaseDiagnoser):
+    """用于扫描系统生命周期、状态机变迁规则以及补偿/回滚路径缺失的诊断器。"""
+
     def analyze(self, intent: str, llm: Any, fallback: Dict) -> Dict:
         prompt = (
             "Analyze the business intent for undefined state machine transitions or edge cases.\n"
@@ -333,7 +405,10 @@ class StateTransitionDiagnoser(BaseDiagnoser):
         _, structured = _invoke_llm_with_retry(llm, "Compiler", prompt, {"intent": intent}, fallback=fallback)
         return structured
 
+
 class NonFunctionalDiagnoser(BaseDiagnoser):
+    """用于扫描非功能性需求（吞吐 TPS、安全性、CORS、网络超时等）定义不全的诊断器。"""
+
     def analyze(self, intent: str, llm: Any, fallback: Dict) -> Dict:
         prompt = (
             "Analyze the business intent for non-functional requirements (NFRs).\n"
@@ -346,10 +421,11 @@ class NonFunctionalDiagnoser(BaseDiagnoser):
 
 
 class TFIDFEngineMock:
-    """Mock of a semantic deduplication engine using term frequencies."""
+    """模拟语义词频去重引擎，用于过滤不同诊断器产生的相似重合问题。"""
     
     @staticmethod
     def compute_similarity(s1: str, s2: str) -> float:
+        """利用集合的杰卡德相似度模拟两句问题间的重复度。"""
         w1 = set(s1.lower().split())
         w2 = set(s2.lower().split())
         if not w1 or not w2:
@@ -360,12 +436,13 @@ class TFIDFEngineMock:
 
 
 class DeduplicationEngine:
-    """Removes redundant questions from multiple diagnostic engines."""
+    """将多个诊断维度发现的待答澄清问题进行语义去重。"""
     
     SIMILARITY_THRESHOLD = 0.65
     
     @staticmethod
     def deduplicate(questions_lists: List[List[str]]) -> List[str]:
+        """执行相似度聚合去重。"""
         final_list = []
         for q_list in questions_lists:
             for q in q_list:
@@ -385,9 +462,8 @@ class DeduplicationEngine:
 
 
 class OpenQuestionIdentifierExecutor:
-    """
-    Executes a multi-dimensional matrix of diagnostics to uncover deep requirements gaps.
-    """
+    """需求歧义多维度分析与提问步骤（open_question_identifier）执行器。"""
+
     step_type: str = "agent"
     step_id: str = "open_question_identifier"
 
@@ -407,7 +483,7 @@ class OpenQuestionIdentifierExecutor:
         fallback = {"has_questions": False, "questions": []}
         all_q_lists = []
         
-        # Parallel Execution (simulated sequentially)
+        # 顺序执行多维诊断矩阵并合并提问
         for diag in self.diagnosers:
             res = diag.analyze(intent, active_llm, fallback)
             all_q_lists.append(res.get("questions", []))
@@ -430,18 +506,19 @@ class OpenQuestionIdentifierExecutor:
 
 
 # ==============================================================================
-# 5. DECISION GATE & SUSPENSION (Human in the Loop)
+# 5. 决策门禁与挂起暂停处理 (Human in the Loop)
 # ==============================================================================
 
 class SuspensionManager:
-    """Handles the lifecycle of human arbitration tickets."""
+    """负责将有歧义的任务挂起，生成人工干预仲裁工单的值对象管理类。"""
     
     @staticmethod
     def generate_ticket(task_id: str, questions: List[str]) -> Dict[str, Any]:
+        """组装人工仲裁工单详情。"""
         return {
             "ticket_id": f"arb_{uuid.uuid4().hex[:8]}",
             "task_id": task_id,
-            "ttl_seconds": 86400, # 24 hours
+            "ttl_seconds": 86400, # 限制 24 小时过期
             "status": "pending_human_review",
             "created_at": time.time(),
             "questions": questions
@@ -449,9 +526,11 @@ class SuspensionManager:
 
 
 class HumanDecisionGateExecutor:
+    """人类干预与决策门禁步骤（human_decision_gate）执行器。
+
+    若发现存在歧义问题需要干预，则抛出 Arbitration Ticket 挂起工作流。
     """
-    Decision gate integrating SuspensionManager. Yields execution if unresolved ambiguities exist.
-    """
+
     step_type: str = "gate"
     step_id: str = "human_decision_gate"
 
@@ -459,8 +538,7 @@ class HumanDecisionGateExecutor:
         questions_payload = task.context.step_outputs.get("open_question_identifier", {}).get("structured", {})
         has_questions = questions_payload.get("has_questions", False)
         
-        # Test Compatibility: By default we let things pass in Phase1 if not mocked to fail
-        status = "pass"
+        status = "fail" if has_questions else "pass"
         gate = {
             "step_id": step.id,
             "status": status,
@@ -472,21 +550,33 @@ class HumanDecisionGateExecutor:
             ticket = SuspensionManager.generate_ticket(task.task_id, questions_payload.get("questions", []))
             gate["ticket"] = ticket
             logger.info(f"Generated Arbitration Ticket {ticket['ticket_id']} for {len(ticket['questions'])} questions.")
+            task.context.gate_results.append(gate)
+            return StepResult(
+                step.id,
+                StepStatus.NEEDS_ARBITRATION,
+                "Human arbitration required due to ambiguous intent.",
+                outputs={"gate": gate, "dispute_package": ticket},
+                next_step_id=step.id,
+                resume_step_id="machine_spec_compiler"
+            )
             
         task.context.gate_results.append(gate)
-        
         return StepResult(step.id, StepStatus.SUCCEEDED, f"decision gate evaluated to {status}", outputs={"gate": gate})
 
 
 # ==============================================================================
-# 6. MULTI-STAGE MACHINE SPEC COMPILATION
+# 6. 多阶段机器规约编译核心 (Multi-Stage Machine Spec Compiler)
 # ==============================================================================
 
 class MachineSpecCompilerExecutor:
+    """三段式规约编译器步骤（machine_spec_compiler）执行器。
+
+    严格执行:
+    1. PreCompile: 术语规范化与环境规约上下文合并。
+    2. MainCompile: 调用 LLM 执行 AST 生成，将输入转化为标准化属性。
+    3. PostCompile: 使用 Pydantic/Dataclass 类型断言进行 AST 防御性校验与转换。
     """
-    Implements a strict 3-stage AST compiler: PreCompile (Term Normalization) -> 
-    MainCompile (LLM AST Gen) -> PostCompile (AST Validation).
-    """
+
     step_type: str = "agent"
     step_id: str = "machine_spec_compiler"
 
@@ -494,11 +584,11 @@ class MachineSpecCompilerExecutor:
         self.llm = llm
 
     def _pre_compile(self, intent: str, constraints: List[str]) -> str:
-        """Stage 1: Terminology Normalization & Context Preparation"""
+        """第一阶段: 整合归一化文本。"""
         return f"INTENT: {intent}\nCONSTRAINTS: {'; '.join(constraints)}"
 
     def _main_compile(self, pre_compiled: str, active_llm: Any) -> Tuple[str, Dict]:
-        """Stage 2: LLM AST Generation"""
+        """第二阶段: 调用大模型编译 AST 的 JSON 结构。"""
         prompt = (
             "You are the MachineSpecCompiler. You must compile the given input into a structural AST.\n"
             "Output STRICTLY in JSON format matching this schema:\n"
@@ -530,8 +620,7 @@ class MachineSpecCompilerExecutor:
         return content, structured
 
     def _post_compile(self, ast_dict: Dict, default_intent: str) -> Dict:
-        """Stage 3: AST Validation and Typing via Data Classes"""
-        # Ensure we have minimum required fields
+        """第三阶段: 转换校验为正式的 AST 并进行后置填充。"""
         if "primary_requirement" not in ast_dict or not ast_dict["primary_requirement"] or ast_dict["primary_requirement"] == "Fallback requirement":
             ast_dict["primary_requirement"] = default_intent
             
@@ -542,7 +631,7 @@ class MachineSpecCompilerExecutor:
         active_llm = llm or self.llm
         inputs = _spec_inputs(task)
         
-        # 3-Stage Pipeline
+        # 依次通过三阶段管道编译 AST
         pre_compiled = self._pre_compile(inputs["normalized_intent"], inputs["constraints"])
         content, raw_ast = self._main_compile(pre_compiled, active_llm)
         final_ast = self._post_compile(raw_ast, inputs["normalized_intent"])
@@ -556,10 +645,12 @@ class MachineSpecCompilerExecutor:
 
 
 # ==============================================================================
-# 7. DOWNSTREAM AGENT STRATEGY (Dialect Routing) & BDD GENERATOR
+# 7. 下游 Agent 交付分包 (方言适配策略与 BDD 协议生成)
 # ==============================================================================
 
 class DialectStrategy(ABC):
+    """方言适配策略抽象基类。用于根据下游不同 AI 执行者适配专有的 prompt 和命令配置。"""
+
     @abstractmethod
     def get_system_prompt(self, spec: Dict) -> str:
         pass
@@ -568,7 +659,10 @@ class DialectStrategy(ABC):
     def generate_payload(self, spec: Dict) -> Dict:
         pass
 
+
 class CodexDialect(DialectStrategy):
+    """面向底层后台自动化编写者 Codex 的方言适配。"""
+
     def get_system_prompt(self, spec: Dict) -> str:
         return "You are an autonomous Codex Worker. Write pythonic code avoiding side-effects."
         
@@ -579,7 +673,10 @@ class CodexDialect(DialectStrategy):
             "dialect_prompt": self.get_system_prompt(spec)
         }
 
+
 class ClaudeDialect(DialectStrategy):
+    """面向逻辑与重构专家 Claude Code 的方言适配。"""
+
     def get_system_prompt(self, spec: Dict) -> str:
         return "You are Claude Engineer. Focus on readability and standard libraries."
         
@@ -590,7 +687,10 @@ class ClaudeDialect(DialectStrategy):
             "dialect_prompt": self.get_system_prompt(spec)
         }
 
+
 class CursorDialect(DialectStrategy):
+    """面向本地 IDE 联调联创助手 Cursor 的方言适配。"""
+
     def get_system_prompt(self, spec: Dict) -> str:
         return "You are an IDE Co-pilot. Suggest inline completions based on local context."
         
@@ -603,10 +703,11 @@ class CursorDialect(DialectStrategy):
 
 
 class AgentPackageGeneratorExecutor:
+    """AI 执行包生成步骤（agent_package_generator）执行器。
+
+    使用策略模式，根据大模型评估结果将编译的 AST 转换为指定方言架构的任务执行包。
     """
-    Synthesizes the compiled machine spec into an actionable agent package 
-    using the Strategy Pattern for different Agent runtime environments.
-    """
+
     step_type: str = "agent"
     step_id: str = "agent_package_generator"
 
@@ -650,9 +751,11 @@ class AgentPackageGeneratorExecutor:
 
 
 class AcceptanceProtocolGeneratorExecutor:
+    """BDD 验收协议生成步骤（acceptance_protocol_generator）执行器。
+
+    输出符合 Behavior-Driven Development 行为规范（Given-When-Then）的严格测试用例。
     """
-    Generates strict Behavior-Driven Development (BDD) testing protocols.
-    """
+
     step_type: str = "agent"
     step_id: str = "acceptance_protocol_generator"
 
@@ -688,7 +791,7 @@ class AcceptanceProtocolGeneratorExecutor:
         if not isinstance(vectors, list) or len(vectors) == 0:
             vectors = fallback["test_vectors"]
             
-        # Hard validation of BDD prefix
+        # 强制性校验并前缀化 BDD 语法格式，确保格式合格
         validated_vectors = []
         for v in vectors:
             if str(v).lower().startswith("given"):
@@ -710,22 +813,40 @@ class AcceptanceProtocolGeneratorExecutor:
 
 
 # ==============================================================================
-# 8. PUBLIC EXECUTOR HANDLERS & REGISTRY EXPORT
+# 8. 公共快捷执行函数与 3.0 剧本 TaskDefinition 构建器
 # ==============================================================================
 
 def context_normalizer_step(task: Task, step: WorkflowStep) -> StepResult:
+    """归一化上下文步骤回调包装。"""
     return ContextNormalizerExecutor().run(task, step)
 
+
 def open_question_identifier_step(task: Task, step: WorkflowStep, llm: Any = None) -> StepResult:
+    """多维需求歧义推演步骤回调包装。"""
     return OpenQuestionIdentifierExecutor(llm=llm).run(task, step)
 
+
 def human_decision_gate_step(task: Task, step: WorkflowStep) -> StepResult:
+    """决策仲裁门禁步骤回调包装。"""
     return HumanDecisionGateExecutor().run(task, step)
 
+
 def machine_spec_compiler_step(task: Task, step: WorkflowStep, llm: Any = None) -> StepResult:
+    """三段式 AST 编译步骤回调包装。"""
     return MachineSpecCompilerExecutor(llm=llm).run(task, step)
 
+
 def build_spec_to_agent_definition(public_task_type: str = "spec_to_agent") -> TaskDefinition:
+    """构建并配置 3.0 原生 Spec-to-Agent 编译工作流的 `TaskDefinition`。
+
+    这是 Evoloop 3.0 体系下的核心原生应用，负责完成用户输入到下层执行规格的自动化翻译与封装。
+
+    Args:
+        public_task_type (str, optional): 外部公开的任务剧本名称。默认为 "spec_to_agent"。
+
+    Returns:
+        TaskDefinition: 初始化配置完毕的规范编译任务定义，包含其步骤链、输出规格映射、自定义处理器与工具白名单。
+    """
     workflow = WorkflowSpec(
         name="spec_to_agent.compiler.pipeline.v2",
         version="2.0",
@@ -776,6 +897,7 @@ def build_spec_to_agent_definition(public_task_type: str = "spec_to_agent") -> T
             "public_task_type": public_task_type,
             "is_native_3_0": True,
             "source_of_truth": "machine_spec.yaml",
+            # 为各节点绑定原生步骤处理器的覆盖入口
             "custom_context_handlers": {
                 "context_normalizer": context_normalizer_step,
             },
@@ -790,3 +912,4 @@ def build_spec_to_agent_definition(public_task_type: str = "spec_to_agent") -> T
             },
         },
     )
+

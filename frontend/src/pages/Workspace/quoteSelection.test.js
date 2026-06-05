@@ -1,3 +1,8 @@
+/**
+ * @file quoteSelection.test.js
+ * @description 针对文本引用与选择逻辑 (quoteSelection.js) 的单元测试。
+ */
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -10,6 +15,7 @@ import {
   getQuoteTooltipLineClamp,
 } from './quoteSelection.js';
 
+// 测试追加多个不同来源的选择时，能正确聚合成单一的 draft 对象
 test('appendQuoteDraft aggregates multiple selections into one draft', () => {
   const first = buildQuoteDraft({
     sourceType: 'message',
@@ -33,6 +39,7 @@ test('appendQuoteDraft aggregates multiple selections into one draft', () => {
   assert.equal(summarizeQuoteDraft(updated), '2 个已选文本片段');
 });
 
+// 测试追加重复的引用源和文本时，去重机制应过滤掉重复项
 test('appendQuoteDraft ignores duplicate source and text pairs', () => {
   const item = buildQuoteDraft({
     sourceType: 'message',
@@ -48,6 +55,7 @@ test('appendQuoteDraft ignores duplicate source and text pairs', () => {
   assert.equal(summarizeQuoteDraft(duplicated), '1 个已选文本片段');
 });
 
+// 测试清空引用草稿状态，清空后应当返回 null
 test('clearQuoteDraft resets the draft state', () => {
   const item = buildQuoteDraft({
     sourceType: 'message',
@@ -59,6 +67,7 @@ test('clearQuoteDraft resets the draft state', () => {
   assert.equal(clearQuoteDraft(appendQuoteDraft(null, item)), null);
 });
 
+// 测试构造发给后端的决策 Payload 时，若包含引用项，需将其转换为下划线参数格式
 test('buildDecisionPayload includes quoted selections only when present', () => {
   const item = buildQuoteDraft({
     sourceType: 'message',
@@ -82,6 +91,7 @@ test('buildDecisionPayload includes quoted selections only when present', () => 
   assert.equal('quoted_selections' in plainPayload, false);
 });
 
+// 测试格式化 Tooltip 展示行时，能交替渲染来源标签与引用内容
 test('buildQuoteTooltipLines formats source-aware preview text', () => {
   const first = buildQuoteDraft({
     sourceType: 'message',
@@ -106,6 +116,7 @@ test('buildQuoteTooltipLines formats source-aware preview text', () => {
   ]);
 });
 
+// 测试当选中的单段引用文本太长时，能自动截断至 150 字符并追加省略号
 test('buildQuoteTooltipLines truncates long quote text to 150 chars', () => {
   const item = buildQuoteDraft({
     sourceType: 'message',
@@ -121,6 +132,7 @@ test('buildQuoteTooltipLines truncates long quote text to 150 chars', () => {
   assert.equal(lines[1].endsWith('…'), true);
 });
 
+// 测试当引用了多个条目时，为防 Tooltip 撑开，每个条目的字数预算应当动态缩减
 test('buildQuoteTooltipLines shortens each segment when there are more quoted items', () => {
   const item1 = buildQuoteDraft({
     sourceType: 'message',
@@ -151,9 +163,11 @@ test('buildQuoteTooltipLines shortens each segment when there are more quoted it
   assert.equal(tripleLines[5].length, tripleLines[1].length);
 });
 
+// 测试随着引用条目的增多，行数显示限制 -webkit-line-clamp 也应对应减少
 test('getQuoteTooltipLineClamp reduces lines as item count grows', () => {
   assert.equal(getQuoteTooltipLineClamp(1), 5);
   assert.equal(getQuoteTooltipLineClamp(2), 3);
   assert.equal(getQuoteTooltipLineClamp(3), 2);
   assert.equal(getQuoteTooltipLineClamp(6), 2);
 });
+

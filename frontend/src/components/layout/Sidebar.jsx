@@ -1,3 +1,8 @@
+/**
+ * @file Sidebar.jsx
+ * @description 应用侧边栏组件。渲染全局导航菜单、拉取并展示最近的任务对话历史列表，提供快速删除（归档）任务的入口。
+ */
+
 import React, { useEffect, useState } from 'react';
 import { NavLink, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { Zap, CheckSquare, BookOpen, ShieldCheck, Archive, Settings, ChevronRight } from 'lucide-react';
@@ -5,6 +10,10 @@ import { apiGet, apiDelete } from '../../api';
 import { flattenConversationGroups } from './sidebarHistory';
 import './sidebar.css';
 
+/**
+ * 侧边栏主导航项配置
+ * @type {Array<{icon: React.ReactNode, label: string, path: string, primary?: boolean, badge?: boolean|string}>}
+ */
 const navItems = [
   { icon: <Zap size={15} />, label: '新建任务', path: '/', primary: true },
   { icon: <CheckSquare size={15} />, label: '任务大厅', path: '/tasks' },
@@ -13,16 +22,28 @@ const navItems = [
   { icon: <Archive size={15} />, label: '归档与回收', path: '/recycle-bin' },
 ];
 
+/**
+ * Sidebar 侧边栏组件
+ * @component
+ */
 export function Sidebar() {
   const navigate = useNavigate();
   const location = useLocation();
+  // 从 URL 参数中获取当前选中的 activeTaskId 以高亮显示最近对话项
   const { id: activeTaskId } = useParams();
+  
+  // 对话历史分类状态：今天、昨天、更早
   const [today, setToday] = useState([]);
   const [yesterday, setYesterday] = useState([]);
   const [older, setOlder] = useState([]);
   const [historyError, setHistoryError] = useState(false);
+  
+  // 将按时间分好的对话历史，扁平化为带分组标签的数组供 JSX 渲染使用
   const historyItems = flattenConversationGroups({ today, yesterday, older });
 
+  /**
+   * 拉取最近对话/任务历史列表
+   */
   const fetchChats = () => {
     apiGet('/api/conversations/recent', null).then(data => {
       if (!data) {
@@ -39,11 +60,18 @@ export function Sidebar() {
     });
   };
 
+  // 当页面路由路径 (location.pathname) 发生改变时，自动重新加载最近对话历史
   useEffect(() => {
     fetchChats();
   }, [location.pathname]);
 
+  /**
+   * 删除/归档任务
+   * @param {React.MouseEvent} e - 事件对象
+   * @param {string} id - 任务 ID
+   */
   const handleDeleteTask = async (e, id) => {
+    // 阻止事件冒泡，防止触发外层 chat-item 的 onClick 路由跳转
     e.stopPropagation();
     await apiDelete(`/api/tasks/${id}`);
     fetchChats();
@@ -51,13 +79,13 @@ export function Sidebar() {
 
   return (
     <aside className="sidebar">
-      {/* Logo */}
+      {/* Logo 区域 */}
       <div className="sidebar-logo">
         <div className="logo-sq">E</div>
         <span className="logo-text">EvoLoop</span>
       </div>
 
-      {/* Nav */}
+      {/* 主导航链接列表 */}
       <nav className="sidebar-nav">
         {navItems.map((item, i) => (
           <NavLink
@@ -77,7 +105,7 @@ export function Sidebar() {
         ))}
       </nav>
 
-      {/* 最近对话 */}
+      {/* 最近对话历史区域 */}
       <div className="sidebar-section">
         <div className="section-row">
           <span className="section-label">最近对话</span>
@@ -90,6 +118,7 @@ export function Sidebar() {
           {!historyError && historyItems.length === 0 && (
             <div className="chat-empty">暂无任务历史</div>
           )}
+          {/* 循环渲染历史项，可以是时间分组标题(type === 'group')，也可以是具体的对话项 */}
           {!historyError && historyItems.map((entry, index) => entry.type === 'group' ? (
             <div key={`${entry.label}-${index}`} className="chat-group-label">{entry.label}</div>
           ) : (
@@ -110,7 +139,7 @@ export function Sidebar() {
         </div>
       </div>
 
-      {/* Footer */}
+      {/* 底部用户信息栏 */}
       <div className="sidebar-footer">
         <div className="user-row">
           <div className="user-av">E</div>
@@ -121,3 +150,4 @@ export function Sidebar() {
     </aside>
   );
 }
+

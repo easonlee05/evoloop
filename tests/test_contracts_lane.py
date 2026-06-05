@@ -1,4 +1,13 @@
-"""Unit tests for Evoloop 3.0 Contracts."""
+"""Evoloop 3.0 契约（Contracts）的单元测试模块。
+
+本模块主要测试核心契约层的数据模型序列化、反序列化、合法性校验、持久化机制等。
+主要覆盖的测试场景包括：
+- WorkItem、Playbook、ProductContext、DecisionGate、WorkerAdapter、ReviewResult 等核心对象的序列化与反序列化。
+- ArtifactGraph 的完整性与依赖关系校验（检测 machine_spec 存在性、依赖循环、错误关系等）。
+- Blackboard（黑板）的权限控制、动态加载、Union 类型检查和审计事件回调。
+- TaskDAG 的拓扑排序、悬挂边校验、循环依赖检测及条件边属性。
+- 各种模型（如 WorkItem, Playbook, ProductContext 等）在 JSON 与 YAML 格式下的文件持久化及异常处理。
+"""
 import unittest
 from uuid import uuid4
 
@@ -21,7 +30,17 @@ from app.services.playbook_service import PlaybookService
 
 
 class TestContractsLane(unittest.TestCase):
+    """契约层核心功能测试类。
+
+    维护各类核心数据结构在各种边界场景下的业务逻辑、完整性校验、持久化和序列化测试。
+    """
+
     def test_work_item_serialization(self):
+        """测试 WorkItem 对象的字典序列化和反序列化流程。
+
+        验证序列化生成的字典中各关键字段（如 work_type, status）的正确性，
+        以及通过 from_dict 还原后的对象属性与原始对象完全一致。
+        """
         item = WorkItem(
             work_type=WorkType.SPEC_TO_AGENT,
             playbook_id="playbook_123",
@@ -32,11 +51,13 @@ class TestContractsLane(unittest.TestCase):
             artifact_graph_ref="graph_ref_001",
             status=WorkStatus.CREATED
         )
+        # 序列化为字典
         d = item.to_dict()
         self.assertEqual(d["work_type"], "spec_to_agent")
         self.assertEqual(d["status"], "created")
         self.assertEqual(d["playbook_id"], "playbook_123")
 
+        # 从字典反序列化还原
         item2 = WorkItem.from_dict(d)
         self.assertEqual(item2.work_id, item.work_id)
         self.assertEqual(item2.work_type, WorkType.SPEC_TO_AGENT)
@@ -44,6 +65,10 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(item2.product_context_ref, "ctx_ref_001")
 
     def test_playbook_serialization(self):
+        """测试 Playbook 及其内部步骤 PlaybookStep 的序列化与反序列化。
+
+        确保 playbook 标识符、嵌套的步骤列表、工具白名单等属性在转换过程中不丢失。
+        """
         step = PlaybookStep(
             step_id="step_1",
             title="Step One",
@@ -60,16 +85,23 @@ class TestContractsLane(unittest.TestCase):
             allowed_tools=["material.read", "artifact.write"],
             output_artifact_types=["machine_spec", "agent_package"]
         )
+        # 执行序列化
         d = playbook.to_dict()
         self.assertEqual(d["playbook_id"], "playbook_v3_spec")
         self.assertEqual(d["steps"][0]["step_id"], "step_1")
 
+        # 执行反序列化还原
         playbook2 = Playbook.from_dict(d)
         self.assertEqual(playbook2.playbook_id, "playbook_v3_spec")
         self.assertEqual(len(playbook2.steps), 1)
         self.assertEqual(playbook2.steps[0].title, "Step One")
 
     def test_product_context_serialization(self):
+        """测试 ProductContext (产品上下文) 及其关联的业务对象（如需求、约束等）的序列化。
+
+        验证包括 SourceInput、Requirement、ProductConstraint、ProductAssumption 等在内的嵌套数据结构
+        是否能够正确地序列化为字典，并能成功反序列化还原。
+        """
         ctx = ProductContext(
             objective="Test Objective",
             source_inputs=[SourceInput(input_id="in_1", kind="brief", summary="Brief details")],
@@ -79,10 +111,12 @@ class TestContractsLane(unittest.TestCase):
             knowledge_refs=[KnowledgeRef(knowledge_id="kn_1", kind="api", summary="API spec")],
             worker_feedback=[WorkerFeedback(feedback_id="fb_1", worker_id="codex", summary="Done")]
         )
+        # 执行序列化
         d = ctx.to_dict()
         self.assertEqual(d["objective"], "Test Objective")
         self.assertEqual(d["requirements"][0]["requirement_id"], "req_1")
 
+        # 执行反序列化还原并做多级断言
         ctx2 = ProductContext.from_dict(d)
         self.assertEqual(ctx2.objective, "Test Objective")
         self.assertEqual(ctx2.requirements[0].statement, "Must support SSO")
@@ -90,6 +124,10 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(ctx2.assumptions[0].statement, "Internet is up")
 
     def test_decision_gate_serialization(self):
+        """测试 DecisionGate (决策网关) 及其决议 (GateResolution) 的序列化。
+
+        验证决策选项、网关阻塞属性、状态以及最终决策方案的序列化与反序列化逻辑。
+        """
         option = DecisionOption(option_id="opt_a", label="Option A", summary="Choose A")
         resolution = GateResolution(selected_option_id="opt_a", rationale="Simplest option")
         gate = DecisionGate(
@@ -102,16 +140,22 @@ class TestContractsLane(unittest.TestCase):
             status=DecisionGateStatus.OPEN,
             resolution=resolution
         )
+        # 序列化
         d = gate.to_dict()
         self.assertEqual(d["gate_id"], "gate_1")
         self.assertEqual(d["resolution"]["selected_option_id"], "opt_a")
 
+        # 反序列化
         gate2 = DecisionGate.from_dict(d)
         self.assertEqual(gate2.gate_id, "gate_1")
         self.assertEqual(gate2.options[0].label, "Option A")
         self.assertEqual(gate2.resolution.rationale, "Simplest option")
 
     def test_worker_adapter_serialization(self):
+        """测试 WorkerAdapter (执行体适配器) 的序列化。
+
+        校验适配器标识、目标类型、调用策略及结果接收策略在序列化前后的一致性。
+        """
         adapter = WorkerAdapter(
             adapter_id="adapter_claude",
             target_type=WorkerTargetType.CLAUDE_CODE,
@@ -119,16 +163,22 @@ class TestContractsLane(unittest.TestCase):
             invocation_policy={"timeout": 60},
             result_intake_policy={"format": "diff"}
         )
+        # 序列化
         d = adapter.to_dict()
         self.assertEqual(d["adapter_id"], "adapter_claude")
         self.assertEqual(d["target_type"], "claude_code")
 
+        # 反序列化
         adapter2 = WorkerAdapter.from_dict(d)
         self.assertEqual(adapter2.adapter_id, "adapter_claude")
         self.assertEqual(adapter2.target_type, WorkerTargetType.CLAUDE_CODE)
         self.assertEqual(adapter2.package_format, "markdown")
 
     def test_review_result_serialization(self):
+        """测试 ReviewResult (验收/审查结果) 及其内部的覆盖率、缺陷列表、修复任务的序列化。
+
+        验证验收结论（verdict）及各关联子对象的属性在序列化和反序列化中均能被完整还原。
+        """
         coverage = RequirementCoverage(requirement_id="req_1", covered=True, evidence_refs=["log_1"])
         issue = ReviewIssue(issue_id="issue_1", severity=ReviewIssueSeverity.MAJOR, summary="Security leak")
         fix_task = ReviewFixTask(task_id="fix_1", title="Sanitize input", source_issue_ids=["issue_1"])
@@ -142,12 +192,14 @@ class TestContractsLane(unittest.TestCase):
             fix_tasks=[fix_task],
             acceptance_protocol_ref="protocol_1"
         )
+        # 序列化
         d = result.to_dict()
         self.assertEqual(d["verdict"], "changes_required")
         self.assertEqual(d["coverage"][0]["requirement_id"], "req_1")
         self.assertEqual(d["issues"][0]["summary"], "Security leak")
         self.assertEqual(d["fix_tasks"][0]["title"], "Sanitize input")
 
+        # 反序列化还原
         result2 = ReviewResult.from_dict(d)
         self.assertEqual(result2.work_id, "work_1")
         self.assertEqual(result2.verdict, ReviewVerdict.CHANGES_REQUIRED)
@@ -156,6 +208,11 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(result2.fix_tasks[0].source_issue_ids, ["issue_1"])
 
     def test_artifact_graph_validation_success(self):
+        """测试 ArtifactGraph 在合法配置下的拓扑关系校验。
+
+        构建包含 machine_spec（唯一真相源）、PRD 和 agent_package 的合法图结构，
+        验证 graph.validate() 能够顺利通过，并能正确识别出唯一的真相源节点。
+        """
         spec_ref = ArtifactRef(name="machine_spec.yaml", storage_uri="s3://specs/1")
         prd_ref = ArtifactRef(name="PRD.md", storage_uri="s3://prds/1")
         package_ref = ArtifactRef(name="package.md", storage_uri="s3://packages/1")
@@ -177,15 +234,26 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(graph.source_of_truth_node().node_id, "n_spec")
 
     def test_artifact_graph_validation_no_machine_spec_with_projections(self):
+        """测试 ArtifactGraph 中缺少 machine_spec 真相源时的校验拦截。
+
+        验证当图中只存在投影节点（如 PRD）而没有 machine_spec 节点时，
+        调用 validate() 会抛出 ArtifactGraphValidationError 异常。
+        """
         prd_ref = ArtifactRef(name="PRD.md", storage_uri="s3://prds/1")
         prd_node = ArtifactNode(node_id="n_prd", type=ArtifactNodeType.OPTIONAL_PRD, artifact_ref=prd_ref)
 
         graph = ArtifactGraph(work_id="work_1", nodes=[prd_node], edges=[])
+        # 验证必须且仅能包含一个 machine_spec 真相源
         with self.assertRaises(ArtifactGraphValidationError) as context:
             graph.validate()
         self.assertIn("must contain exactly one machine_spec", str(context.exception))
 
     def test_artifact_graph_validation_multiple_machine_specs(self):
+        """测试 ArtifactGraph 中存在多个 machine_spec 真相源时的校验拦截。
+
+        验证当图中存在两个及以上的 machine_spec 节点时，
+        调用 validate() 会抛出 ArtifactGraphValidationError 异常。
+        """
         spec_ref1 = ArtifactRef(name="machine_spec1.yaml")
         spec_ref2 = ArtifactRef(name="machine_spec2.yaml")
 
@@ -193,11 +261,17 @@ class TestContractsLane(unittest.TestCase):
         spec_node2 = ArtifactNode(node_id="n_spec2", type=ArtifactNodeType.MACHINE_SPEC, artifact_ref=spec_ref2)
 
         graph = ArtifactGraph(work_id="work_1", nodes=[spec_node1, spec_node2], edges=[])
+        # 验证真相源重复时的拦截
         with self.assertRaises(ArtifactGraphValidationError) as context:
             graph.validate()
         self.assertIn("must contain exactly one machine_spec", str(context.exception))
 
     def test_artifact_graph_validation_unconnected_projection_node(self):
+        """测试 ArtifactGraph 中存在孤立投影节点时的校验拦截。
+
+        验证当图中的投影节点（如 PRD）没有与 machine_spec 建立任何依赖连接时，
+        调用 validate() 会正确检测到断联并抛出校验异常。
+        """
         spec_ref = ArtifactRef(name="machine_spec.yaml")
         prd_ref = ArtifactRef(name="PRD.md")
 
@@ -206,11 +280,17 @@ class TestContractsLane(unittest.TestCase):
 
         # 没有边连接 prd_node 和 spec_node
         graph = ArtifactGraph(work_id="work_1", nodes=[spec_node, prd_node], edges=[])
+        # 验证孤立节点拦截
         with self.assertRaises(ArtifactGraphValidationError) as context:
             graph.validate()
         self.assertIn("is disconnected from the machine_spec source of truth", str(context.exception))
 
     def test_artifact_graph_validation_reverse_dependence_on_projection(self):
+        """测试 ArtifactGraph 中真相源错误地依赖于投影节点（逆向依赖）时的校验拦截。
+
+        验证当 machine_spec 通过 DERIVES_FROM 错误地依赖于 PRD 时，
+        调用 validate() 会拦截并报错，确保真相源不能衍生自投影产物。
+        """
         spec_ref = ArtifactRef(name="machine_spec.yaml")
         prd_ref = ArtifactRef(name="PRD.md")
 
@@ -226,11 +306,17 @@ class TestContractsLane(unittest.TestCase):
         )
 
         graph = ArtifactGraph(work_id="work_1", nodes=[spec_node, prd_node], edges=[bad_edge])
+        # 校验逆向依赖拦截
         with self.assertRaises(ArtifactGraphValidationError) as context:
             graph.validate()
         self.assertIn("is invalid because the source of truth cannot derive from", str(context.exception))
 
     def test_artifact_graph_cycle_detection(self):
+        """测试 ArtifactGraph 中存在循环依赖（环）时的校验拦截。
+
+        构建 brief -> prd -> brief 这样的循环依赖，并与真相源连接，
+        验证 validate() 能够正确检测出依赖环并抛出异常。
+        """
         spec_ref = ArtifactRef(name="machine_spec.yaml")
         prd_ref = ArtifactRef(name="PRD.md")
         brief_ref = ArtifactRef(name="human_brief.md")
@@ -245,11 +331,17 @@ class TestContractsLane(unittest.TestCase):
         edge2 = ArtifactEdge(edge_id="e2", from_node_id="n_brief", to_node_id="n_prd", type=ArtifactEdgeType.DERIVES_FROM)
         
         graph = ArtifactGraph(work_id="work_loop", nodes=[spec_node, prd_node, brief_node], edges=[edge_init, edge1, edge2])
+        # 校验循环依赖拦截
         with self.assertRaises(ArtifactGraphValidationError) as context:
             graph.validate()
         self.assertIn("contains a dependency loop/cycle", str(context.exception))
 
     def test_artifact_graph_edge_type_constraints(self):
+        """测试 ArtifactGraph 边类型约束（Edge Type Constraints）的组合验证。
+
+        针对 REVIEWS、VALIDATES、ADDRESSES_REQUIREMENT、RESOLVES_DECISION 和 SUPERSEDES 等不同关系类型，
+        分别验证合法的连接配置能够通过校验，而违反约束的错误配置会被 validate() 精准拦截并报错。
+        """
         from app.core.artifact_graph import (
             ArtifactGraph, ArtifactNode, ArtifactEdge, ArtifactRef,
             ArtifactNodeType, ArtifactEdgeType, ArtifactGraphValidationError
@@ -422,6 +514,11 @@ class TestContractsLane(unittest.TestCase):
         self.assertIn("referencing non-existent node", str(context.exception))
 
     def test_playbook_service_uses_frozen_contract_field_names(self):
+        """测试 PlaybookService 在启动 Playbook 时对工作项及黑板状态的处理。
+
+        验证服务能够正确根据工作项和剧本规格初始化工作流，并确保其状态变为 RUNNING，
+        同时检查其在 active_dags 和 blackboards 中均已成功注册。
+        """
         item = WorkItem(
             work_type=WorkType.SPEC_TO_AGENT,
             playbook_id="playbook_v3_spec",
@@ -453,6 +550,15 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(item.status, WorkStatus.RUNNING)
 
     def test_blackboard_slot_permission_and_type_safety(self):
+        """测试 Blackboard（黑板）的权限控制与动态类型安全校验。
+
+        验证以下业务场景：
+        1. 允许的写者和读者在鉴权通过时能够正常进行读写。
+        2. 写入与注册槽类型不符的数据时抛出 TypeError。
+        3. 未在 allowed_writers 中的角色写入时拦截并抛出 PermissionError。
+        4. 未在 allowed_readers 中的角色读取时拦截并抛出 PermissionError。
+        5. 只读角色（审计节点）可以成功读取但不能进行写入。
+        """
         from app.core.blackboard import Blackboard, BlackboardSlot
 
         blackboard = Blackboard()
@@ -488,6 +594,13 @@ class TestContractsLane(unittest.TestCase):
             blackboard.write("config_slot", {"theme": "light"}, caller_id="audit_node")
 
     def test_task_dag_deep_validation_and_topological_sort(self):
+        """测试 TaskDAG 的深度校验逻辑与拓扑排序功能。
+
+        验证以下场景：
+        1. 正常的有向无环图（DAG）能够通过校验并正确输出拓扑排序序列。
+        2. 存在悬挂边（依赖了不存在的节点）时校验失败并抛出正确的错误码（dag.dangling_dependency）。
+        3. 存在循环依赖（环）时校验失败并抛出正确的错误码（dag.cyclic_dependency）。
+        """
         from app.core.dag import TaskDAG, DAGNode
         from app.core.errors import DomainError
 
@@ -536,6 +649,11 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(ctx_cycle_sort.exception.code, "dag.cyclic_dependency")
 
     def test_strong_type_file_persistence(self):
+        """测试 ProductContext 和 ArtifactGraph 强类型对象的本地文件持久化及加载。
+
+        通过 tempfile 生成临时 JSON 文件，执行保存与加载操作，
+        验证加载后的对象类型及属性字典与原始强类型对象 100% 一致。
+        """
         import tempfile
         import os
         from app.core.playbook import (
@@ -612,6 +730,12 @@ class TestContractsLane(unittest.TestCase):
                 os.remove(temp_path_graph)
 
     def test_blackboard_dynamic_loading_and_audit(self):
+        """测试 Blackboard 从字典动态加载槽定义以及审计回调函数的功能。
+
+        验证：
+        1. 从包含类型、读写权限字典的列表动态解析并成功在黑板上注册槽。
+        2. 注册审计回调，拦截并记录每一次正常的或越权的读写尝试，确保其记录的行为和成功标志准确无误。
+        """
         from app.core.blackboard import Blackboard
         blackboard = Blackboard()
         
@@ -654,6 +778,14 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(audit_events[1], ("malicious_user", "write", "dynamic_int", False))
 
     def test_blackboard_improvements(self):
+        """测试 Blackboard 的多项改进机制。
+
+        覆盖的场景包括：
+        1. 匿名读写（caller_id 为 None）时自动将操作者记录为 system。
+        2. 对 Union 复杂类型的兼容性，验证 Union[int, str] 能够允许整型和字符串写入但拦截浮点型。
+        3. 严格模式（strict=True）下强制拦截未注册槽的读写。
+        4. 验证审计回调抛出异常时，主业务流程（读写操作）不崩溃且能正常进行。
+        """
         from app.core.blackboard import Blackboard, BlackboardSlot
         from typing import Union
 
@@ -710,6 +842,11 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(blackboard.read("registered_key"), "new_value")
 
     def test_task_dag_conditions_and_serialization(self):
+        """测试 TaskDAG 节点的条件边属性配置及其序列化/反序列化。
+
+        验证 DAGNode 的 conditions 条件属性能够被正确存取，并且 TaskDAG 在执行 JSON
+        和 YAML 保存与重新加载后，其节点属性、依赖及条件状态依然保持完好。
+        """
         from app.core.dag import TaskDAG, DAGNode, NodeStatus
         import tempfile
         import os
@@ -767,6 +904,11 @@ class TestContractsLane(unittest.TestCase):
                 os.remove(temp_path_yaml)
 
     def test_contract_persistence_helpers(self):
+        """综合测试各核心契约模型（WorkItem、Playbook、ProductContext 等）的持久化辅助方法。
+
+        使用统一的临时文件清理框架，循环测试各核心对象在 JSON 与 YAML 格式下的保存与加载，
+        校验保存前后的数据一致性，并验证当文件不存在或格式损坏时能正确抛出 DomainError(persistence.load_failed)。
+        """
         import tempfile
         import os
         from app.core.errors import DomainError
@@ -881,7 +1023,7 @@ class TestContractsLane(unittest.TestCase):
                 edges=[edge]
             )
 
-            # Test save and load for JSON and YAML for all objects
+            # 测试 JSON 和 YAML 的保存与读取逻辑
             targets = [
                 ("WorkItem", original_work_item, WorkItem),
                 ("Playbook", original_playbook, Playbook),
@@ -902,13 +1044,13 @@ class TestContractsLane(unittest.TestCase):
                         f"Mismatch after saving/loading {name} with extension {ext}"
                     )
             
-            # 7. Verify exception throwing for non-existent file
+            # 7. 验证加载不存在文件时抛出异常
             non_existent_path = "/non_existent_dir/no_file.json"
             with self.assertRaises(DomainError) as context_none:
                 WorkItem.load_from_file(non_existent_path)
             self.assertEqual(context_none.exception.code, "persistence.load_failed")
             
-            # 8. Verify exception throwing for invalid YAML/JSON content
+            # 8. 验证加载损坏的文件时抛出异常
             invalid_content_path = get_temp_path(".yaml")
             with open(invalid_content_path, "w", encoding="utf-8") as f:
                 f.write("invalid: [unclosed bracket")
@@ -918,6 +1060,7 @@ class TestContractsLane(unittest.TestCase):
             self.assertEqual(context_invalid.exception.code, "persistence.load_failed")
 
         finally:
+            # 清理临时生成的文件
             for path in temp_files:
                 if os.path.exists(path):
                     try:

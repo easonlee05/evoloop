@@ -1,7 +1,7 @@
 # AGENTS.md — PM-Agent 平台工作规则
 
 > 适用工具：Claude Code、Codex、Antigravity 及所有 AI 编程工具。
-> 本仓库当前以 `AGENT_MAP.md`、`docs/evoloop-3.0/architecture/00-global-architecture.md` 和 `docs/evoloop-3.0/technical/00-evolution-roadmap.md` 作为导航与实现路线来源。
+> 本仓库当前以 `AGENT_MAP.md`、`docs/evoloop-3.1/architecture/00-global-architecture.md` 和 `docs/evoloop-3.1/technical/00-agent-session-evolution.md` 作为导航与实现路线来源。
 
 ---
 
@@ -11,14 +11,13 @@
 
 1. 本文件：职责边界、禁止事项、验证方式
 2. `AGENT_MAP.md`：仓库导航、文件职责、常见修改路径
-3. `docs/evoloop-3.0/architecture/00-global-architecture.md`：3.0 架构真相源
-4. `docs/evoloop-3.0/technical/00-evolution-roadmap.md`：1.0 到 3.0 技术演进路线
-5. `docs/evoloop-3.0/technical/01-parallel-development-boundaries.md`：并行开发边界规范
-6. 用 `rg` 定位相关符号，只展开与任务直接相关的模块
+3. `docs/evoloop-3.1/architecture/00-global-architecture.md`：3.1 架构真相源
+4. `docs/evoloop-3.1/technical/00-agent-session-evolution.md`：3.1 AgentSession 技术演进路线
+5. 用 `rg` 定位相关符号，只展开与任务直接相关的模块
 
 **重要：**
 - `docs/evoloop-2.0-fullchain/` 和 `docs/vision/pm_agent_v2_vision.md` 只作为历史参考，不再作为当前目标架构真相源。
-- 如果 2.0 文档与 3.0 文档冲突，始终以 3.0 文档为准。
+- 如果 2.0/3.0 文档与 3.1 文档冲突，始终以 3.1 文档为准。
 
 **默认不读：**
 - `.env`：可能含凭证
@@ -35,15 +34,16 @@
 
 ## 当前目标架构
 
-本仓库当前目标是 Evoloop 3.0：以“数字产品经理”作为系统核心，而不是以 PRD/操作手册生成作为中心。
+本仓库当前目标是 Evoloop 3.1：以“数字产品经理”作为系统核心，而不是以 PRD/操作手册生成作为中心。
 
-3.0 的主方向是：
+3.1 的主方向是：
 
 - 把业务意图编译为 AI 可执行规格、任务包和验收协议
-- 让 Codex / Claude Code / Cursor 等 AI worker 成为下游执行者
+- 让 Codex / Claude Code / Cursor / Antigravity 等 AI 技术同事与数字 PM 平级协作，就像产品经理与工程师协作，而不是上下游关系
+- 采用 “Playbook 控流程，AgentSession 控推理，ToolPolicy 控权限，Acceptance Review 控闭环” 的 3.1 形态
 - 通过 Decision Gate、Artifact Graph、Acceptance Review 和长期产品记忆形成闭环
 
-现有 `manual` 和 `prd` 仍然存在，但在 3.0 中应被视为 legacy playbook 或可选 artifact，而不是系统最终产品定位。
+现有 `manual` 和 `prd` 仍然存在，但在 3.1 中应被视为 legacy playbook 或可选 artifact，而不是系统最终产品定位。
 
 旧 `app/workflow/orchestrator.py`、`app/workflow/prd_orchestrator.py`、`app/server.py`、`app/chat.py`、`app/main.py` 不再是主架构入口。
 
@@ -60,9 +60,10 @@
 | Workflow | `app/workflows/prd.py` | prd TaskDefinition |
 | Service | `app/services/task_service.py` | 创建、运行、恢复、取消任务 |
 | Service | `app/services/tool_service.py` | Tool 白名单、权限、事件审计 |
+| Service | `app/services/agent_runtime/` | 3.1 目标新增层：AgentSession 多轮推理、tool_use、schema 校验 |
 | API | `app/api/server.py` | FastAPI API/SSE surface |
 | Frontend | `frontend/src/api.js` | EvoLoop 前端 API helper |
-| Contract | `docs/evoloop-3.0/technical/00-evolution-roadmap.md` | 当前实现路线与重构阶段真相源 |
+| Contract | `docs/evoloop-3.1/technical/00-agent-session-evolution.md` | 当前 AgentSession 演进路线与实施基准 |
 
 ---
 
@@ -82,10 +83,10 @@
 
 ## 前端协作规则
 
-- Antigravity/Claude 负责 `frontend/` UI 与样式；Codex 后端只做必要 API 接入。
+- Antigravity/Claude/Codex 按专业分工平级协作；前端 UI 与样式改动需遵守既有设计边界，后端 API 接入由后端统一维护。
 - 不要轻易改 `frontend/**/*.css` 或设计 token。
 - 前端通过稳定 API/SSE 协议协作，不解析后端日志文本。
-- 后端主维护 3.0 文档和实现路线；前端提出变更后，由后端统一更新对应文档与实现边界。
+- 后端主维护 3.1 文档和实现路线；前端提出变更后，由后端统一更新对应文档与实现边界。
 - `frontend/src/pages/Workspace/` 是有效工作台页面；根目录 `.gitignore` 只忽略 `/workspace/`，避免误伤该页面。
 
 ---

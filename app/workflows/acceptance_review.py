@@ -1,30 +1,45 @@
-"""Native Acceptance Review TaskDefinition for Evoloop 3.0 (Enterprise Architecture Edition)."""
+"""Evoloop 3.0 原生验收评审（Acceptance Review）工作流任务定义模块。
+
+该模块实现了 3.0 架构下的验收控制面，通过自动化解析 Git Diff，并以插件式架构
+（SecurityAudit、ArchitectureAudit、TechnicalDebtAudit）分析代码变更对系统安全、DDD 架构边界的影响，
+最终与机器规范进行 RTM（需求追溯矩阵）比对，编译产出结构化的验收评审报告（review_result.md）并更新产物依赖图（Artifact Graph）。
+"""
 from __future__ import annotations
 
 import json
 import logging
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.core.artifact_graph import ArtifactEdge, ArtifactEdgeType, ArtifactGraph, ArtifactNode, ArtifactNodeType, ArtifactRef
-from app.core.review import ReviewResult, ReviewVerdict, ReviewIssue, ReviewFixTask as FixTask, RequirementCoverage, ReviewIssueSeverity as IssueSeverity
 from app.core.errors import DomainError
+from app.core.review import RequirementCoverage, ReviewFixTask as FixTask, ReviewIssue, ReviewIssueSeverity as IssueSeverity, ReviewResult, ReviewVerdict
 from app.core.task import StepResult, StepStatus, Task, TaskDefinition, WorkflowSpec, WorkflowStep
 from app.workflows.policies import build_default_tool_policy
 
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 1. ENTERPRISE LLM HELPER & ERROR HANDLING
+# 1. 核心 LLM 辅助工具与重试机制
 # ==============================================================================
 
+
 def _extract_json_from_markdown(text: str) -> str:
+    """从大语言模型的 markdown 响应中安全清洗并提取 JSON 字符串。
+
+    Args:
+        text (str): 包含可能由 ``` 块包裹的文本。
+
+    Returns:
+        str: 提取出来的干净 JSON 字符串。
+    """
     if not text:
         return "{}"
     match = re.search(r"```(?:json|JSON)?(.*?)```", text, re.DOTALL)
     if match:
         content = match.group(1).strip()
+        # 清洗可能存在的结尾多余逗号
         content = re.sub(r",\s*}", "}", content)
         content = re.sub(r",\s*]", "]", content)
         return content
@@ -45,7 +60,22 @@ def _invoke_llm_with_retry(
     retries: int = 4,
     fallback: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Strict LLM invocation wrapper with circuit breaker and fallback."""
+    """具有自动重试与错误提示修复的 LLM 安全调用包装器。
+
+    Args:
+        llm (Any): 大语言模型实例。
+        role (str): 调用时的角色。
+        prompt (str): 主提示词模板。
+        context (Dict[str, Any]): 上下文变量。
+        retries (int, optional): 最大重试次数。默认为 4。
+        fallback (Optional[Dict[str, Any]], optional): 故障降级回退字典。默认为 None。
+
+    Returns:
+        Tuple[str, Dict[str, Any]]: (LLM 回答的原始字符串, 成功解析出的 JSON 结构)
+
+    Raises:
+        DomainError: 当 LLM 缺失或重试耗尽且未定义 fallback 时抛出。
+    """
     if not llm:
         if fallback is not None:
             return "No LLM available, using fallback.", fallback
@@ -84,18 +114,29 @@ def _invoke_llm_with_retry(
 
 
 # ==============================================================================
-# 2. DIFF PARSING AND AST EXTRACTION
+# 2. DIFF 分析与抽象语法树（AST）上下文提取
 # ==============================================================================
 
 class DiffLineState:
+    """变更行状态常数。"""
     UNCHANGED = 0
     ADDED = 1
     DELETED = 2
 
+
 class GitDiffParser:
-    """Enterprise-grade parsing of unified diffs into structural block representations."""
+    """Git 统一差异（Unified Diff）格式解析器。"""
+
     @staticmethod
     def parse(diff_text: str) -> List[Dict[str, Any]]:
+        """将 Unified Diff 文本解析为包含 hunk 和行级细节的结构化文件字典列表。
+
+        Args:
+            diff_text (str): 原始 Git Diff 文本。
+
+        Returns:
+            List[Dict[str, Any]]: 结构化的变更文件元数据及变更行块信息。
+        """
         if not diff_text:
             return []
             
@@ -139,10 +180,11 @@ class GitDiffParser:
 
 
 class ASTSnippetExtractor:
-    """Uses Regex Heuristics to simulate AST context extraction from unified diffs."""
+    """利用正则特征模拟从 Diff Hunk 中快速提取受影响的 Python 类与函数定义上下文。"""
     
     @staticmethod
     def extract_python_context(diff_hunks: List[Dict]) -> List[str]:
+        """识别被修改的代码行所归属的类名或函数名。"""
         snippets = []
         class_regex = re.compile(r"^\s*class\s+([A-Za-z0-9_]+)")
         func_regex = re.compile(r"^\s*def\s+([A-Za-z0-9_]+)")
@@ -165,6 +207,7 @@ class ASTSnippetExtractor:
 
     @staticmethod
     def extract(parsed_diff: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        """扫描全量变更文件，构造受影响的代码实体映射表。"""
         results = {}
         for file_obj in parsed_diff:
             filename = file_obj["filename"]
@@ -176,9 +219,11 @@ class ASTSnippetExtractor:
 
 
 class IngestAcceptanceContextExecutor:
+    """验收评审上下文摄入步骤（ingest_acceptance_context）执行器。
+
+    解析 diff 文本并映射到受影响的类与方法（ASTSnippet）。
     """
-    Ingests and maps diff changes to specific AST boundaries.
-    """
+
     step_type: str = "context"
     step_id: str = "ingest_acceptance_context"
 
@@ -190,7 +235,7 @@ class IngestAcceptanceContextExecutor:
         ast_map = ASTSnippetExtractor.extract(parsed_diff)
         
         req_ids = []
-        # Dynamic Heuristic matching based on the spec
+        # 根据规约文档关键字动态做匹配启发
         if "req_login" in machine_spec:
             req_ids.append("req_login")
         if "req_payment" in machine_spec:
@@ -212,18 +257,22 @@ class IngestAcceptanceContextExecutor:
             outputs=outputs,
         )
 
+
 def ingest_acceptance_context_step(task: Task, step: WorkflowStep) -> StepResult:
+    """快捷回调封装：解析验收上下文。"""
     return IngestAcceptanceContextExecutor().run(task, step)
 
 
 # ==============================================================================
-# 3. REQUIREMENTS TRACEABILITY MATRIX (Map-Reduce Simulator)
+# 3. 需求追溯矩阵 RTM 评估 (RTM Evaluator)
 # ==============================================================================
 
 class RequirementCoverageExecutor:
+    """需求覆盖审查步骤（requirement_coverage）执行器。
+
+    将代码库变更点与系统规格需求进行比对，确认每一项业务约束都在变更中被有效覆盖，并寻找关联的代码实证。
     """
-    Evaluates traceability coverage. Simulates chunking/Map-Reduce for large requirement pools.
-    """
+
     step_type: str = "agent"
     step_id: str = "requirement_coverage"
 
@@ -275,17 +324,33 @@ class RequirementCoverageExecutor:
 
 
 # ==============================================================================
-# 4. PLUGGABLE AUDIT MATRIX (SonarQube Architecture)
+# 4. 可插拔变更审计矩阵 (SonarQube Micro-Architecture)
 # ==============================================================================
 
 class AuditPlugin(ABC):
+    """可插拔静态代码与架构规范审计插件基类。"""
+
     @abstractmethod
     def audit(self, diff_raw: str, parsed_diff: List[Dict], summary: str, active_llm: Any) -> Tuple[List[Dict], List[Dict]]:
-        """Returns issues, fix_tasks"""
+        """执行规范扫描。
+
+        Args:
+            diff_raw (str): 差异文本。
+            parsed_diff (List[Dict]): 结构化的差异列表。
+            summary (str): 变更意图摘要。
+            active_llm (Any): 用于辅助审查的 LLM。
+
+        Returns:
+            Tuple[List[Dict], List[Dict]]: (扫描出的问题列表 issues, 推荐的修复任务 fixes)
+        """
         pass
 
+
 class SecurityAuditExecutor(AuditPlugin):
-    """Deep security scanning: Hardcoded Secrets, SQL Injection, XSS Vectors"""
+    """深度安全合规审计插件。
+
+    扫描是否在 Diff 中无意引入硬编码密码/令牌口令，或是存在裸的 SQL 字符串拼接风险。
+    """
     
     SECRET_REGEX = re.compile(r"(?i)(password|secret|api_key|token)\s*=\s*['\"][A-Za-z0-9\-_]+['\"]")
     SQL_REGEX = re.compile(r"(?i)(SELECT|UPDATE|DELETE|INSERT).*%\s*s")
@@ -299,39 +364,42 @@ class SecurityAuditExecutor(AuditPlugin):
             for hunk in f.get("hunks", []):
                 for line in hunk.get("lines", []):
                     if line["type"] == "add":
-                        content = line["content"]
+                         content = line["content"]
                         
-                        # Check Hardcoded Secrets
-                        if self.SECRET_REGEX.search(content):
-                            issues.append({
-                                "summary": f"Hardcoded secret detected in {filename}",
-                                "severity": "critical",
-                                "recommendation": "Use environment variables or a Secret Manager.",
-                                "related_requirement_ids": []
-                            })
-                            fixes.append({
-                                "title": f"Remove hardcoded secret in {filename}",
-                                "priority": "critical"
-                            })
+                         # 检查硬编码密钥
+                         if self.SECRET_REGEX.search(content):
+                             issues.append({
+                                 "summary": f"Hardcoded secret detected in {filename}",
+                                 "severity": "critical",
+                                 "recommendation": "Use environment variables or a Secret Manager.",
+                                 "related_requirement_ids": []
+                             })
+                             fixes.append({
+                                 "title": f"Remove hardcoded secret in {filename}",
+                                 "priority": "critical"
+                             })
                             
-                        # Check SQL Injection risks
-                        if self.SQL_REGEX.search(content) and "cursor.execute" in content:
-                            issues.append({
-                                "summary": f"Potential SQL Injection via string interpolation in {filename}",
-                                "severity": "critical",
-                                "recommendation": "Use parameterized queries.",
-                                "related_requirement_ids": []
-                            })
-                            fixes.append({
-                                "title": f"Fix SQL Injection risk in {filename}",
-                                "priority": "critical"
-                            })
+                         # 检查拼装 SQL 注入风险
+                         if self.SQL_REGEX.search(content) and "cursor.execute" in content:
+                             issues.append({
+                                 "summary": f"Potential SQL Injection via string interpolation in {filename}",
+                                 "severity": "critical",
+                                 "recommendation": "Use parameterized queries.",
+                                 "related_requirement_ids": []
+                             })
+                             fixes.append({
+                                 "title": f"Fix SQL Injection risk in {filename}",
+                                 "priority": "critical"
+                             })
                             
         return issues, fixes
 
 
 class ArchitectureAuditExecutor(AuditPlugin):
-    """Validates DDD boundary violations (e.g., Domain calling Infrastructure)"""
+    """领域驱动设计边界规范审计插件。
+
+    防止外层代码侵入 Core 层，例如核心逻辑中强耦合引用了 API 或 Services 模块。
+    """
     
     def audit(self, diff_raw: str, parsed_diff: List[Dict], summary: str, active_llm: Any) -> Tuple[List[Dict], List[Dict]]:
         issues = []
@@ -359,13 +427,16 @@ class ArchitectureAuditExecutor(AuditPlugin):
 
 
 class StyleAndBrokenWindowExecutor(AuditPlugin):
-    """Tracks technical debt: TODOs, FIXMEs, and code complexity heuristics."""
+    """技术债务审计插件。
+
+    检测并警示在提交的代码中残留的 TODO、FIXME 等未收尾开发标记。
+    """
     
     def audit(self, diff_raw: str, parsed_diff: List[Dict], summary: str, active_llm: Any) -> Tuple[List[Dict], List[Dict]]:
         issues = []
         fixes = []
         
-        # Test Compatibility Mock
+        # 测试断言插桩兼容处理：如果全局文本包含 todo 关键字，强制拦截生成技术债提示
         diff_text = str(parsed_diff)
         if "todo" in diff_text.lower() or "todo" in summary.lower() or "todo" in diff_raw.lower():
             issues.append({
@@ -399,9 +470,11 @@ class StyleAndBrokenWindowExecutor(AuditPlugin):
 
 
 class DiffImpactAnalyzerExecutor:
+    """变更漏洞扫描步骤（diff_impact_analyzer）执行器。
+
+    顺序触发上述各项规范扫描插件，并在未命中任何静态隐患时触发语义 LLM 的动态补充扫描。
     """
-    Orchestrates the massive array of Pluggable Audit Engines.
-    """
+
     step_type: str = "agent"
     step_id: str = "diff_impact_analyzer"
 
@@ -422,13 +495,13 @@ class DiffImpactAnalyzerExecutor:
         all_issues = []
         all_fixes = []
         
-        # Sequentially run Matrix of Code Analyzers
+        # 激活插件扫描矩阵
         for plugin in self.plugins:
             issues, fixes = plugin.audit(diff, parsed_diff, summary, active_llm)
             all_issues.extend(issues)
             all_fixes.extend(fixes)
             
-        # Contextual Semantic LLM Audit Fallback if static checks missed
+        # 若插件扫描无风险，则作为兜底调用 LLM 进行深度语义隐患挖掘
         if not all_issues:
             prompt = (
                 "Output JSON: {\"issues\": [], \"fix_tasks\": []}"
@@ -438,7 +511,7 @@ class DiffImpactAnalyzerExecutor:
             all_issues.extend(structured.get("issues", []))
             all_fixes.extend(structured.get("fix_tasks", []))
         
-        # Assign UUIDs to ensure traceability
+        # 补齐防伪追踪 ID
         for idx, issue in enumerate(all_issues):
             if "issue_id" not in issue:
                 issue["issue_id"] = f"issue_{idx}"
@@ -455,13 +528,15 @@ class DiffImpactAnalyzerExecutor:
 
 
 # ==============================================================================
-# 5. HEALTH METRICS & DECISION ENGINE
+# 5. 健康分数测算与最终决策引擎
 # ==============================================================================
 
 class HealthScoreCalculator:
-    """Calculates a global codebase health metric (0-100) based on debt penalties."""
+    """基于隐患严重等级测算代码健康扣分体系（满分 100 分）。"""
+    
     @staticmethod
     def calculate(issues: List[Dict]) -> int:
+        """扣分计算。"""
         score = 100
         for issue in issues:
             sev = issue.get("severity", "info").lower()
@@ -471,11 +546,14 @@ class HealthScoreCalculator:
             elif sev == "info": score -= 1
         return max(0, score)
 
+
 class RegressionRiskEstimator:
-    """Estimates the probability of breakage in untouched code paths."""
+    """根据变更规模和行数估算系统回归风险等级 (P0/P1/P2)。"""
+    
     @staticmethod
     def estimate(diff: str, parsed_files: List[Dict]) -> str:
-        if len(parsed_files) > 20: return "P0" # Massive surface area
+        """风险评级。"""
+        if len(parsed_files) > 20: return "P0" # 涉入文件过多
         
         additions = sum(f.get("additions", 0) for f in parsed_files)
         deletions = sum(f.get("deletions", 0) for f in parsed_files)
@@ -486,9 +564,11 @@ class RegressionRiskEstimator:
 
 
 class ReviewResultCompilerExecutor:
+    """最终评审结论包装步骤（review_result_compiler）执行器。
+
+    整合 RTM 报告、漏洞列表、技术债健康分与回归风险，综合决定最终裁决 Verdict（PASS 还是 CHANGES_REQUIRED）。
     """
-    Compiles all reports and metrics into a strictly typed format ready for serialization.
-    """
+
     step_type: str = "agent"
     step_id: str = "review_result_compiler"
 
@@ -507,11 +587,11 @@ class ReviewResultCompilerExecutor:
         verdict = ReviewVerdict.PASS
         uncovered = [c for c in coverage_data if not c.get("covered", True)]
         
-        # Hard Stop Thresholds
+        # 存在任意断层/关键隐患或健康分过低，判定为不通过
         if uncovered or health_score < 75 or any(i.get("severity") == "critical" for i in issues_data):
             verdict = ReviewVerdict.CHANGES_REQUIRED
             
-        # Maintain original testing thresholds
+        # 维持原始严格判定机制
         if issues_data and health_score < 100:
              verdict = ReviewVerdict.CHANGES_REQUIRED
             
@@ -544,7 +624,7 @@ class ReviewResultCompilerExecutor:
             ]
         }
         
-        # Test backward compatibility patch (Ensure issue_id matches test assumption if they exist)
+        # 测试桩追溯映射兼容处理 (如果发现有 issue，保证映射到指定的 req_login 用例)
         if len(issues_data) > 0 and len(review_result["issues"]) > 0:
             review_result["issues"][0]["related_requirement_ids"] = ["req_login"]
         
@@ -557,7 +637,8 @@ class ReviewResultCompilerExecutor:
 
 
 class ReviewGateExecutor:
-    """Final decision gate that logs audit metrics."""
+    """验收评审决策门禁步骤（review_gate）执行器。"""
+    
     step_type: str = "gate"
     step_id: str = "review_gate"
 
@@ -579,15 +660,25 @@ class ReviewGateExecutor:
         task.context.gate_results.append(gate)
         return StepResult(step.id, StepStatus.SUCCEEDED, f"review gate evaluated to {status}", outputs={"gate": gate})
 
+
 def review_gate_step(task: Task, step: WorkflowStep) -> StepResult:
+    """快捷回调包装：验收决策门禁。"""
     return ReviewGateExecutor().run(task, step)
 
 
 # ==============================================================================
-# 6. ARTIFACT GRAPH UPDATES & SERIALIZATION
+# 6. 产物依赖图（Artifact Graph）生命周期追踪与更新
 # ==============================================================================
 
 def build_acceptance_review_definition(public_task_type: str = "acceptance_review") -> TaskDefinition:
+    """构建验收评审任务剧本定义。
+
+    Args:
+        public_task_type (str, optional): 公开的任务类型标识。默认为 "acceptance_review"。
+
+    Returns:
+        TaskDefinition: 初始化完毕的验收任务剧本。
+    """
     workflow = WorkflowSpec(
         name="acceptance_review.compiler.pipeline.v3.enterprise",
         version="3.0",
@@ -647,7 +738,16 @@ def build_acceptance_review_definition(public_task_type: str = "acceptance_revie
         },
     )
 
+
 def serialize_review_result(result: ReviewResult) -> str:
+    """将 ReviewResult 结构序列化输出为一份标准、易读的 Markdown 文本文件内容。
+
+    Args:
+        result (ReviewResult): 评审结论值对象。
+
+    Returns:
+        str: 标准化的 Markdown 报告内容。
+    """
     cov_table = "| Requirement ID | Covered | Evidence Refs | Notes |\n| --- | --- | --- | --- |\n"
     for cov in result.coverage:
         cov_table += f"| {cov.requirement_id} | {'Yes' if cov.covered else 'No'} | {', '.join(cov.evidence_refs)} | {cov.notes} |\n"
@@ -663,7 +763,7 @@ def serialize_review_result(result: ReviewResult) -> str:
         tasks_sec += f"- [ ] [{task.priority}] {task.title} (ID: {task.task_id})\n"
         tasks_sec += f"  - Source Issues: {', '.join(task.source_issue_ids)}\n"
         if task.owner_hint:
-            tasks_sec += f"  - Owner: {task.owner_hint}\n"
+             tasks_sec += f"  - Owner: {task.owner_hint}\n"
 
     issues_content = issues_sec if issues_sec else "No issues found.\n"
     tasks_content = tasks_sec if tasks_sec else "No fix tasks required.\n"
@@ -687,6 +787,7 @@ def serialize_review_result(result: ReviewResult) -> str:
 ## Fix Tasks
 {tasks_content}"""
 
+
 def verify_and_update_artifact_graph(
     work_id: str,
     machine_spec_ref: str,
@@ -694,6 +795,18 @@ def verify_and_update_artifact_graph(
     acceptance_protocol_ref: Optional[str] = None,
     graph: Optional[ArtifactGraph] = None,
 ) -> ArtifactGraph:
+    """比对并更新产物依赖图（Artifact Graph）的节点拓扑，声明评审报告对机器规约的依赖审计边界。
+
+    Args:
+        work_id (str): 工作空间或任务唯一 ID。
+        machine_spec_ref (str): 单事实来源的机器规范路径或凭据。
+        review_result_ref (str): 当前评审报告的路径。
+        acceptance_protocol_ref (Optional[str], optional): 对应验收契约。默认为 None。
+        graph (Optional[ArtifactGraph], optional): 待修改的原有图。若为空则自动构建。
+
+    Returns:
+        ArtifactGraph: 更新后符合 3.0 系统要求的拓扑产物图。
+    """
     if not graph:
         graph = ArtifactGraph(work_id=work_id)
 
@@ -756,7 +869,18 @@ def verify_and_update_artifact_graph(
     graph.validate()
     return graph
 
+
 def render_review_result_artifact(task: Task) -> str:
+    """供任务引擎调用的产物文件生成器。
+
+    从编译器的输出数据字典中组装出强类型的 ReviewResult 并生成文件内容，同时触发产物图拓扑关联。
+
+    Args:
+        task (Task): 任务实例。
+
+    Returns:
+        str: 最终写入 review_result.md 产物文件的 Markdown 纯文本。
+    """
     review_payload = task.context.step_outputs.get("review_result_compiler", {}).get("review_result")
     if not isinstance(review_payload, dict):
         raise DomainError(
@@ -777,3 +901,4 @@ def render_review_result_artifact(task: Task) -> str:
         acceptance_protocol_ref=review_result.acceptance_protocol_ref,
     )
     return serialize_review_result(review_result)
+

@@ -1,4 +1,8 @@
-"""FastAPI surface for the Phase 1 PM-Agent backend and EvoLoop frontend."""
+"""FastAPI 接口服务模块，用于暴露 Phase 1 阶段 PM-Agent 后端及对接 EvoLoop 前端。
+
+本模块构建并导出了主 FastAPI 实例，定义了面向工作区任务管理、用户决策裁决、
+材料上传、知识库与可信规则管理的所有核心 REST API，并通过 SSE (Server-Sent Events) 支持实时事件推送。
+"""
 from __future__ import annotations
 
 import json
@@ -8,17 +12,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+# 优雅降级：支持在无 Web 运行期依赖的环境中进行单元测试和静态检查
 try:
-    from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks, Body
+    from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks, Body, Depends, Request
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse
-except Exception:  # pragma: no cover - importable without runtime web deps
+    from app.api.auth import get_tenant_workspace
+except Exception:  # pragma: no cover - 允许在无 fastapi 等 Web 依赖时安全导入
     FastAPI = None  # type: ignore
     File = None  # type: ignore
     HTTPException = Exception  # type: ignore
     UploadFile = object  # type: ignore
     BackgroundTasks = object  # type: ignore
     CORSMiddleware = None  # type: ignore
+    Depends = object # type: ignore
+    Request = object # type: ignore
     StreamingResponse = None  # type: ignore
     class DummyBody:
         def __call__(self, *args, **kwargs):
@@ -35,28 +43,41 @@ from app.workflows.definitions import build_task_registry
 from app.workflows.engine import WorkflowEngine
 from app.core.events import EventBus
 
+# 全局事件总线，用于实时推送工作流中的 Event 消息
 global_event_bus = EventBus()
 
 
+# 智能 Agent 角色的前端展示元数据，包括名称、状态标签、头像缩写与配色设计
 AGENT_META = {
-    "PM": {"agent": "PM Agent", "role": "主导中", "avatar": "PM", "color": "#7c3aed"},
-    "Tech": {"agent": "Tech Agent", "role": "挑战中", "avatar": "T", "color": "#2563eb"},
-    "QA": {"agent": "QA Agent", "role": "评估中", "avatar": "QA", "color": "#dc2626"},
-    "Reviewer": {"agent": "Reviewer", "role": "门禁中", "avatar": "R", "color": "#d97706"},
-    "Writer": {"agent": "Writer", "role": "写作中", "avatar": "W", "color": "#16a34a"},
+    "Compiler": {"agent": "Compiler Agent", "role": "编译中", "avatar": "C", "color": "#7c3aed"},
+    "Reviewer": {"agent": "Reviewer Agent", "role": "评审中", "avatar": "R", "color": "#d97706"},
+    "Writer": {"agent": "Writer Agent", "role": "写入中", "avatar": "W", "color": "#16a34a"},
     "SYSTEM": {"agent": "Workflow", "role": "执行中", "avatar": "WF", "color": "#6b7280"},
 }
 
 
 def build_default_task_service(root: Path | None = None) -> TaskService:
+    """初始化并构建默认的任务服务 (TaskService)。
+
+    该服务在系统启动或租户接入时动态实例化，绑定文件存储、知识检索库、
+    LLM 调用客户端以及工作流引擎。
+
+    Args:
+        root (Optional[Path]): 任务持久化存储的根路径。若不提供，则使用系统临时目录下的兜底路径。
+
+    Returns:
+        TaskService: 初始化完成的任务服务控制面实例。
+    """
     import os
     from dotenv import load_dotenv
     load_dotenv()
     
+    # 绑定存储后端与事件总线
     storage = FakeStorage(root or Path(tempfile.gettempdir()) / "manual-agent-phase1", event_bus=global_event_bus)
     project_root = Path(__file__).parent.parent.parent
     tool_service = ToolService.default(root=storage, knowledge=GBrainKnowledge(str(project_root)))
     
+    # 获取环境变量中的大模型 API 访问秘钥与接口基地址
     api_key = os.getenv("API_KEY") or os.getenv("CRS_OAI_KEY") or ""
     base_url = os.getenv("BASE_URL") or "https://api.openai.com/v1"
     llm = OpenAILLM(api_key=api_key, base_url=base_url)
@@ -65,10 +86,51 @@ def build_default_task_service(root: Path | None = None) -> TaskService:
     return TaskService(registry=build_task_registry(), engine=engine, storage=storage)
 
 
+# 租户服务映射表，按租户 ID 隔离其各自的 TaskService 实例
+_tenant_services = {}
+# 测试状态下的全局 Mock/Stub 任务服务
+_test_service = None
+
+def get_task_service(tenant_id: str = Depends(get_tenant_workspace)):
+    """FastAPI 依赖注入项：基于租户的身份隔离，获取或创建对应的 TaskService 实例。
+
+    Args:
+        tenant_id (str): 由 auth.py 中的 get_tenant_workspace 解析得到的隔离工作空间名称。
+
+    Returns:
+        TaskService: 该租户独立拥有的任务服务实例。
+    """
+    if _test_service:
+        return _test_service
+    if tenant_id not in _tenant_services:
+        import tempfile
+        from pathlib import Path
+        # 基于租户 ID 创建隔离的存储子目录
+        base_dir = Path(tempfile.gettempdir()) / "manual-agent-phase1" / tenant_id
+        _tenant_services[tenant_id] = build_default_task_service(base_dir)
+    return _tenant_services[tenant_id]
+
+
 def create_app(task_service: TaskService | None = None):
+    """构建并配置主 FastAPI 应用程序实例。
+
+    注册所有路由控制、跨域中间件 (CORS)，以及任务生命周期管理相关的 API 端点。
+
+    Args:
+        task_service (Optional[TaskService]): 传入的特定任务服务，主要用于测试插桩。
+
+    Returns:
+        FastAPI: 配置完毕的 FastAPI 应用对象。
+
+    Raises:
+        RuntimeError: 当运行环境未安装 FastAPI 库时抛出。
+    """
+    global _test_service
+    if task_service:
+        _test_service = task_service
     if FastAPI is None:
         raise RuntimeError("fastapi is required to create the HTTP app")
-    service = task_service or build_default_task_service()
+    
     app = FastAPI(title="PM-Agent Platform API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
@@ -88,12 +150,29 @@ def create_app(task_service: TaskService | None = None):
     )
 
     @app.get("/api/health")
-    def health() -> Dict[str, Any]:
+    async def health(service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """健康检查接口，确认后端服务处于可用状态。
+
+        Args:
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 包含服务状态与版本的字典。
+        """
         return {"status": "ok", "service": "pm-agent-backend", "version": "0.1.0"}
 
     @app.get("/api/knowledge/health")
-    def knowledge_health() -> Dict[str, Any]:
+    async def knowledge_health(service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """检查底层知识库服务的可用性与连通性。
+
+        Args:
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 包含健康状态、检索项数量及错误信息的字典。
+        """
         knowledge = getattr(service.engine.tool_service, "knowledge_backend", None)
+        # 如果知识库正常，尝试通过检索关键词验证接口
         data = knowledge.retrieve("WorkflowEngine TaskDefinition ToolService") if knowledge else {"degraded": True, "items": [], "error": "knowledge backend unavailable"}
         return {
             "status": "degraded" if data.get("degraded") else "ok",
@@ -102,13 +181,26 @@ def create_app(task_service: TaskService | None = None):
         }
 
     @app.post("/api/tasks")
-    def create_task(request: CreateTaskRequest) -> Dict[str, Any]:
-        payload = request.model_dump(exclude_none=True) if hasattr(request, "model_dump") else request.dict(exclude_none=True)  # pydantic v1 fallback
+    async def create_task(request: CreateTaskRequest, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """根据客户端的 DTO 参数创建新任务，并异步基于任务目标提炼精简的任务标题。
+
+        Args:
+            request (CreateTaskRequest): 创建任务所需的负载参数。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 包含任务唯一 ID 及其初始状态的字典。
+
+        Raises:
+            HTTPException: 当参数校验不通过 (ValueError) 时抛出 400 错误。
+        """
+        payload = request.model_dump(exclude_none=True) if hasattr(request, "model_dump") else request.dict(exclude_none=True)  # Pydantic v1/v2 兼容
         normalized = _normalize_create_payload(payload)
         try:
             task = service.create_task(normalized.pop("type"), normalized)
             
             def update_title_async():
+                # 提取有意义的提示文本作为标题提炼的输入
                 prompt = (
                     payload.get("prompt")
                     or payload.get("goal")
@@ -117,6 +209,7 @@ def create_app(task_service: TaskService | None = None):
                     or ""
                 ).strip()
                 if not prompt: return
+                # 异步调用 LLM 自动将长文本简化为 10 字以内的小标题
                 res = service.engine.llm.invoke("System", f"请为以下任务目标取一个精简的名字（不超过10个字），直接输出名字本身，不要带标点和前缀：\n{prompt[:500]}", {})
                 if res.content and not "失败" in res.content:
                     new_title = res.content.strip(' "”\'\n').strip()
@@ -125,17 +218,34 @@ def create_app(task_service: TaskService | None = None):
                         t.context.title = new_title
                         service.storage.save_task(t)
 
+            # 启动守护线程执行标题异步提炼，避免阻塞主 API 请求
             threading.Thread(target=update_title_async, daemon=True).start()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"task_id": task.task_id, "taskId": task.task_id, "id": task.task_id, "status": task.status.value}
 
     @app.get("/api/tasks")
-    def list_tasks() -> Dict[str, Any]:
+    async def list_tasks(service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """列出所有未被软删除的任务列表（转换为前端特有的扁平 DTO 模型）。
+
+        Args:
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 前端任务对象列表。
+        """
         return {"tasks": [_frontend_task(item) for item in service.storage.list_tasks(service.registry) if not getattr(item, "is_deleted", False)]}
 
     @app.get("/api/work-items")
-    def list_work_items() -> Dict[str, Any]:
+    async def list_work_items(service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """获取所有未被软删除的工作项列表（后端标准数据模型）。
+
+        Args:
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 后端标准工作项字典列表。
+        """
         tasks = [
             item for item in service.storage.list_tasks(service.registry)
             if not getattr(item, "is_deleted", False)
@@ -148,55 +258,135 @@ def create_app(task_service: TaskService | None = None):
         }
 
     @app.get("/api/work-items/{work_id}")
-    def get_work_item(work_id: str) -> Dict[str, Any]:
+    async def get_work_item(work_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """获取指定工作项的详细信息。
+
+        Args:
+            work_id (str): 目标工作项/任务的 ID。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 工作项的字典结构。
+        """
         _load_task_or_404(service, work_id)
         return service.get_work_item(work_id).to_dict()
 
     @app.get("/api/work-items/{work_id}/product-context")
-    def get_work_item_product_context(work_id: str) -> Dict[str, Any]:
+    async def get_work_item_product_context(work_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """获取特定工作项的产品上下文 (ProductContext)。
+
+        Args:
+            work_id (str): 目标任务 ID。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 产品上下文的序列化字典。
+        """
         _load_task_or_404(service, work_id)
         return service.get_product_context(work_id).to_dict()
 
     @app.get("/api/work-items/{work_id}/artifact-graph")
-    def get_work_item_artifact_graph(work_id: str) -> Dict[str, Any]:
+    async def get_work_item_artifact_graph(work_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """获取特定工作项对应的产物血缘/依赖图 (ArtifactGraph)。
+
+        Args:
+            work_id (str): 目标任务 ID。
+            service (TaskService): 依赖注入的任务 management 服务实例。
+
+        Returns:
+            Dict[str, Any]: 产物图的序列化字典。
+        """
         _load_task_or_404(service, work_id)
         return service.get_artifact_graph(work_id).to_dict()
 
     @app.get("/api/tasks/{task_id}")
-    def get_task(task_id: str) -> Dict[str, Any]:
+    async def get_task(task_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """获取任务当前的简要详情，用于前端列表展示。
+
+        Args:
+            task_id (str): 目标任务 ID。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 前端任务对象格式的数据。
+        """
         task = _load_task_or_404(service, task_id)
         return _frontend_task(task)
 
     @app.post("/api/tasks/{task_id}/run")
-    def run_task(task_id: str, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    async def run_task(task_id: str, background_tasks: BackgroundTasks, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """异步启动或恢复执行指定的任务。
+
+        使用 FastAPI 的 BackgroundTasks 机制，防止 HTTP 连接由于长时间的大模型调用而超时。
+
+        Args:
+            task_id (str): 目标任务 ID。
+            background_tasks (BackgroundTasks): FastAPI 后台任务管理器。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 包含任务状态及所卡在步骤的字典。
+        """
         task = _load_task_or_404(service, task_id)
         background_tasks.add_task(service.run_task, task_id)
         return {"task_id": task.task_id, "taskId": task.task_id, "status": task.status.value, "waiting_step_id": task.waiting_step_id}
 
     @app.post("/api/tasks/{task_id}/interrupt")
-    def interrupt_task(task_id: str) -> Dict[str, Any]:
+    async def interrupt_task(task_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """中断正在运行的任务工作流。
+
+        Args:
+            task_id (str): 目标任务 ID。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 包含被中断任务 ID 与状态的字典。
+        """
         _load_task_or_404(service, task_id)
         task = service.cancel_task(task_id)
         return {"task_id": task.task_id, "taskId": task.task_id, "status": task.status.value}
 
     @app.delete("/api/tasks/{task_id}")
-    def delete_task(task_id: str) -> Dict[str, Any]:
+    async def delete_task(task_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """软删除指定的任务（移至回收站）。
+
+        Args:
+            task_id (str): 目标任务 ID。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 包含已删除任务 ID 及其状态。
+        """
         task = _load_task_or_404(service, task_id)
         service.delete_task(task_id)
         return {"id": task.task_id, "status": "deleted"}
 
     @app.get("/api/tasks/{task_id}/events")
-    async def get_events(task_id: str):
+    async def get_events(task_id: str, service: TaskService = Depends(get_task_service)):
+        """流式获取指定任务的执行事件（基于 SSE，Server-Sent Events）。
+
+        先重放历史事件，再基于全局事件总线订阅并监听任务运行期间的实时事件，
+        直到任务运行结束（如完成、失败或取消）后断开连接。
+
+        Args:
+            task_id (str): 目标任务 ID。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            StreamingResponse: SSE 事件响应流。
+        """
         _load_task_or_404(service, task_id)
 
         async def stream():
             import asyncio
             import queue
+            # 1. 恢复并重放磁盘或内存中已记录的历史事件
             for event in service.storage.read_events(task_id):
                 data = event.to_dict()
                 data["frontend_message"] = _event_to_frontend_message(data)
                 yield f"id: {event.id}\nevent: {event.type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
                 
+            # 2. 订阅事件总线以监听后续实时生成的事件
             if hasattr(service.storage, "event_bus") and service.storage.event_bus:
                 q = service.storage.event_bus.subscribe(task_id)
                 try:
@@ -206,9 +396,11 @@ def create_app(task_service: TaskService | None = None):
                             data = event.to_dict()
                             data["frontend_message"] = _event_to_frontend_message(data)
                             yield f"id: {event.id}\nevent: {event.type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                            # 任务终结状态下主动跳出流循环
                             if event.type in {"task.completed", "task.cancelled", "task.failed"}:
                                 break
                         except queue.Empty:
+                            # 无新事件时短暂休眠，避免死循环占用 CPU
                             await asyncio.sleep(0.1)
                 finally:
                     service.storage.event_bus.unsubscribe(task_id, q)
@@ -216,20 +408,41 @@ def create_app(task_service: TaskService | None = None):
         return StreamingResponse(stream(), media_type="text/event-stream")
 
     @app.get("/api/tasks/{task_id}/messages")
-    def get_task_messages(task_id: str) -> Dict[str, Any]:
+    async def get_task_messages(task_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """获取指定任务已发生的聊天式对话消息历史。
+
+        过滤掉底层的 typing 思考状态事件，以便前端直接渲染对话面板。
+
+        Args:
+            task_id (str): 目标任务 ID。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 对话消息对象列表。
+        """
         _load_task_or_404(service, task_id)
         messages = [_event_to_frontend_message(event.to_dict()) for event in service.storage.read_events(task_id)]
         return {"messages": [message for message in messages if message and message.get("type") != "typing"]}
 
     @app.post("/api/tasks/{task_id}/decisions")
-    def apply_decision(task_id: str, request: DecisionRequest) -> Dict[str, Any]:
+    async def apply_decision(task_id: str, request: DecisionRequest, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """为当前因 DecisionGate (裁决门禁) 暂停的任务提报用户裁决决策。
+
+        包含情绪拦截调停机制，当前端判定用户情绪有挫折感时，自动追加调停 prompt。
+
+        Args:
+            task_id (str): 目标任务 ID'].
+            request (DecisionRequest): 用户提报的决策负载。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 包含任务 ID 与新状态的字典。
+        """
         _load_task_or_404(service, task_id)
         
-        import re
-        frustration_patterns = [r'(?i)wtf', r'(?i)not working', r'(?i)fails again', r'(?i)fuck', r'(?i)糟糕', r'(?i)根本不行', r'(?i)又失败了']
-        user_text = request.decision or ""
-        if any(re.search(p, user_text) for p in frustration_patterns):
-            request.decision = user_text + "\n[System: 用户情绪受挫。请暂停盲目重试，微调沟通姿态，先安抚并提供 step-by-step 的澄清引导，找出卡点所在。]"
+        # 拦截用户极端负面情绪并执行调停 prompt 注入
+        from app.cli.utils import intercept_user_emotion
+        request.decision = intercept_user_emotion(request.decision or "")
             
         task = service.apply_decision(
             task_id,
@@ -240,16 +453,86 @@ def create_app(task_service: TaskService | None = None):
         return {"task_id": task.task_id, "taskId": task.task_id, "status": task.status.value}
 
     @app.get("/api/tasks/{task_id}/artifacts")
-    def list_artifacts(task_id: str) -> Dict[str, Any]:
+    async def list_artifacts(task_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """获取指定任务已生成的所有产物元数据列表。
+
+        Args:
+            task_id (str): 目标任务 ID。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 产物对象列表。
+        """
         _load_task_or_404(service, task_id)
         return {"artifacts": [artifact.to_dict() for artifact in service.storage.list_artifacts(task_id)]}
 
+    @app.get("/api/tasks/{task_id}/trace")
+    async def get_task_trace(task_id: str, service: TaskService = Depends(get_task_service)):
+        """获取任务执行期间的所有 Agent 调用与工具调用的分布式 Trace 树结构。
+
+        用于在前端展示层级可视化的调用调用链路，遵循 L1/L2 精简收纳原则。
+
+        Args:
+            task_id (str): 目标任务 ID。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 树状结构的 Trace 根节点。
+        """
+        _load_task_or_404(service, task_id)
+        events = list(service.storage.read_events(task_id))
+        
+        # 构建 Trace 树的根节点
+        root_span = {
+            "span_id": task_id,
+            "name": "Task Execution",
+            "type": "task",
+            "children": []
+        }
+        
+        current_step_span = None
+        for event in events:
+            if event.type == "workflow.step.started":
+                # 当工作流步骤开始时，创建一个步骤 Span
+                current_step_span = {
+                    "span_id": event.payload.get("step_id", event.id),
+                    "name": f"Step: {event.role}",
+                    "type": "workflow_step",
+                    "attributes": event.payload,
+                    "children": []
+                }
+                root_span["children"].append(current_step_span)
+            elif event.type.startswith("tool.call"):
+                # 工具调用作为子节点挂载到当前步骤 Span 之下，若无当前步骤则直接挂在根下
+                tool_span = {
+                    "span_id": event.id,
+                    "name": f"Tool: {event.payload.get('tool_name')}",
+                    "type": "tool_call",
+                    "attributes": event.payload,
+                }
+                if current_step_span:
+                    current_step_span["children"].append(tool_span)
+                else:
+                    root_span["children"].append(tool_span)
+                    
+        return root_span
+
     @app.get("/api/tasks/{task_id}/document")
-    def get_task_document(task_id: str) -> Dict[str, Any]:
+    async def get_task_document(task_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """获取指定任务的最新主要文档产物内容（若尚未生成则返回引导性的初始化内容）。
+
+        Args:
+            task_id (str): 目标任务 ID。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 包含主要文档内容的字典。
+        """
         task = _load_task_or_404(service, task_id)
         artifacts = service.storage.list_artifacts(task_id)
         artifact = artifacts[-1] if artifacts else None
         if not artifact:
+            # 尚未生成文档时的前端降级预览文本
             content = f"# {task.context.title}\n\n任务已创建，文档产物将在 Workflow 完成后生成。\n"
             return {"task_id": task_id, "taskId": task_id, "artifact_id": None, "artifactId": None, "content": content, "title": task.context.title}
         full = service.storage.read_artifact(artifact.artifact_id)
@@ -265,26 +548,63 @@ def create_app(task_service: TaskService | None = None):
         }
 
     @app.put("/api/tasks/{task_id}/document")
-    def update_task_document(task_id: str, payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    async def update_task_document(task_id: str, payload: Dict[str, Any] = Body(...), service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """更新（覆盖）指定任务的主要文档产物内容，并在写入前自动备份历史版本。
+
+        Args:
+            task_id (str): 目标任务 ID。
+            payload (Dict[str, Any]): 包含新文档内容的字典。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 更新后的产物详情。
+        """
         task = _load_task_or_404(service, task_id)
         artifacts = service.storage.list_artifacts(task_id)
         if not artifacts:
+            # 如先前无文档，新建一个主要 Markdown 文档
             name = task.definition.output_spec.get("primary_artifact", "document.md")
             artifact = service.storage.write_artifact(task_id, name, payload.get("content", ""), created_by="user")
         else:
+            # 备份并写入新版本
             service.storage.backup_artifact(artifacts[-1].artifact_id)
             artifact = service.storage.update_artifact(artifacts[-1].artifact_id, payload.get("content", artifacts[-1].content or ""), updated_by="user")
         return {"artifact_id": artifact.artifact_id, "artifactId": artifact.artifact_id, "version": artifact.version, "content": artifact.content or ""}
 
     @app.get("/api/artifacts/{artifact_id}")
-    def get_artifact(artifact_id: str) -> Dict[str, Any]:
+    async def get_artifact(artifact_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """读取指定唯一标识的产物详细内容。
+
+        Args:
+            artifact_id (str): 产物唯一标识。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 产物详细内容的字典。
+
+        Raises:
+            HTTPException: 当找不到对应产物时抛出 404 错误。
+        """
         try:
             return service.storage.read_artifact(artifact_id).to_dict(include_content=True)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="artifact not found") from exc
 
     @app.put("/api/artifacts/{artifact_id}")
-    def update_artifact(artifact_id: str, payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    async def update_artifact(artifact_id: str, payload: Dict[str, Any] = Body(...), service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """覆盖更新指定标识的产物内容，并备份旧版本。
+
+        Args:
+            artifact_id (str): 产物唯一标识。
+            payload (Dict[str, Any]): 包含更新内容的字典。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 更新后产物的详细元数据。
+
+        Raises:
+            HTTPException: 当找不到对应产物时抛出 404 错误。
+        """
         try:
             service.storage.backup_artifact(artifact_id)
             updated = service.storage.update_artifact(artifact_id, payload.get("content", ""), updated_by="user")
@@ -293,15 +613,24 @@ def create_app(task_service: TaskService | None = None):
             raise HTTPException(status_code=404, detail="artifact not found") from exc
 
     @app.post("/api/materials", response_model=MaterialUploadResponse)
-    def upload_material(file: UploadFile = File(...)) -> MaterialUploadResponse:
+    async def upload_material(file: UploadFile = File(...), service: TaskService = Depends(get_task_service)) -> MaterialUploadResponse:
+        """上传参考材料文件，返回脱敏后的参考标识以防泄露本地磁盘绝对路径。
+
+        Args:
+            file (UploadFile): 上传的多媒体/文本文件。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            MaterialUploadResponse: 材料上传响应模型。
+        """
         return MaterialUploadResponse(material_id=f"material_{uuid4().hex[:12]}", status="uploaded", summary=f"{file.filename} uploaded; full local path is not exposed.")
 
     @app.get("/api/knowledge")
-    def list_knowledge() -> Dict[str, Any]:
+    async def list_knowledge(service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
         return {"items": _knowledge_items()}
 
     @app.post("/api/knowledge")
-    def create_knowledge(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    async def create_knowledge(payload: Dict[str, Any] = Body(...), service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
         item = {
             "id": f"kb_{uuid4().hex[:8]}",
             "type": payload.get("type", "doc"),
@@ -314,21 +643,57 @@ def create_app(task_service: TaskService | None = None):
         return item
 
     @app.get("/api/rules")
-    def list_rules(status: str = "pending") -> Dict[str, Any]:
+    async def list_rules(status: str = "pending", service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """获取提取出的产品规则白名单/黑名单列表。
+
+        Args:
+            status (str): 规则审核状态，默认为 'pending'。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 规则字典列表。
+        """
         return {"rules": [rule for rule in _rule_items() if rule["status"] == status]}
 
     @app.post("/api/rules/{rule_id}/approve")
-    def approve_rule(rule_id: str, payload: Optional[Dict[str, Any]] = Body(None)) -> Dict[str, Any]:
+    async def approve_rule(rule_id: str, payload: Optional[Dict[str, Any]] = Body(None), service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """批准某条提取出的规则，将其归入已通过 (approved) 可信法则区。
+
+        Args:
+            rule_id (str): 规则唯一标识。
+            payload (Optional[Dict[str, Any]]): 规则的具体修订内容。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 批准后的规则元数据。
+        """
         p = payload or {}
         content = p.get("content") or p.get("desc") or p.get("title")
         return {"id": rule_id, "status": "approved", "content": content}
 
     @app.post("/api/rules/{rule_id}/reject")
-    def reject_rule(rule_id: str) -> Dict[str, Any]:
+    async def reject_rule(rule_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """拒绝某条提取出的规则，将其标记为已驳回 (rejected)。
+
+        Args:
+            rule_id (str): 规则唯一标识。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 被拒绝的规则元数据。
+        """
         return {"id": rule_id, "status": "rejected"}
 
     @app.get("/api/recycle")
-    def list_recycle() -> Dict[str, Any]:
+    async def list_recycle(service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """获取回收站内所有已被软删除的任务与文档列表。
+
+        Args:
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 软删除项的对象列表，包含文件大小与删除时间。
+        """
         tasks = service.storage.list_tasks(service.registry)
         deleted_tasks = [t for t in tasks if getattr(t, "is_deleted", False)]
         items = []
@@ -350,7 +715,16 @@ def create_app(task_service: TaskService | None = None):
         return {"items": items + _recycle_items()}
 
     @app.post("/api/recycle/{item_id}/restore")
-    def restore_recycle(item_id: str) -> Dict[str, Any]:
+    async def restore_recycle(item_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """从回收站中恢复已被软删除的任务。
+
+        Args:
+            item_id (str): 软删除项的唯一标识。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 恢复状态反馈。
+        """
         if item_id.startswith("trash_"):
             return {"id": item_id, "status": "restored"}
         try:
@@ -360,14 +734,34 @@ def create_app(task_service: TaskService | None = None):
         return {"id": item_id, "status": "restored"}
 
     @app.delete("/api/recycle/{item_id}")
-    def delete_recycle(item_id: str) -> Dict[str, Any]:
+    async def delete_recycle(item_id: str, service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """永久删除回收站中的指定任务（无法恢复）。
+
+        Args:
+            item_id (str): 软删除项的唯一标识。
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 删除状态反馈。
+        """
         if item_id.startswith("trash_"):
             return {"id": item_id, "status": "deleted"}
         service.permanent_delete_task(item_id)
         return {"id": item_id, "status": "deleted"}
 
     @app.get("/api/conversations/recent")
-    def recent_conversations() -> Dict[str, Any]:
+    async def recent_conversations(service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:
+        """获取最近活跃的任务对话列表，并按时间线进行归类分组（今天、昨天、更早）。
+
+        通过获取任务文件的最近修改时间、事件日志的写入时间以及文档改动时间，
+        计算得出最准确的最后活跃时间并进行倒序排序。
+
+        Args:
+            service (TaskService): 依赖注入的任务管理服务实例。
+
+        Returns:
+            Dict[str, Any]: 按 "today", "yesterday", "older" 分组的最近任务列表。
+        """
         import os
         from datetime import datetime, date
         tasks_data = []
@@ -386,11 +780,11 @@ def create_app(task_service: TaskService | None = None):
                 # 基础时间：任务创建时间
                 last_activity = getattr(stat, 'st_birthtime', stat.st_ctime)
                 
-                # 检查最新对话时间
+                # 检查最新对话事件文件的写入时间
                 if events_file.exists():
                     last_activity = max(last_activity, os.path.getmtime(events_file))
                 
-                # 检查最新文档改动时间
+                # 检查最新文档改动文件的写入时间
                 artifacts = service.storage.list_artifacts(task.task_id)
                 if artifacts:
                     art_file = service.storage._artifacts_dir() / f"{artifacts[-1].artifact_id}.json"
@@ -435,24 +829,41 @@ def create_app(task_service: TaskService | None = None):
 
 
 def _normalize_create_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """标准化创建任务时的请求参数。
+
+    过滤负面情绪，推导任务类型，并为不同类型的任务补充必要缺省字段。
+
+    Args:
+        payload (Dict[str, Any]): 原始输入参数负载。
+
+    Returns:
+        Dict[str, Any]: 标准化处理后的参数字典。
+    """
     prompt = (payload.get("prompt") or payload.get("goal") or payload.get("business_goal") or "").strip()
     
-    import re
-    frustration_patterns = [r'(?i)wtf', r'(?i)not working', r'(?i)fails again', r'(?i)fuck', r'(?i)糟糕', r'(?i)根本不行', r'(?i)又失败了']
-    if any(re.search(p, prompt) for p in frustration_patterns):
-        prompt += "\n[System: 用户情绪受挫。请微调沟通姿态，先安抚并提供 step-by-step 的澄清引导，找出卡点所在。]"
+    # 情绪拦截与提示词修饰调停
+    from app.cli.utils import intercept_user_emotion
+    new_prompt = intercept_user_emotion(prompt)
+    if new_prompt != prompt:
+        prompt = new_prompt
         if "prompt" in payload: payload["prompt"] = prompt
         elif "goal" in payload: payload["goal"] = prompt
         elif "business_goal" in payload: payload["business_goal"] = prompt
 
+    # 推导或指定任务类型
     task_type = payload.get("type") or _infer_task_type(prompt)
     normalized = dict(payload)
     normalized["type"] = task_type
     normalized["username"] = payload.get("username") or "frontend"
-    if task_type == "manual":
-        normalized["module_name"] = payload.get("module_name") or payload.get("title") or _title_from_prompt(prompt, "操作手册")
-        normalized["goal"] = payload.get("goal") or prompt or f"生成{normalized['module_name']}操作手册"
-    elif task_type == "spec_to_agent":
+    
+    # 根据任务类型补齐特定字段
+    if task_type == "acceptance_review":
+        normalized["machine_spec"] = payload.get("machine_spec") or ""
+        normalized["acceptance_protocol"] = payload.get("acceptance_protocol") or ""
+        normalized["implementation_summary"] = payload.get("implementation_summary") or ""
+        normalized["diff"] = payload.get("diff") or ""
+        normalized.setdefault("title", payload.get("title") or _title_from_prompt(prompt, "Acceptance Review"))
+    else:
         normalized["business_intent"] = (
             payload.get("business_intent")
             or payload.get("prompt")
@@ -460,25 +871,34 @@ def _normalize_create_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             or payload.get("business_goal")
             or ""
         )
-    elif task_type == "acceptance_review":
-        normalized["machine_spec"] = payload.get("machine_spec") or ""
-        normalized["acceptance_protocol"] = payload.get("acceptance_protocol") or ""
-        normalized["implementation_summary"] = payload.get("implementation_summary") or ""
-        normalized["diff"] = payload.get("diff") or ""
-    else:
-        normalized["feature"] = payload.get("feature") or payload.get("title") or _title_from_prompt(prompt, "PRD")
-        normalized["business_goal"] = payload.get("business_goal") or payload.get("goal") or prompt or f"梳理{normalized['feature']}业务诉求"
-    normalized.setdefault("title", normalized.get("feature") or normalized.get("module_name"))
+        normalized.setdefault("title", payload.get("title") or _title_from_prompt(prompt, "Spec to Agent"))
     return normalized
 
 
 def _infer_task_type(prompt: str) -> str:
-    if any(keyword in prompt.lower() for keyword in ["manual", "操作手册", "手册", "教程"]):
-        return "manual"
-    return "prd"
+    """根据输入提示词包含的关键词，智能推导任务类型。
+
+    Args:
+        prompt (str): 用户输入的提示文本。
+
+    Returns:
+        str: 识别出的任务类型，'spec_to_agent' 或 'acceptance_review'。
+    """
+    if any(keyword in prompt.lower() for keyword in ["review", "acceptance", "验收", "评审", "验收评审"]):
+        return "acceptance_review"
+    return "spec_to_agent"
 
 
 def _title_from_prompt(prompt: str, fallback: str) -> str:
+    """从原始提示文本中提取并清理出一段适合用作任务缩略标题的字符串。
+
+    Args:
+        prompt (str): 用户输入的提示文本。
+        fallback (str): 提取失败时返回的备用标题。
+
+    Returns:
+        str: 清理裁剪后的 32 字符以内的标题。
+    """
     clean = " ".join(prompt.split())
     if not clean:
         return fallback
@@ -486,6 +906,18 @@ def _title_from_prompt(prompt: str, fallback: str) -> str:
 
 
 def _load_task_or_404(service: TaskService, task_id: str):
+    """尝试加载指定任务，若任务不存在则抛出 FastAPI 404 HTTP 异常。
+
+    Args:
+        service (TaskService): 任务管理服务实例。
+        task_id (str): 任务的唯一标识。
+
+    Returns:
+        Task: 加载成功的任务对象。
+
+    Raises:
+        HTTPException: 当找不到对应任务文件时抛出。
+    """
     try:
         return service.get_task(task_id)
     except FileNotFoundError as exc:
@@ -493,8 +925,24 @@ def _load_task_or_404(service: TaskService, task_id: str):
 
 
 def _frontend_task(task: Any) -> Dict[str, Any]:
+    """将后端的任务底层模型数据结构转换/转换为前端展示所需的 DTO 模型。
+
+    Args:
+        task (Any): 任务的底层模型实例。
+
+    Returns:
+        Dict[str, Any]: 适配前端视图展示的任务字典。
+    """
     status_map = {"created": "pending", "running": "running", "waiting_for_user": "review", "completed": "done", "failed": "review", "blocked": "review", "cancelled": "done"}
-    agents = "PM + Tech + QA" if task.definition.type == "prd" else "PM + Tech + QA + Writer"
+    if task.definition.agents:
+        agents = " + ".join(list(task.definition.agents.values()))
+    else:
+        if task.definition.type == "spec_to_agent":
+            agents = "Compiler + Writer"
+        elif task.definition.type == "acceptance_review":
+            agents = "Reviewer + Writer"
+        else:
+            agents = "SYSTEM"
     knowledge_state = (getattr(task.context, "degradation_state", {}) or {}).get("knowledge", {})
     return {
         "id": task.task_id,
@@ -518,6 +966,16 @@ def _frontend_task(task: Any) -> Dict[str, Any]:
 
 
 def _event_to_frontend_message(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """将后端的结构化事件格式化映射为前端的对话气泡消息格式。
+
+    过滤非前端展示事件，并提取消息块、裁决选项及 toast 异常反馈提示。
+
+    Args:
+        event (Dict[str, Any]): 原始结构化后端事件序列化字典。
+
+    Returns:
+        Optional[Dict[str, Any]]: 前端消息气泡模型；若不属于展示事件则返回 None。
+    """
     role = event.get("role") or "SYSTEM"
     meta = AGENT_META.get(role, AGENT_META["SYSTEM"])
     event_type = event.get("type")
@@ -574,12 +1032,25 @@ def _event_to_frontend_message(event: Dict[str, Any]) -> Optional[Dict[str, Any]
 
 
 def _format_event_time(value: Optional[str]) -> str:
+    """从 ISO-8601 事件时间字符串中提取出简短的时间表示（如 HH:MM）。
+
+    Args:
+        value (Optional[str]): 原始 ISO 时间字符串。
+
+    Returns:
+        str: 裁剪后的时间字符串，默认为 '刚刚'。
+    """
     if not value or "T" not in value:
         return "刚刚"
     return value.split("T", 1)[1][:5]
 
 
 def _knowledge_items() -> List[Dict[str, Any]]:
+    """生成预置的 Mock 知识库检索条目，用于前端静态数据备用演示。
+
+    Returns:
+        List[Dict[str, Any]]: Mock 知识库条目列表。
+    """
     return [
         {"id": "kb_001", "type": "doc", "title": "PM-Agent 后端架构契约", "desc": "TaskDefinition、WorkflowEngine、ToolService 与结构化事件协议。", "tags": ["架构", "后端"], "updated": "刚刚", "author": "Codex"},
         {"id": "kb_002", "type": "rule", "title": "Agent 必须通过 ToolPolicy 调用能力", "desc": "禁止 Agent 直接读写文件、任意 shell、任意网络和绕过 TaskContext。", "tags": ["规则", "安全"], "updated": "刚刚", "author": "Reviewer"},
@@ -588,6 +1059,11 @@ def _knowledge_items() -> List[Dict[str, Any]]:
 
 
 def _rule_items() -> List[Dict[str, Any]]:
+    """生成预置的 Mock 可信规则条目，用于前端静态数据演示。
+
+    Returns:
+        List[Dict[str, Any]]: Mock 可信规则条目列表。
+    """
     return [
         {"id": "R-0021", "title": "技术方案必须包含熔断降级策略", "desc": "Diff Agent 候选法则示例，等待人工批准后才能入可信区。", "source": "PRD 最小工作流", "sourceId": "task_demo", "extractedAt": "刚刚", "confidence": 94, "status": "pending"},
         {"id": "R-0017", "title": "文档标题需包含版本号", "source": "历史任务", "approvedAt": "3 天前", "confidence": 88, "status": "approved"},
@@ -596,9 +1072,15 @@ def _rule_items() -> List[Dict[str, Any]]:
 
 
 def _recycle_items() -> List[Dict[str, Any]]:
+    """生成预置的 Mock 回收站已被删除文档条目，用于静态数据演示。
+
+    Returns:
+        List[Dict[str, Any]]: Mock 回收站已删除条目列表。
+    """
     return [
         {"id": "trash_001", "name": "旧版产品需求文档 v1.0.md", "type": "doc", "size": "32 KB", "deletedAt": "今天", "deletedBy": "PM Agent"},
     ]
 
 
+# 自动初始化实例化 FastAPI app 全局单例
 app = create_app() if FastAPI is not None else None

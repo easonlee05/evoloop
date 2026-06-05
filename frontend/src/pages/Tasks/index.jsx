@@ -1,9 +1,18 @@
+/**
+ * @file index.jsx
+ * @description 任务大厅页面组件。聚合展示系统内的所有任务，并支持按“运行中”、“审查中”、“待启动”及“已完成”状态进行页签筛选过滤，点击相应任务可跳转至具体工作台。
+ */
+
 import React, { useEffect, useState } from 'react';
 import { Plus, MoreHorizontal, Filter } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { apiGet } from '../../api';
 import './tasks.css';
 
+/**
+ * 任务列表默认/后备静态数据
+ * @type {Array<{id: string, title: string, status: 'running'|'review'|'pending'|'done', agent: string, priority: 'high'|'medium'|'low', updated: string}>}
+ */
 const tasks = [
   { id: 'T-0421', title: '产品需求文档 v2.0 评审', status: 'running', agent: 'PM + Tech + QA', priority: 'high', updated: '10 分钟前' },
   { id: 'T-0420', title: '用户增长策略分析报告', status: 'review', agent: 'Intern + Reviewer', priority: 'medium', updated: '1 小时前' },
@@ -14,6 +23,10 @@ const tasks = [
   { id: 'T-0415', title: '新用户引导流程优化', status: 'done', agent: 'PM + Intern', priority: 'low', updated: '3 天前' },
 ];
 
+/**
+ * 状态映射配置，用于在列表中渲染对应的中文状态标签及颜色
+ * @type {Object.<string, {label: string, color: string}>}
+ */
 const statusMap = {
   running: { label: '运行中', color: '#2563eb' },
   review:  { label: '审查中', color: '#d97706' },
@@ -21,17 +34,32 @@ const statusMap = {
   done:    { label: '已完成', color: '#16a34a' },
 };
 
+/**
+ * 优先级名称与配色映射
+ * @type {Object.<string, string>}
+ */
 const priorityMap = { high: '高', medium: '中', low: '低' };
 const priorityColor = { high: '#dc2626', medium: '#d97706', low: '#a0a0a0' };
 
+/**
+ * 页签过滤选项列表
+ * @type {Array<string>}
+ */
 const tabs = ['全部', '运行中', '审查中', '待启动', '已完成'];
 
+/**
+ * Tasks 任务大厅组件
+ * @component
+ */
 export default function Tasks() {
-  const [tab, setTab] = useState('全部');
-  const [items, setItems] = useState(tasks);
+  const [tab, setTab] = useState('全部'); // 选中的页签状态
+  const [items, setItems] = useState(tasks); // 任务列表状态，初始为静态 mock 数据
   const navigate = useNavigate();
+
+  // 根据当前选择的页签，对列表数据进行状态过滤
   const list = tab === '全部' ? items : items.filter(t => statusMap[t.status]?.label === tab);
 
+  // 组件挂载时，从后端 API 拉取最新的任务列表数据；如果接口请求失败，则 fallback 使用本地预置的任务列表数据
   useEffect(() => {
     apiGet('/api/tasks', { tasks }).then(data => setItems(data.tasks || tasks));
   }, []);

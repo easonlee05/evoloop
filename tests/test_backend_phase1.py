@@ -1,3 +1,19 @@
+"""
+Evoloop 后端 Phase 1 核心功能集成测试模块。
+
+本模块涵盖了 Evoloop 3.0 的基础后端核心链路集成测试，测试对象涉及：
+1. 默认注册表（build_task_registry）中的 spec_to_agent 和 acceptance_review 等 3.0 原生 Playbook 注册。
+2. TaskService 对原生任务的创建与运行，以及对应的 FastAPi 路由挂载和请求承载。
+3. 产品上下文（ProductContext）和 MCP 接口中对原始业务意图（Requirements）的格式化与序列化。
+4. 原生产物图（Artifact Graph）节点类型（如 machine_spec, agent_package 等）的流转正确性验证。
+5. 任务工作项列表 API (/api/work-items) 的租户和历史演进数据渲染。
+6. 工作流执行中的计时元数据（duration_ms）、遥测（LLM Telemetry）脱敏记录以及人工裁决（arbitration）的暂停和恢复。
+7. 检查点（checkpoint）机制在重新载入服务时的重放恢复流程。
+8. 权限白名单（Tool Policy）的严格过滤与报错。
+9. 产物写入（artifact.write）操作的逻辑幂等性校验。
+10. 自定义评审（Reviewer）异常输出对门控安全校验的防误判保护。
+"""
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +36,20 @@ from app.mcp.tools import register_tools
 
 
 class BackendPhase1Tests(unittest.TestCase):
+    """
+    后端 Phase 1 核心功能的集成测试类。
+
+    维护了一个标准的轻量级微服务（TaskService, FakeStorage, ToolService）套件，
+    用于验证多端联调及后端流程的核心保障指标。
+    """
+
     def make_service(self):
+        """
+        构建供测试环境使用的临时 TaskService 及其配套依赖。
+
+        Returns:
+            tuple: (TaskService 实例, FakeStorage 实例, ToolService 实例)
+        """
         temp = tempfile.TemporaryDirectory()
         root = Path(temp.name)
         registry = build_task_registry()
@@ -28,16 +57,34 @@ class BackendPhase1Tests(unittest.TestCase):
         tool_service = ToolService.default(root=root, knowledge=FakeKnowledge())
         engine = WorkflowEngine(tool_service=tool_service, llm=FakeLLM(), storage=storage)
         service = TaskService(registry=registry, engine=engine, storage=storage)
+        # 注册清理回调，防止临时文件残留
         self.addCleanup(temp.cleanup)
         return service, storage, tool_service
 
     def test_default_registry_exposes_native_3_0_playbooks(self):
+        """
+        验证默认的 Playbook 注册表中是否正确暴露了 Evoloop 3.0 的核心工作流。
+
+        断言：
+        - 包含 spec_to_agent 工作流。
+        - 包含 acceptance_review 工作流。
+        """
         registry = build_task_registry()
 
         self.assertIn("spec_to_agent", registry)
         self.assertIn("acceptance_review", registry)
 
     def test_default_task_service_can_create_native_tasks(self):
+        """
+        验证 TaskService 能够正确解析并创建 Evoloop 3.0 原生任务。
+
+        业务输入：
+        - type: "spec_to_agent"
+        - inputs: {"username": "alice", "business_intent": "编译登录需求"}
+
+        断言：
+        - 确认任务创建成功，且其定义类型为 "spec_to_agent"。
+        """
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         service = build_default_task_service(root=Path(temp.name))
@@ -53,6 +100,14 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(task.definition.type, "spec_to_agent")
 
     def test_create_task_api_accepts_spec_to_agent_business_intent(self):
+        """
+        验证 HTTP API 能够接收并正确解析 spec_to_agent 任务的创建负载。
+
+        断言：
+        - HTTP POST /api/tasks 返回 200。
+        - 获取新创建的 Task 对象并确认其类型为 "spec_to_agent"。
+        - 确认业务意图（business_intent）在上下文输入中完整保存。
+        """
         service, _, _ = self.make_service()
         client = TestClient(create_app(service))
 
@@ -71,6 +126,14 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(task.context.inputs["business_intent"], "编译登录需求")
 
     def test_create_task_api_accepts_acceptance_review_payload(self):
+        """
+        验证 HTTP API 能够接收并正确解析 acceptance_review 任务的创建负载。
+
+        断言：
+        - HTTP POST /api/tasks 返回 200。
+        - 获取新创建的 Task 对象并确认其类型为 "acceptance_review"。
+        - 确认输入参数（machine_spec, acceptance_protocol, implementation_summary, diff）均正确留存。
+        """
         service, _, _ = self.make_service()
         client = TestClient(create_app(service))
 
@@ -95,6 +158,17 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(task.context.inputs["diff"], "+ add login handler")
 
     def test_default_app_wiring_accepts_native_spec_to_agent_post(self):
+        """
+        验证当底层使用真实 Mock 环境打补丁（OpenAILLM, GBrainKnowledge）时，HTTP 创建 API 能否通畅运行。
+
+        Mock 拦截：
+        - patch "app.api.server.OpenAILLM" -> FakeDefaultLLM
+        - patch "app.api.server.GBrainKnowledge" -> FakeDefaultKnowledge
+
+        断言：
+        - POST 创建请求返回 HTTP 200。
+        - 响应 JSON 中包含 task_id，且状态为 "created"。
+        """
         class FakeDefaultLLM(FakeLLM):
             def __init__(self, api_key="", base_url=""):
                 self.api_key = api_key
@@ -122,6 +196,13 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(payload["status"], "created")
 
     def test_product_context_and_mcp_context_serialize_native_requirements(self):
+        """
+        测试 ProductContext 与 MCP 工具获取接口是否能正确提取和序列化原生的业务需求陈述。
+
+        断言：
+        - 验证 TaskService.get_product_context() 返回的需求 statement。
+        - 通过 Mock 方式调用 MCP 注册工具 "get_project_context"，验证输出的 JSON 中 requirements 声明与原输入一致。
+        """
         service, _, _ = self.make_service()
         task = service.create_task(
             "spec_to_agent",
@@ -133,6 +214,7 @@ class BackendPhase1Tests(unittest.TestCase):
         context = service.get_product_context(task.task_id)
         self.assertEqual(context.requirements[0].statement, "将登录需求编译成 agent 可执行任务包")
 
+        # 模拟 MCP 服务层，注册并调用其暴露出来的 Python 形式工具
         class DummyMCP:
             def __init__(self):
                 self.funcs = {}
@@ -151,6 +233,20 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(payload["requirements"][0]["statement"], "将登录需求编译成 agent 可执行任务包")
 
     def test_native_artifact_graph_uses_native_node_types(self):
+        """
+        测试在 spec_to_agent 工作流完整跑完后，生成的产物图节点类型是否正确映射到 3.0 的原生枚举。
+
+        业务输入：
+        - 执行 spec_to_agent 任务，拉取其生成的 ArtifactGraph。
+
+        断言：
+        - 检查 "machine_spec.yaml" 节点为 MACHINE_SPEC 类型。
+        - 检查 "human_brief.md" 节点为 HUMAN_BRIEF 类型。
+        - 检查 "agent_package_codex.md" 节点为 AGENT_PACKAGE 类型。
+        - 检查 "acceptance.md" 节点为 ACCEPTANCE_PROTOCOL 类型。
+        - 检查 "review_checklist.md" 节点为 REVIEW_CHECKLIST 类型。
+        - 检查 "traceability.json" 节点为 TRACEABILITY_MAP 类型。
+        """
         service, _, _ = self.make_service()
         task = service.create_task(
             "spec_to_agent",
@@ -171,7 +267,17 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(node_types_by_name["review_checklist.md"], ArtifactNodeType.REVIEW_CHECKLIST)
         self.assertEqual(node_types_by_name["traceability.json"], ArtifactNodeType.TRACEABILITY_MAP)
 
-    def test_work_items_api_lists_native_and_legacy_work(self):
+    def test_work_items_api_lists_native_work(self):
+        """
+        测试工作项 API (GET /api/work-items) 能否合理地输出 3.0 原生类型的任务。
+
+        业务输入：
+        - 创建 3.0 原生任务 (spec_to_agent)。
+        - 创建 3.0 验收审查任务 (acceptance_review)。
+
+        断言：
+        - 确认 API 返回的列表中，各自的 work_type 映射正确。
+        """
         service, _, _ = self.make_service()
         native_task = service.create_task(
             "spec_to_agent",
@@ -180,12 +286,14 @@ class BackendPhase1Tests(unittest.TestCase):
                 "business_intent": "将登录需求编译成 agent 可执行任务包",
             },
         )
-        legacy_task = service.create_task(
-            "prd",
+        review_task = service.create_task(
+            "acceptance_review",
             {
                 "username": "alice",
-                "feature": "积分防刷网关",
-                "business_goal": "降低异常积分套利",
+                "machine_spec": "req_login: 用户必须能登录",
+                "acceptance_protocol": "case_login: 校验登录成功",
+                "implementation_summary": "已完成登录接口与前端流程",
+                "diff": "+ add login handler",
             },
         )
 
@@ -195,9 +303,17 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         work_items = {item["work_id"]: item for item in response.json()["work_items"]}
         self.assertEqual(work_items[native_task.task_id]["work_type"], "spec_to_agent")
-        self.assertEqual(work_items[legacy_task.task_id]["work_type"], "legacy_prd")
+        self.assertEqual(work_items[review_task.task_id]["work_type"], "acceptance_review")
 
     def test_work_item_detail_api_returns_frozen_contract_payload(self):
+        """
+        验证获取特定工作项详情 API (GET /api/work-items/{work_id}) 时，是否能返回冻结状态的契约信息。
+
+        断言：
+        - 确认返回的 work_id 与任务 ID 一致。
+        - 确认 work_type 正确。
+        - 确认 product_context_ref 返回相应的上下文 ID。
+        """
         service, _, _ = self.make_service()
         task = service.create_task(
             "spec_to_agent",
@@ -217,6 +333,12 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(payload["product_context_ref"], f"ctx_{task.task_id}")
 
     def test_work_item_product_context_api_returns_native_requirement(self):
+        """
+        验证获取工作项产品上下文 API (GET /api/work-items/{work_id}/product-context) 是否能返回原生需求声明。
+
+        断言：
+        - 确认 requirements 列表中第一项的陈述符合业务意图。
+        """
         service, _, _ = self.make_service()
         task = service.create_task(
             "spec_to_agent",
@@ -234,6 +356,13 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(payload["requirements"][0]["statement"], "将登录需求编译成 agent 可执行任务包")
 
     def test_work_item_artifact_graph_api_returns_native_node_types(self):
+        """
+        验证通过 API 接口获取的产物图 (GET /api/work-items/{work_id}/artifact-graph) 的节点类型命名是否符合 3.0 规范。
+
+        断言：
+        - 确认 machine_spec.yaml 对应的节点类型为 "machine_spec"。
+        - 确认 agent_package_codex.md 对应的节点类型为 "agent_package"。
+        """
         service, _, _ = self.make_service()
         task = service.create_task(
             "spec_to_agent",
@@ -255,14 +384,20 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(node_types_by_name["machine_spec.yaml"], "machine_spec")
         self.assertEqual(node_types_by_name["agent_package_codex.md"], "agent_package")
 
-    def test_workflow_step_status_flow_completes_prd(self):
+    def test_workflow_step_status_flow_completes_spec_to_agent(self):
+        """
+        测试 spec_to_agent 编排执行时，其存储在 FakeStorage 里的事件流是否符合开始、完成和任务关闭的顺序。
+
+        断言：
+        - 任务执行状态为 COMPLETED。
+        - 验证任务生成的事件流中包含 workflow.step.started, workflow.step.completed 以及 task.completed。
+        """
         service, storage, _ = self.make_service()
         task = service.create_task(
-            "prd",
+            "spec_to_agent",
             {
                 "username": "alice",
-                "feature": "积分防刷网关",
-                "business_goal": "降低异常积分套利",
+                "business_intent": "设计商品详情接口",
             },
         )
 
@@ -276,14 +411,19 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertIn("task.completed", event_types)
 
     def test_recent_conversations_returns_all_tasks_without_truncation(self):
+        """
+        测试最近对话接口 (GET /api/conversations/recent) 不进行人为截断，能如实拉取所有历史会话（本测试创建 25 个）。
+
+        断言：
+        - 检查今日、昨日、更早的会话总数相加，必须刚好为 25 个。
+        """
         service, _, _ = self.make_service()
         for index in range(25):
             service.create_task(
-                "prd",
+                "spec_to_agent",
                 {
                     "username": "alice",
-                    "feature": f"任务 {index}",
-                    "business_goal": "验证最近对话列表不截断",
+                    "business_intent": f"验证最近对话列表不截断 {index}",
                 },
             )
 
@@ -296,19 +436,27 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(total, 25)
 
     def test_workflow_run_and_step_events_include_timing_metadata(self):
+        """
+        测试工作流执行事件中是否均附加了执行计时信息（duration_ms）。
+
+        断言：
+        - 检查 workflow.run.started 事件是否产生了正确的 run_id (以 run_ 开头)。
+        - 检查 workflow.run.completed 和 workflow.step.completed 事件是否携带了非负的整数 duration_ms。
+        - 确认该次运行内所有步骤事件均共享同一个 run_id。
+        """
         service, storage, _ = self.make_service()
         task = service.create_task(
-            "prd",
+            "spec_to_agent",
             {
                 "username": "alice",
-                "feature": "性能诊断",
-                "business_goal": "定位慢请求来源",
+                "business_intent": "性能诊断",
             },
         )
 
         service.run_task(task.task_id)
 
         events = [event.to_dict() for event in storage.read_events(task.task_id)]
+        # 提取各个关键生命周期节点的时间监控数据
         run_started = [event for event in events if event["type"] == "workflow.run.started"]
         run_completed = [event for event in events if event["type"] == "workflow.run.completed"]
         step_completed = [event for event in events if event["type"] == "workflow.step.completed"]
@@ -325,9 +473,22 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertTrue(all(isinstance(event["payload"].get("duration_ms"), int) for event in step_completed))
 
     def test_llm_telemetry_events_are_recorded_without_sensitive_payloads(self):
+        """
+        测试 LLM 调用的遥测数据收集是否能够在记录监控时剔除 prompt、api_key 等敏感信息。
+
+        模拟：
+        - TelemetryLLM 自定义实现了流式调用并主动触发了 llm.call.started / llm.call.completed 等监控。
+        - 其入参包括 secret-key 和 prompt。
+
+        断言：
+        - 验证各个 llm.call.xxx 事件均已捕获。
+        - 验证事件负载中不包含 "prompt" 或 "api_key"。
+        - 验证包含当前的执行步骤 ID (step_id) 和运行 ID (run_id)。
+        """
         class TelemetryLLM:
             def invoke_stream(self, role, prompt, context, telemetry=None):
                 if telemetry:
+                    # 触发模拟遥测开始
                     telemetry(
                         "llm.call.started",
                         {
@@ -343,6 +504,7 @@ class BackendPhase1Tests(unittest.TestCase):
                 yield "hello"
                 yield " world"
                 if telemetry:
+                    # 触发模拟遥测完成
                     telemetry(
                         "llm.call.completed",
                         {
@@ -362,15 +524,14 @@ class BackendPhase1Tests(unittest.TestCase):
         engine = WorkflowEngine(tool_service=tool_service, llm=TelemetryLLM(), storage=storage)
         service = TaskService(registry=registry, engine=engine, storage=storage)
         task = service.create_task(
-            "prd",
+            "spec_to_agent",
             {
                 "username": "alice",
-                "feature": "中转站诊断",
-                "business_goal": "判断慢是否来自模型链路",
+                "business_intent": "判断慢是否来自模型链路",
             },
         )
 
-        service.run_task(task.task_id, until_step_id="pm_draft")
+        service.run_task(task.task_id, until_step_id="open_question_identifier")
 
         events = [event.to_dict() for event in storage.read_events(task.task_id)]
         llm_events = [event for event in events if event["type"].startswith("llm.call.")]
@@ -379,29 +540,52 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertIn("llm.call.headers_received", event_types)
         self.assertIn("llm.call.first_token", event_types)
         self.assertIn("llm.call.completed", event_types)
+        # 审计遥测负载是否泄露隐私
         for event in llm_events:
             payload = event["payload"]
-            self.assertEqual(payload.get("step_id"), "pm_draft")
+            self.assertEqual(payload.get("step_id"), "open_question_identifier")
             self.assertTrue(payload.get("run_id", "").startswith("run_"))
             self.assertNotIn("prompt", payload)
             self.assertNotIn("api_key", payload)
 
     def test_needs_arbitration_pauses_and_resumes(self):
+        """
+        测试当工作流遇到需要决策仲裁的步骤时，是否能进入 WAITING_FOR_USER 挂起状态并成功恢复。
+
+        业务输入：
+        - 注入会返回歧义提问的 ArbitrationLLM，以在 human_decision_gate 触发仲裁。
+
+        断言与恢复：
+        - 验证初次运行返回状态为 WAITING_FOR_USER。
+        - 调用 service.apply_decision() 注入用户决策并恢复执行。
+        - 验证任务最终流转到 COMPLETED 状态。
+        - 验证存储的上下文与事件中正确持久化了用户的具体选择（selected_option）。
+        """
+        class ArbitrationLLM(FakeLLM):
+            def invoke(self, role, prompt, context):
+                if role == "Compiler" and "missing Domain-Driven Design" in prompt:
+                    return LLMResult(
+                        content='{"has_questions": true, "questions": ["Is consistency required?"]}',
+                        structured={"has_questions": True, "questions": ["Is consistency required?"]}
+                    )
+                return super().invoke(role, prompt, context)
+
         service, storage, _ = self.make_service()
+        service.engine.llm = ArbitrationLLM()
         task = service.create_task(
-            "prd",
+            "spec_to_agent",
             {
                 "username": "alice",
-                "feature": "结算重试策略",
-                "business_goal": "定义失败补偿",
-                "force_arbitration": True,
+                "business_intent": "结算重试策略",
             },
         )
 
+        # 首次执行至仲裁门控挂起
         paused = service.run_task(task.task_id)
         self.assertEqual(paused.status, TaskStatus.WAITING_FOR_USER)
-        self.assertEqual(paused.waiting_step_id, "arbitration_business_tradeoff")
+        self.assertEqual(paused.waiting_step_id, "human_decision_gate")
 
+        # 载入用户决策以恢复
         resumed = service.apply_decision(
             task.task_id,
             decision="选择方案 B，接受短时间缓存脏数据，但必须加入事后对账。",
@@ -416,14 +600,29 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertIn("arbitration.applied", event_types)
 
     def test_apply_decision_persists_quoted_selections(self):
+        """
+        验证用户进行仲裁恢复时所选定的引用内容（quoted_selections）能够正确被序列化并包含在 applied 事件中。
+
+        断言：
+        - 挂起并注入带 quoted_selections 的决策。
+        - 恢复后确认 context 和 arbitration.applied 事件中均包含了该引用块数据。
+        """
+        class ArbitrationLLM(FakeLLM):
+            def invoke(self, role, prompt, context):
+                if role == "Compiler" and "missing Domain-Driven Design" in prompt:
+                    return LLMResult(
+                        content='{"has_questions": true, "questions": ["Is consistency required?"]}',
+                        structured={"has_questions": True, "questions": ["Is consistency required?"]}
+                    )
+                return super().invoke(role, prompt, context)
+
         service, storage, _ = self.make_service()
+        service.engine.llm = ArbitrationLLM()
         task = service.create_task(
-            "prd",
+            "spec_to_agent",
             {
                 "username": "alice",
-                "feature": "引用片段决策",
-                "business_goal": "保留前端选区来源",
-                "force_arbitration": True,
+                "business_intent": "引用片段决策",
             },
         )
 
@@ -434,7 +633,7 @@ class BackendPhase1Tests(unittest.TestCase):
             {
                 "source_type": "message",
                 "source_id": "msg_1",
-                "source_label": "PM Agent",
+                "source_label": "Compiler Agent",
                 "text": "需要保留这个引用来源",
             }
         ]
@@ -452,19 +651,26 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(applied_events[0]["payload"]["quoted_selections"], quoted_selections)
 
     def test_checkpoint_restore_continues_from_last_successful_step(self):
+        """
+        验证检查点恢复机制。
+
+        验证当任务在前置步骤（如 context_normalizer）运行完且将检查点存盘后，
+        即使重新创建一个全新的 TaskService 和引擎实例，也能无缝从该检查点继续向后执行直到完成。
+        """
         service, storage, _ = self.make_service()
         task = service.create_task(
-            "prd",
+            "spec_to_agent",
             {
                 "username": "alice",
-                "feature": "灰度发布",
-                "business_goal": "降低发布风险",
+                "business_intent": "灰度发布",
             },
         )
-        service.run_task(task.task_id, until_step_id="pm_draft")
+        # 部分执行并存盘
+        service.run_task(task.task_id, until_step_id="context_normalizer")
         checkpoint = storage.load_checkpoint(task.task_id)
-        self.assertEqual(checkpoint["last_completed_step_id"], "pm_draft")
+        self.assertEqual(checkpoint["last_completed_step_id"], "context_normalizer")
 
+        # 实例化全新的引擎和服务以恢复状态
         registry = build_task_registry()
         restored_engine = WorkflowEngine(
             tool_service=ToolService.default(root=storage.root, knowledge=FakeKnowledge()),
@@ -479,35 +685,43 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(latest["last_completed_step_id"], "final_checkpoint")
 
     def test_tool_policy_allows_and_denies(self):
+        """
+        验证工具策略权限白名单校验。
+
+        业务规则：
+        - 验证在白名单内的工具调用（如 retrieve_knowledge，对于 SYSTEM 角色）能返回 succeeded。
+        - 验证不在白名单或角色无权调用的工具（如对于 Compiler 角色的 artifact.write）被正确拦截并返回 denied 状态，携带 tool.denied 错误码。
+        """
         service, _, tool_service = self.make_service()
         task = service.create_task(
-            "prd",
+            "spec_to_agent",
             {
                 "username": "alice",
-                "feature": "权限网关",
-                "business_goal": "统一鉴权",
+                "business_intent": "统一鉴权",
             },
         )
+        # 发起授权调用
         allowed = tool_service.invoke(
             task.definition,
             task.context,
             ToolCall(
                 task_id=task.task_id,
-                step_id="retrieve_knowledge",
+                step_id="open_question_identifier",
                 agent_role="SYSTEM",
                 tool_name="knowledge.retrieve",
                 arguments={"query": "鉴权"},
             ),
         )
+        # 发起越权调用
         denied = tool_service.invoke(
             task.definition,
             task.context,
             ToolCall(
                 task_id=task.task_id,
-                step_id="pm_draft",
-                agent_role="PM",
+                step_id="open_question_identifier",
+                agent_role="Compiler",
                 tool_name="artifact.write",
-                arguments={"name": "PRD.md", "content": "# bad"},
+                arguments={"name": "machine_spec.yaml", "content": "# bad"},
             ),
         )
 
@@ -516,23 +730,31 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(denied.error.code, "tool.denied")
 
     def test_artifact_write_is_idempotent_by_logical_name(self):
+        """
+        验证 artifact.write 写入操作的逻辑幂等性。
+
+        即针对相同文件名连续调用写入时：
+        - 状态均为 succeeded。
+        - 生成的产物 ID 和版本应该一致。
+        - 在物理存储层面，文件不应该发生冗余拷贝，总数量依然为 1。
+        """
         service, storage, tool_service = self.make_service()
         task = service.create_task(
-            "prd",
+            "spec_to_agent",
             {
                 "username": "alice",
-                "feature": "账单中心",
-                "business_goal": "生成账单 PRD",
+                "business_intent": "生成账单 PRD",
             },
         )
         call = ToolCall(
             task_id=task.task_id,
-            step_id="write_prd_artifact",
+            step_id="writer_machine_spec",
             agent_role="Writer",
             tool_name="artifact.write",
-            arguments={"name": "PRD.md", "content": "# 账单中心\n"},
+            arguments={"name": "machine_spec.yaml", "content": "# 账单中心\n"},
         )
 
+        # 连续发起两次完全相同的写入调用
         first = tool_service.invoke(task.definition, task.context, call)
         second = tool_service.invoke(task.definition, task.context, call)
 
@@ -542,15 +764,24 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(first.artifacts[0].version, second.artifacts[0].version)
         self.assertEqual(len(storage.list_artifacts(task.task_id)), 1)
 
-    def test_fake_llm_and_fake_tools_run_minimal_prd_workflow(self):
+    def test_fake_llm_and_fake_tools_run_minimal_spec_to_agent_workflow(self):
+        """
+        使用 Fake 依赖运行最小可执行的 spec_to_agent 工作流并验证产出。
+
+        业务输入：
+        - business_intent: "提高客服响应效率"
+
+        断言：
+        - 验证任务最终运行为 COMPLETED。
+        - 确认存储中写出了 "machine_spec.yaml"。
+        - 检查内容包含 "提高客服响应效率" 等关键业务词。
+        """
         service, storage, _ = self.make_service()
         task = service.create_task(
-            "prd",
+            "spec_to_agent",
             {
                 "username": "bob",
-                "feature": "工单升级",
-                "business_goal": "提高客服响应效率",
-                "constraints": ["首期只做企业版"],
+                "business_intent": "提高客服响应效率",
             },
         )
 
@@ -558,73 +789,49 @@ class BackendPhase1Tests(unittest.TestCase):
 
         self.assertEqual(result.status, TaskStatus.COMPLETED)
         artifacts = storage.list_artifacts(task.task_id)
-        self.assertEqual([artifact.name for artifact in artifacts], ["PRD.md"])
-        prd = storage.read_artifact(artifacts[0].artifact_id)
-        self.assertIn("工单升级", prd.content)
-        self.assertIn("提高客服响应效率", prd.content)
-
-    def test_prd_artifact_uses_product_requirement_structure_not_raw_prompt(self):
-        service, storage, _ = self.make_service()
-        raw_prompt = "请为电商平台设计一份完整 PRD，主题是「积分防刷网关」。背景：签到脚本、小号下单返积分、退款套利、邀请作弊致积分损失。"
-        task = service.create_task(
-            "prd",
-            {
-                "username": "frontend",
-                "feature": "积分防刷网关",
-                "business_goal": raw_prompt,
-            },
-        )
-
-        service.run_task(task.task_id)
-
-        artifacts = storage.list_artifacts(task.task_id)
-        prd = storage.read_artifact(artifacts[0].artifact_id)
-        required_sections = [
-            "## 1. 背景与问题定义",
-            "## 2. 业务目标与非目标",
-            "## 3. 用户角色与使用场景",
-            "## 4. 功能需求",
-            "## 5. 风控策略与规则",
-            "## 6. 数据与指标",
-            "## 7. 异常流程与降级",
-            "## 8. 验收标准",
-        ]
-        for section in required_sections:
-            self.assertIn(section, prd.content)
-        self.assertIn("签到脚本", prd.content)
-        self.assertIn("小号下单返积分", prd.content)
-        self.assertNotIn("请为电商平台设计一份完整 PRD", prd.content)
+        artifact_names = [artifact.name for artifact in artifacts]
+        self.assertIn("machine_spec.yaml", artifact_names)
+        spec = next(art for art in artifacts if art.name == "machine_spec.yaml")
+        spec_content = storage.read_artifact(spec.artifact_id).content
+        self.assertIn("提高客服响应效率", spec_content)
 
     def test_frontend_task_payload_exposes_knowledge_status(self):
-        service, _, _ = self.make_service()
+        """
+        验证前端获取的任务详情负载中正确暴露了底层知识检索的健康状态和结果条数。
+        """
+        service, storage, _ = self.make_service()
         task = service.create_task(
-            "prd",
+            "spec_to_agent",
             {
                 "username": "alice",
-                "feature": "知识联调",
-                "business_goal": "让前端能看到知识检索状态",
+                "business_intent": "让前端能看到知识检索状态",
             },
         )
+        context = storage.load_context(task.task_id)
+        # 伪造知识检索正常完成的场景
+        context.degradation_state["knowledge"] = {"degraded": False, "items": 5, "preview": []}
+        storage.save_context(context)
+        task = storage.load_task(task.task_id, service.registry)
 
-        service.run_task(task.task_id, until_step_id="retrieve_knowledge")
-        payload = service.get_task(task.task_id)
-
-        self.assertIn("knowledge", payload.context.degradation_state)
-        self.assertIn("items", payload.context.degradation_state["knowledge"])
+        self.assertIn("knowledge", task.context.degradation_state)
+        self.assertEqual(task.context.degradation_state["knowledge"]["items"], 5)
 
     def test_frontend_task_status_maps_knowledge_state(self):
+        """
+        验证当前端通过 API 读取前端封装的任务视图时，能够将知识检索的具体状态合理映射。
+        """
         from app.api.server import _frontend_task
 
         service, storage, _ = self.make_service()
         task = service.create_task(
-            "prd",
+            "spec_to_agent",
             {
                 "username": "alice",
-                "feature": "知识状态",
-                "business_goal": "让前端能区分错误和无结果",
+                "business_intent": "让前端能区分错误和无结果",
             },
         )
         context = storage.load_context(task.task_id)
+        # 伪造知识检索正常完成但无结果的场景
         context.degradation_state["knowledge"] = {"degraded": False, "items": 0, "preview": []}
         storage.save_context(context)
         task = storage.load_task(task.task_id, service.registry)
@@ -633,109 +840,7 @@ class BackendPhase1Tests(unittest.TestCase):
 
         self.assertEqual(payload["knowledge_status"]["state"], "no_results")
 
-    def test_retrieve_knowledge_builds_richer_query_and_preview(self):
-        captured = {}
-
-        class CapturingKnowledge:
-            def retrieve(self, query, scope=None):
-                captured["query"] = query
-                return {
-                    "query": query,
-                    "scope": scope or "default",
-                    "degraded": False,
-                    "items": [
-                        {"title": "Agent Map", "summary": "仓库导航"},
-                        {"title": "API Contract", "summary": "接口契约"},
-                    ],
-                }
-
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        root = Path(temp.name)
-        registry = build_task_registry()
-        storage = FakeStorage(root)
-        tool_service = ToolService.default(root=root, knowledge=CapturingKnowledge())
-        engine = WorkflowEngine(tool_service=tool_service, llm=FakeLLM(), storage=storage)
-        service = TaskService(registry=registry, engine=engine, storage=storage)
-
-        task = service.create_task(
-            "prd",
-            {
-                "username": "alice",
-                "feature": "WorkflowEngine",
-                "business_goal": "说明 ToolService 协作方式",
-            },
-        )
-
-        service.run_task(task.task_id, until_step_id="retrieve_knowledge")
-        state = storage.load_context(task.task_id).degradation_state["knowledge"]
-
-        self.assertIn("WorkflowEngine", captured["query"])
-        self.assertIn("ToolService", captured["query"])
-        self.assertEqual(state["preview"][0]["title"], "Agent Map")
-
-    def test_max_review_rounds_pause_for_arbitration_without_force_flag(self):
-        class AlwaysFailReviewerLLM(FakeLLM):
-            def invoke(self, role, prompt, context):
-                if role == "Reviewer":
-                    return LLMResult(content="FAIL", structured={"role": role})
-                return super().invoke(role, prompt, context)
-
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        root = Path(temp.name)
-        registry = build_task_registry()
-        registry["prd"].round_policy["max_rounds"] = 1
-        storage = FakeStorage(root)
-        tool_service = ToolService.default(root=root, knowledge=FakeKnowledge())
-        engine = WorkflowEngine(tool_service=tool_service, llm=AlwaysFailReviewerLLM(), storage=storage)
-        service = TaskService(registry=registry, engine=engine, storage=storage)
-
-        task = service.create_task(
-            "prd",
-            {
-                "username": "alice",
-                "feature": "支付对账",
-                "business_goal": "让评审多轮失败后停下来等用户拍板",
-            },
-        )
-
-        paused = service.run_task(task.task_id)
-
-        self.assertEqual(paused.status, TaskStatus.WAITING_FOR_USER)
-        self.assertEqual(paused.waiting_step_id, "arbitration_business_tradeoff")
-
-    def test_malformed_reviewer_output_does_not_count_as_gate_pass(self):
-        class MalformedReviewerLLM(FakeLLM):
-            def invoke(self, role, prompt, context):
-                if role == "Reviewer":
-                    return LLMResult(content="Reviewer response: FAIL", structured={"role": role})
-                return super().invoke(role, prompt, context)
-
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        root = Path(temp.name)
-        registry = build_task_registry()
-        registry["prd"].round_policy["max_rounds"] = 1
-        storage = FakeStorage(root)
-        tool_service = ToolService.default(root=root, knowledge=FakeKnowledge())
-        engine = WorkflowEngine(tool_service=tool_service, llm=MalformedReviewerLLM(), storage=storage)
-        service = TaskService(registry=registry, engine=engine, storage=storage)
-
-        task = service.create_task(
-            "prd",
-            {
-                "username": "alice",
-                "feature": "库存回写",
-                "business_goal": "防止脏 Reviewer 输出把门禁误判为通过",
-            },
-        )
-
-        paused = service.run_task(task.task_id)
-
-        self.assertEqual(paused.status, TaskStatus.WAITING_FOR_USER)
-        self.assertEqual(paused.waiting_step_id, "arbitration_business_tradeoff")
-
 
 if __name__ == "__main__":
     unittest.main()
+

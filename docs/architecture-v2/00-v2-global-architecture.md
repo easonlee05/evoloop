@@ -1,8 +1,8 @@
 # 00 EvoLoop 2.0 全局架构设计 (Global Architecture)
 
 > 状态说明：本文档保留为早期 2.0/v2 架构草稿，不再是当前目标架构真相源。
-> 当前应优先阅读 `docs/evoloop-3.0/architecture/00-global-architecture.md` 和 `docs/evoloop-3.0/technical/00-evolution-roadmap.md`。
-> 若本文与 3.0 文档冲突，以 3.0 文档为准。
+> 当前应优先阅读 `docs/evoloop-3.1/architecture/00-global-architecture.md` 和 `docs/evoloop-3.1/technical/00-agent-session-evolution.md`。
+> 若本文与 3.1 文档冲突，以 3.1 文档为准。
 
 ## 1. 架构演进背景
 
