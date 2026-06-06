@@ -118,6 +118,13 @@ Knowledge & Storage Layer
 
 其中 `Agent Session Runtime` 是 3.1 新增的关键服务层。它不取代 `WorkflowEngine`，而是被 `AgentStepExecutor` 调用，用来执行单个 agent step 内部的多轮推理。
 
+3.1 当前还新增了一层“内部 subagent 编排”，但它不是新的主控制面：
+
+- `session_helper`：只存在于单个 `AgentSession` 内部，用于窄任务包分析。
+- `formal_subtask`：只在控制面天然可分的 repair/review 子包里启用，并直接复用现有 `Task` / `WorkItem`。
+
+这两者都必须服从 `Playbook 控流程、AgentSession 控推理、ToolPolicy 控权限、Acceptance Review 控闭环` 的主结构，不能反向长出第二套自治树。
+
 ### 4.3 State & Memory Layer
 
 3.1 明确区分四种状态：
@@ -126,10 +133,16 @@ Knowledge & Storage Layer
 |---|---|
 | `ProductContext` | 跨任务的产品上下文真相源 |
 | `WorkingMemory` | 单个 playbook run 的工作态 |
-| `AgentSessionState` | 单个 AgentSession 的消息、工具观察、迭代状态 |
+| `AgentSessionState` | 单个 AgentSession 的消息、工具观察、agenda、helper run 与迭代状态 |
 | `ArtifactGraph` | 产物依赖、证据与投影关系图 |
 
 `AgentSessionState` 是新增对象。它必须可追踪、可审计、可持久化摘要，但不要求把完整 chain-of-thought 暴露给用户。对外展示应以行动、工具调用、观察和结构化结果为主。
+
+内部 subagent 的状态分层也必须清晰：
+
+- `session_helper` trace 进入父 `AgentSessionState.helper_runs`，但不进入正式任务树。
+- `formal_subtask` 进入正式 `Task` / `WorkItem` 持久化体系，并保留 `parent_task_id`、`root_task_id`、`subtask_type` 和 `join_step_id`。
+- 两类 subagent 都不能获得未裁剪的父上下文全文。
 
 ### 4.4 Tool & Governance Layer
 
@@ -387,8 +400,8 @@ Agenda 的定位：
 
 - Agenda 是 Agent 视角的临时分析待办，不是 Workflow DAG。
 - AgendaItem 属于 `AgentSessionState`，随 session trace 记录。
-- Agenda 工具只能影响当前 session 的推理顺序，不能新增、删除或跳过 Playbook step。
-- 建议第一版提供 `agenda.add_item`、`agenda.update_status`、`agenda.list` 三个受控工具。
+- Agenda 工具或内部协议只能影响当前 session 的推理顺序，不能新增、删除或跳过 Playbook step。
+- 当前第一版已通过 `AgentRuntime` 的内部 `agenda_add` / `agenda_update` 协议落地；若后续需要更强治理或前端可见性，再演进为显式 `agenda.add_item`、`agenda.update_status`、`agenda.list` 受控工具。
 - Agenda 默认有数量上限，例如 12 个 item，防止复杂任务无限展开。
 
 这保持了 3.1 的核心原则：外层流程确定，内层推理智能。

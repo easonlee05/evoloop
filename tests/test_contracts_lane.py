@@ -11,6 +11,17 @@
 import unittest
 from uuid import uuid4
 
+from app.core.errors import DomainError
+from app.core.subagent import (
+    ExecutionMode,
+    SubagentBudget,
+    SubagentDenyReason,
+    SubagentResult,
+    SubagentRun,
+    SubagentRunStatus,
+    SubagentScope,
+    SubagentSpawnRequest,
+)
 from app.core.work import WorkItem, WorkType, WorkStatus
 from app.core.playbook import (
     Playbook, PlaybookStep, ProductContext, DecisionGate, WorkerAdapter,
@@ -97,6 +108,59 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(restored.parent_work_id, "task_parent")
         self.assertEqual(restored.review_cycle_id, "review_cycle_123")
         self.assertEqual(restored.max_review_iterations, 3)
+
+    def test_subagent_run_serialization(self):
+        """SubagentRun 应完整保留 scope、budget、结果与错误语义。"""
+        request = SubagentSpawnRequest(
+            scope=SubagentScope.SESSION_HELPER,
+            goal="Inspect ambiguity",
+            task_slice="Only inspect auth rule ambiguity",
+            input_refs=["business_intent"],
+            input_excerpt={"business_intent": "Build login with SSO"},
+            allowed_tools=["knowledge.retrieve"],
+            output_schema={"summary": "string", "findings": "array"},
+            budget=SubagentBudget(
+                max_iterations=2,
+                max_input_tokens=400,
+                max_output_tokens=200,
+                max_tool_calls=2,
+                spawn_fanout_remaining=1,
+            ),
+        )
+        run = SubagentRun(
+            parent_task_id="task_parent",
+            parent_session_id="session_parent",
+            root_task_id="task_root",
+            scope=SubagentScope.SESSION_HELPER,
+            depth=1,
+            request=request,
+            execution_mode=ExecutionMode.PARALLEL_HELPERS,
+            status=SubagentRunStatus.DENIED,
+            result=SubagentResult(
+                summary="Budget gate denied helper",
+                structured_output={},
+                evidence_refs=[],
+                used_tools=[],
+                confidence="low",
+                degraded=True,
+                degradation_reason="input excerpt too large",
+            ),
+            error=DomainError("subagent.denied", "budget denied"),
+            deny_reason=SubagentDenyReason.BUDGET_EXCEEDED,
+        )
+
+        data = run.to_dict()
+        restored = SubagentRun.from_dict(data)
+
+        self.assertEqual(data["scope"], "session_helper")
+        self.assertEqual(data["status"], "denied")
+        self.assertEqual(data["execution_mode"], "parallel_helpers")
+        self.assertEqual(data["deny_reason"], "budget_exceeded")
+        self.assertEqual(restored.scope, SubagentScope.SESSION_HELPER)
+        self.assertEqual(restored.status, SubagentRunStatus.DENIED)
+        self.assertEqual(restored.execution_mode, ExecutionMode.PARALLEL_HELPERS)
+        self.assertEqual(restored.deny_reason, SubagentDenyReason.BUDGET_EXCEEDED)
+        self.assertEqual(restored.request.budget.max_input_tokens, 400)
 
     def test_playbook_serialization(self):
         """测试 Playbook 及其内部步骤 PlaybookStep 的序列化与反序列化。
@@ -1105,4 +1169,3 @@ class TestContractsLane(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

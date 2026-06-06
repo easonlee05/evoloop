@@ -281,6 +281,41 @@ class TestAcceptanceReviewWorkflow(unittest.TestCase):
         self.assertTrue(result.outputs["agent_session_id"].startswith("session_"))
         self.assertEqual(result.outputs["agent_session_trace"]["step_id"], "requirement_coverage")
         self.assertEqual(result.outputs["agent_session_trace"]["state"]["status"], "succeeded")
+        self.assertIn("allowed_tools", result.outputs["agent_session_trace"])
+        self.assertIn("agenda_items", result.outputs["agent_session_trace"]["state"])
+
+    def test_requirement_coverage_records_helper_runs_when_enabled(self):
+        """启用内部 subagent 时，requirement_coverage 应记录 helper runs。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+
+        class HelperAwareLLM:
+            def invoke(self, role, prompt, context):
+                if "SESSION HELPER" in prompt:
+                    return LLMResult(
+                        content='{"summary":"Coverage hotspots found","requirement_focus":["req_login"],"confidence":"medium"}'
+                    )
+                return LLMResult(
+                    content='{"req_login":{"covered":true,"notes":"implemented","evidence_refs":["app/auth.py"]}}'
+                )
+
+        context = TaskContext(
+            task_id="task_exec_coverage_helpers",
+            task_type="acceptance_review",
+            username="alice",
+            title="Coverage Helper Test",
+            goal="Coverage Helper Test",
+            inputs={"diff": "+ add login", "machine_spec": "req_login:", "enable_subagents": True},
+        )
+        context.step_outputs["ingest_acceptance_context"] = {"requirement_ids": ["req_login"]}
+        task = Task(definition=build_acceptance_review_definition(), context=context)
+        step = WorkflowStep(id="requirement_coverage", type="agent", title="Coverage", role="Reviewer")
+
+        result = RequirementCoverageExecutor(llm=HelperAwareLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertGreaterEqual(len(result.outputs["agent_session_trace"]["state"]["helper_runs"]), 1)
 
     def test_requirement_coverage_marks_degraded_when_agent_session_invalid(self):
         """requirement_coverage 不能在模型不可解析时继续伪装成可信 coverage。"""
@@ -376,6 +411,40 @@ class TestAcceptanceReviewWorkflow(unittest.TestCase):
         self.assertTrue(result.outputs["agent_session_id"].startswith("session_"))
         self.assertEqual(result.outputs["agent_session_trace"]["step_id"], "diff_impact_analyzer")
         self.assertEqual(result.outputs["agent_session_trace"]["state"]["status"], "succeeded")
+
+    def test_diff_impact_analyzer_records_helper_runs_when_enabled(self):
+        """启用内部 subagent 时，diff_impact_analyzer 应记录 helper runs。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+
+        class HelperAwareLLM:
+            def invoke(self, role, prompt, context):
+                if "SESSION HELPER" in prompt:
+                    return LLMResult(
+                        content='{"summary":"Found risk themes","risk_focus":["regression"],"confidence":"medium"}'
+                    )
+                return LLMResult(content='{"issues":[],"fix_tasks":[]}')
+
+        context = TaskContext(
+            task_id="task_exec_diff_helpers",
+            task_type="acceptance_review",
+            username="alice",
+            title="Diff Helper Test",
+            goal="Diff Helper Test",
+            inputs={"diff": "+ add login flow", "implementation_summary": "login changed", "enable_subagents": True},
+        )
+        context.step_outputs["ingest_acceptance_context"] = {
+            "parsed_diff_files": [],
+            "requirement_ids": ["req_login"],
+        }
+        task = Task(definition=build_acceptance_review_definition(), context=context)
+        step = WorkflowStep(id="diff_impact_analyzer", type="agent", title="Diff Check", role="Reviewer")
+
+        result = DiffImpactAnalyzerExecutor(llm=HelperAwareLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertGreaterEqual(len(result.outputs["agent_session_trace"]["state"]["helper_runs"]), 1)
 
     def test_graph_validation(self):
         """

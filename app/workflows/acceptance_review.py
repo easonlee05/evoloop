@@ -16,8 +16,10 @@ from app.core.artifact_graph import ArtifactEdge, ArtifactEdgeType, ArtifactGrap
 from app.core.errors import DomainError
 from app.core.review import RequirementCoverage, ReviewFixTask as FixTask, ReviewIssue, ReviewIssueSeverity as IssueSeverity, ReviewResult, ReviewVerdict
 from app.core.session import AgentSession, AgentSessionStatus
+from app.core.subagent import SubagentBudget, SubagentScope, SubagentSpawnRequest
 from app.core.task import StepResult, StepStatus, Task, TaskDefinition, WorkflowSpec, WorkflowStep
 from app.services.agent_runtime import AgentRuntime
+from app.services.subagent_service import SubagentService
 from app.workflows.policies import build_default_tool_policy
 
 logger = logging.getLogger(__name__)
@@ -291,6 +293,53 @@ class RequirementCoverageExecutor:
         self.llm = llm
         self.tool_service = tool_service
 
+    def _run_internal_helpers(
+        self,
+        task: Task,
+        session: AgentSession,
+        req_ids: List[str],
+        diff: str,
+        active_llm: Any,
+    ) -> List[Dict[str, Any]]:
+        """Optionally pre-scan coverage hotspots with a bounded helper."""
+        if not task.context.inputs.get("enable_subagents"):
+            return []
+
+        helper_request = SubagentSpawnRequest(
+            scope=SubagentScope.SESSION_HELPER,
+            goal="Identify requirement coverage hotspots before final coverage mapping.",
+            task_slice="Only inspect likely uncovered requirements and evidence hotspots from the diff.",
+            input_refs=["requirement_ids", "diff_head"],
+            input_excerpt={"requirement_ids": list(req_ids), "diff_head": diff[:1200]},
+            allowed_tools=["knowledge.retrieve"] if self.tool_service else [],
+            output_schema={"summary": "string", "requirement_focus": "array", "confidence": "string"},
+            budget=SubagentBudget(
+                max_iterations=2,
+                max_input_tokens=400,
+                max_output_tokens=160,
+                max_tool_calls=1,
+                spawn_fanout_remaining=1,
+            ),
+            depth=1,
+        )
+        run = SubagentService(llm=active_llm, tool_service=self.tool_service).run_helper(
+            parent_session=session,
+            request=helper_request,
+            task_definition=task.definition,
+            task_context=task.context,
+        )
+        if not run.result:
+            return []
+        return [
+            {
+                "summary": run.result.summary,
+                "requirement_focus": run.result.structured_output.get("requirement_focus", []),
+                "confidence": run.result.confidence,
+                "degraded": run.result.degraded,
+                "degradation_reason": run.result.degradation_reason,
+            }
+        ]
+
     def run(self, task: Task, step: WorkflowStep, *, run_id: Optional[str] = None, is_parallel: bool = False, llm: Any = None) -> StepResult:
         active_llm = llm or self.llm
         req_ids = task.context.step_outputs.get("ingest_acceptance_context", {}).get("requirement_ids", [])
@@ -317,10 +366,18 @@ class RequirementCoverageExecutor:
             },
             max_iterations=3,
         )
+        helper_context = self._run_internal_helpers(task, session, req_ids, diff, active_llm)
         run_result = AgentRuntime(llm=active_llm, tool_service=self.tool_service).run_json_session(
             session=session,
-            prompt=prompt,
-            context={"req_ids": req_ids, "diff_head": diff[:2000]},
+            prompt=prompt
+            + (
+                "\n\nINTERNAL HELPER SNAPSHOT:\n"
+                "Use these helper findings as advisory coverage hints only.\n"
+                f"{json.dumps(helper_context, ensure_ascii=False)}"
+                if helper_context
+                else ""
+            ),
+            context={"req_ids": req_ids, "diff_head": diff[:2000], "helper_context": helper_context},
             required_keys=req_ids,
             task_definition=task.definition,
             task_context=task.context,
@@ -548,6 +605,53 @@ class DiffImpactAnalyzerExecutor:
             StyleAndBrokenWindowExecutor(),
         ]
 
+    def _run_internal_helpers(
+        self,
+        task: Task,
+        session: AgentSession,
+        diff: str,
+        requirement_ids: List[str],
+        active_llm: Any,
+    ) -> List[Dict[str, Any]]:
+        """Optionally pre-scan semantic risk themes with a bounded helper."""
+        if not task.context.inputs.get("enable_subagents"):
+            return []
+
+        helper_request = SubagentSpawnRequest(
+            scope=SubagentScope.SESSION_HELPER,
+            goal="Identify semantic risk themes before final diff impact review.",
+            task_slice="Only inspect regression, compatibility, and requirement-risk themes from the diff.",
+            input_refs=["diff_head", "requirement_ids"],
+            input_excerpt={"diff_head": diff[:1200], "requirement_ids": list(requirement_ids)},
+            allowed_tools=["knowledge.retrieve"] if self.tool_service else [],
+            output_schema={"summary": "string", "risk_focus": "array", "confidence": "string"},
+            budget=SubagentBudget(
+                max_iterations=2,
+                max_input_tokens=400,
+                max_output_tokens=160,
+                max_tool_calls=1,
+                spawn_fanout_remaining=1,
+            ),
+            depth=1,
+        )
+        run = SubagentService(llm=active_llm, tool_service=self.tool_service).run_helper(
+            parent_session=session,
+            request=helper_request,
+            task_definition=task.definition,
+            task_context=task.context,
+        )
+        if not run.result:
+            return []
+        return [
+            {
+                "summary": run.result.summary,
+                "risk_focus": run.result.structured_output.get("risk_focus", []),
+                "confidence": run.result.confidence,
+                "degraded": run.result.degraded,
+                "degradation_reason": run.result.degradation_reason,
+            }
+        ]
+
     def run(self, task: Task, step: WorkflowStep, *, run_id: Optional[str] = None, is_parallel: bool = False, llm: Any = None) -> StepResult:
         active_llm = llm or self.llm
         parsed_diff = task.context.step_outputs.get("ingest_acceptance_context", {}).get("parsed_diff_files", [])
@@ -582,10 +686,24 @@ class DiffImpactAnalyzerExecutor:
                 },
                 max_iterations=3,
             )
+            helper_context = self._run_internal_helpers(
+                task,
+                session,
+                diff,
+                task.context.step_outputs.get("ingest_acceptance_context", {}).get("requirement_ids", []),
+                active_llm,
+            )
             run_result = AgentRuntime(llm=active_llm, tool_service=self.tool_service).run_json_session(
                 session=session,
-                prompt=prompt,
-                context={"diff": diff[:1500]},
+                prompt=prompt
+                + (
+                    "\n\nINTERNAL HELPER SNAPSHOT:\n"
+                    "Use these helper findings as advisory semantic risk hints only.\n"
+                    f"{json.dumps(helper_context, ensure_ascii=False)}"
+                    if helper_context
+                    else ""
+                ),
+                context={"diff": diff[:1500], "helper_context": helper_context},
                 required_keys=["issues", "fix_tasks"],
                 task_definition=task.definition,
                 task_context=task.context,

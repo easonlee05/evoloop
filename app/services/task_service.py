@@ -8,6 +8,12 @@ from uuid import uuid4
 from app.core.context import TaskContext
 from app.core.events import Event
 from app.core.task import Task, TaskDefinition, TaskStatus
+from app.core.subagent import (
+    SubagentDenyReason,
+    SubagentRunStatus,
+    SubagentScope,
+    SubagentSpawnRequest,
+)
 
 # 3.0 Frozen Contracts
 from app.core.work import WorkItem, WorkType, WorkStatus
@@ -294,6 +300,155 @@ class TaskService:
         )
         return repair_task
 
+    def spawn_formal_subtask(self, parent_task_id: str, request: SubagentSpawnRequest) -> Task:
+        """Create a formal child task using the existing Task/WorkItem model."""
+        parent = self.storage.load_task(parent_task_id, self.registry)
+        if request.scope != SubagentScope.FORMAL_SUBTASK:
+            raise ValueError("spawn_formal_subtask requires formal_subtask scope")
+        if int(request.depth) > 2:
+            raise ValueError(SubagentDenyReason.DEPTH_EXCEEDED.value)
+
+        siblings = self._list_formal_subtasks(parent_task_id)
+        if len(siblings) >= 3:
+            raise ValueError(SubagentDenyReason.FANOUT_EXCEEDED.value)
+
+        task_type = request.task_type or "spec_to_agent"
+        payload = dict(request.input_excerpt)
+        payload.setdefault("username", parent.context.username)
+        payload.setdefault("title", request.goal)
+        payload.setdefault("goal", request.goal)
+        payload["subagent_scope"] = SubagentScope.FORMAL_SUBTASK.value
+        payload["parent_task_id"] = parent.task_id
+        payload["parent_work_id"] = parent.task_id
+        payload["root_task_id"] = parent.context.inputs.get("root_task_id") or parent.task_id
+        payload["subtask_type"] = request.subtask_type or "formal_subtask"
+        payload["subtask_index"] = request.subtask_index if request.subtask_index is not None else len(siblings)
+        payload["join_step_id"] = request.join_step_id
+        payload["acceptance_slice"] = dict(request.acceptance_slice)
+        payload["spawn_depth"] = int(request.depth)
+        payload["review_cycle_id"] = payload.get("review_cycle_id") or parent.context.inputs.get("review_cycle_id")
+        payload["max_review_iterations"] = payload.get("max_review_iterations") or parent.context.inputs.get("max_review_iterations", 2)
+        child = self.create_task(task_type, payload)
+        self.storage.append_event(
+            Event(
+                task_id=parent.task_id,
+                type="subagent.run.created",
+                status=SubagentRunStatus.CREATED.value,
+                payload={
+                    "scope": SubagentScope.FORMAL_SUBTASK.value,
+                    "run_id": child.task_id,
+                    "parent_task_id": parent.task_id,
+                    "parent_session_id": "",
+                    "root_task_id": payload["root_task_id"],
+                    "depth": request.depth,
+                    "execution_mode": "serial",
+                    "budget": request.budget.to_dict(),
+                    "used_tools": [],
+                    "degradation_reason": "",
+                },
+            )
+        )
+        return child
+
+    def join_formal_subtasks(self, parent_task_id: str) -> Dict[str, Any]:
+        """Join completed formal subtasks into one aggregated delivery bundle."""
+        parent = self.storage.load_task(parent_task_id, self.registry)
+        children = self._list_formal_subtasks(parent_task_id)
+        if not children:
+            raise ValueError("no_formal_subtasks")
+
+        terminal_statuses = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED}
+        if any(child.status not in terminal_statuses for child in children):
+            return {"ready": False, "child_task_ids": [child.task_id for child in children]}
+
+        summaries = []
+        diffs = []
+        artifacts = []
+        child_statuses = []
+        for child in children:
+            bundle = dict(child.context.inputs.get("delivery_bundle") or {})
+            summaries.append(bundle.get("implementation_summary") or child.context.goal)
+            diffs.append(bundle.get("diff") or "")
+            artifacts.extend(bundle.get("artifacts") or [])
+            child_statuses.append({"task_id": child.task_id, "status": child.status.value})
+
+        joined_bundle = {
+            "implementation_summary": "\n".join(summary for summary in summaries if summary),
+            "diff": "\n".join(diff for diff in diffs if diff),
+            "peer_target": "multiple_formal_subtasks",
+            "artifacts": artifacts,
+        }
+        parent.context.inputs["delivery_bundle"] = joined_bundle
+        parent.context.inputs["formal_subtask_join"] = {
+            "ready": True,
+            "child_task_ids": [child.task_id for child in children],
+            "child_statuses": child_statuses,
+        }
+        parent.status = TaskStatus.COMPLETED
+        self.storage.save_context(parent.context)
+        self.storage.save_task(parent)
+        self.storage.append_event(
+            Event(
+                task_id=parent.task_id,
+                type="subagent.join.completed",
+                status="completed",
+                payload={
+                    "scope": SubagentScope.FORMAL_SUBTASK.value,
+                    "child_task_ids": [child.task_id for child in children],
+                    "used_tools": [],
+                    "degradation_reason": "",
+                },
+            )
+        )
+        return {"ready": True, "delivery_bundle": joined_bundle, "child_task_ids": [child.task_id for child in children]}
+
+    def _fanout_formal_repair_subtasks(self, review_task_id: str, review_result: Dict[str, Any]) -> Task:
+        """Create a coordinator repair task and child formal subtasks for independent fixes."""
+        coordinator = self.fork_repair_work_item(review_task_id, review_result)
+        child_ids = []
+        for index, fix_task in enumerate(review_result.get("fix_tasks", [])):
+            request = SubagentSpawnRequest(
+                scope=SubagentScope.FORMAL_SUBTASK,
+                goal=str(fix_task.get("title") or f"Repair subtask {index + 1}"),
+                task_slice=str(fix_task.get("title") or "Repair one independent fix task"),
+                input_refs=["fix_task"],
+                input_excerpt={
+                    "username": coordinator.context.username,
+                    "business_intent": self._repair_business_intent(coordinator, [fix_task]),
+                    "machine_spec": coordinator.context.inputs.get("machine_spec", ""),
+                    "acceptance_protocol": coordinator.context.inputs.get("acceptance_protocol", ""),
+                    "machine_spec_ref": coordinator.context.inputs.get("machine_spec_ref", ""),
+                    "acceptance_protocol_ref": coordinator.context.inputs.get("acceptance_protocol_ref", ""),
+                    "review_cycle_id": coordinator.context.inputs.get("review_cycle_id"),
+                    "max_review_iterations": coordinator.context.inputs.get("max_review_iterations", 2),
+                    "iteration": coordinator.context.inputs.get("iteration", 1),
+                    "fix_tasks": [fix_task],
+                },
+                allowed_tools=[],
+                output_schema={"implementation_summary": "string"},
+                budget=self._default_formal_subtask_budget(len(review_result.get("fix_tasks", []))),
+                depth=2,
+                task_type="spec_to_agent",
+                subtask_type="repair_fix_task",
+                join_step_id="review.followup",
+                acceptance_slice={"source_issue_ids": list(fix_task.get("source_issue_ids", []))},
+                subtask_index=index,
+            )
+            child = self.spawn_formal_subtask(coordinator.task_id, request)
+            child_ids.append(child.task_id)
+
+        coordinator = self.storage.load_task(coordinator.task_id, self.registry)
+        coordinator.context.inputs["latest_repair_work_ids"] = child_ids
+        self.storage.save_context(coordinator.context)
+        self.storage.save_task(coordinator)
+
+        review_task = self.storage.load_task(review_task_id, self.registry)
+        review_task.context.inputs["latest_repair_work_id"] = coordinator.task_id
+        review_task.context.inputs["latest_repair_work_ids"] = child_ids
+        self.storage.save_context(review_task.context)
+        self.storage.save_task(review_task)
+        return coordinator
+
     def handle_review_result(self, review_task_id: str) -> Optional[Task]:
         """处理 Acceptance Review 结果，并在需要修复时 fork 下一轮修复任务。"""
         task = self.storage.load_task(review_task_id, self.registry)
@@ -312,7 +467,10 @@ class TaskService:
             return None
 
         if verdict in {"changes_required", "blocked"}:
-            repair_task = self.fork_repair_work_item(task.task_id, review_result)
+            if self._should_fanout_fix_tasks(review_result):
+                repair_task = self._fanout_formal_repair_subtasks(task.task_id, review_result)
+            else:
+                repair_task = self.fork_repair_work_item(task.task_id, review_result)
             task = self.storage.load_task(review_task_id, self.registry)
             task.context.inputs["latest_repair_work_id"] = repair_task.task_id
             task.context.inputs["review_cycle_id"] = task.context.inputs.get("review_cycle_id") or f"review_cycle_{task.task_id}"
@@ -520,6 +678,35 @@ class TaskService:
             )
         )
 
+        if task.context.inputs.get("subagent_scope") == SubagentScope.FORMAL_SUBTASK.value:
+            parent_task_id = task.context.inputs.get("parent_task_id")
+            if parent_task_id:
+                self.storage.append_event(
+                    Event(
+                        task_id=parent_task_id,
+                        type="subagent.run.completed",
+                        status=SubagentRunStatus.SUCCEEDED.value,
+                        payload={
+                            "scope": SubagentScope.FORMAL_SUBTASK.value,
+                            "run_id": task.task_id,
+                            "parent_task_id": parent_task_id,
+                            "parent_session_id": "",
+                            "root_task_id": task.context.inputs.get("root_task_id") or parent_task_id,
+                            "depth": int(task.context.inputs.get("spawn_depth", 1)),
+                            "execution_mode": "serial",
+                            "budget": {},
+                            "used_tools": [],
+                            "degradation_reason": "",
+                            "join_step_id": task.context.inputs.get("join_step_id"),
+                            "subtask_type": task.context.inputs.get("subtask_type"),
+                        },
+                    )
+                )
+                join_result = self.join_formal_subtasks(parent_task_id)
+                if join_result.get("ready"):
+                    return self.handle_repair_completion(parent_task_id)
+            return self.storage.load_task(task.task_id, self.registry)
+
         if (
             task.context.inputs.get("review_cycle_id")
             and task.context.inputs.get("machine_spec")
@@ -711,8 +898,46 @@ class TaskService:
             metadata={
                 "legacy_task_id": task.task_id,
                 "legacy_bridge": True,
+                "subagent_scope": task.context.inputs.get("subagent_scope"),
+                "parent_task_id": task.context.inputs.get("parent_task_id"),
+                "root_task_id": task.context.inputs.get("root_task_id"),
+                "subtask_type": task.context.inputs.get("subtask_type"),
             }
         )
+
+    def _list_formal_subtasks(self, parent_task_id: str) -> list[Task]:
+        tasks = self.storage.list_tasks(self.registry)
+        return [
+            task
+            for task in tasks
+            if task.context.inputs.get("subagent_scope") == SubagentScope.FORMAL_SUBTASK.value
+            and task.context.inputs.get("parent_task_id") == parent_task_id
+        ]
+
+    @staticmethod
+    def _default_formal_subtask_budget(fanout: int) -> Any:
+        from app.core.subagent import SubagentBudget
+
+        return SubagentBudget(
+            max_iterations=4,
+            max_input_tokens=800,
+            max_output_tokens=240,
+            max_tool_calls=2,
+            spawn_fanout_remaining=max(0, 3 - fanout),
+        )
+
+    @staticmethod
+    def _should_fanout_fix_tasks(review_result: Dict[str, Any]) -> bool:
+        fix_tasks = list(review_result.get("fix_tasks") or [])
+        if len(fix_tasks) < 2 or len(fix_tasks) > 3:
+            return False
+        source_ids = []
+        for fix_task in fix_tasks:
+            task_source_ids = list(fix_task.get("source_issue_ids", []))
+            if not task_source_ids:
+                return False
+            source_ids.extend(task_source_ids)
+        return len(source_ids) == len(set(source_ids))
 
     def get_product_context(self, task_id: str) -> ProductContext:
         """将 1.0 任务上下文及其关联信息，转换为 3.0 标准的 ProductContext。

@@ -1041,6 +1041,184 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertIn("peer.collaboration.completed", event_types)
         self.assertIn("review.followup.run.completed", event_types)
 
+    def test_spawn_formal_subtask_persists_child_metadata(self):
+        """formal_subtask 应复用普通 Task/WorkItem 并保留父子元数据。"""
+        from app.core.subagent import SubagentBudget, SubagentScope, SubagentSpawnRequest
+
+        service, storage, _ = self.make_service()
+        parent = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "Repair checkout rules",
+                "machine_spec": "req_coupon:",
+                "acceptance_protocol": "Given coupon, Then rules apply",
+                "review_cycle_id": "review_cycle_task_parent",
+                "max_review_iterations": 2,
+            },
+        )
+        request = SubagentSpawnRequest(
+            scope=SubagentScope.FORMAL_SUBTASK,
+            goal="Repair coupon stacking rule",
+            task_slice="Only repair checkout stacking rule",
+            input_refs=["fix_task"],
+            input_excerpt={
+                "username": "alice",
+                "business_intent": "Repair coupon stacking rule",
+                "machine_spec": "req_coupon:",
+                "acceptance_protocol": "Given coupon, Then rules apply",
+                "fix_tasks": [{"title": "Repair coupon stacking rule", "source_issue_ids": ["issue_coupon"]}],
+            },
+            allowed_tools=[],
+            output_schema={"implementation_summary": "string"},
+            budget=SubagentBudget(max_iterations=3, max_input_tokens=400, max_output_tokens=200, max_tool_calls=2, spawn_fanout_remaining=0),
+            task_type="spec_to_agent",
+            subtask_type="repair_coupon_rule",
+            join_step_id="review.followup",
+            acceptance_slice={"requirement_ids": ["req_coupon"]},
+            subtask_index=0,
+        )
+
+        child = service.spawn_formal_subtask(parent.task_id, request)
+        child_context = storage.load_context(child.task_id)
+        child_work_item = service.get_work_item(child.task_id)
+
+        self.assertEqual(child_context.inputs["subagent_scope"], "formal_subtask")
+        self.assertEqual(child_context.inputs["parent_task_id"], parent.task_id)
+        self.assertEqual(child_context.inputs["subtask_type"], "repair_coupon_rule")
+        self.assertEqual(child_work_item.parent_work_id, parent.task_id)
+        self.assertEqual(child_work_item.metadata["subagent_scope"], "formal_subtask")
+
+    def test_handle_review_result_fans_out_independent_fix_tasks_into_formal_subtasks(self):
+        """独立 fix_tasks 应派生 coordinator repair task 与 formal subtasks。"""
+        service, storage, _ = self.make_service()
+        review_task = service.create_task(
+            "acceptance_review",
+            {
+                "username": "alice",
+                "machine_spec": "req_login:\nreq_trace:",
+                "acceptance_protocol": "Given unauthenticated request, Then return 401",
+                "implementation_summary": "TODO auth branch and docs",
+                "diff": "+ // TODO",
+                "max_review_iterations": 2,
+            },
+        )
+        review_task.context.step_outputs["review_result_compiler"] = {
+            "review_result": {
+                "verdict": "changes_required",
+                "fix_tasks": [
+                    {
+                        "task_id": "fix_0",
+                        "priority": "high",
+                        "title": "Implement auth failure branch",
+                        "source_issue_ids": ["issue_auth"],
+                    },
+                    {
+                        "task_id": "fix_1",
+                        "priority": "medium",
+                        "title": "Repair traceability docs",
+                        "source_issue_ids": ["issue_trace"],
+                    },
+                ],
+            }
+        }
+        storage.save_context(review_task.context)
+
+        coordinator = service.handle_review_result(review_task.task_id)
+        refreshed = storage.load_task(review_task.task_id, service.registry)
+        child_ids = refreshed.context.inputs["latest_repair_work_ids"]
+        child_tasks = [storage.load_task(task_id, service.registry) for task_id in child_ids]
+
+        self.assertEqual(coordinator.definition.type, "spec_to_agent")
+        self.assertEqual(len(child_ids), 2)
+        self.assertTrue(all(task.context.inputs["subagent_scope"] == "formal_subtask" for task in child_tasks))
+
+    def test_join_formal_subtasks_aggregates_delivery_bundle_and_triggers_followup(self):
+        """所有 formal_subtask 完成后，应 join 为一个 delivery bundle 并进入 follow-up review。"""
+        from app.core.subagent import SubagentBudget, SubagentScope, SubagentSpawnRequest
+
+        service, storage, _ = self.make_service()
+        coordinator = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "Repair checkout rules",
+                "machine_spec": "req_coupon:\nreq_trace:",
+                "acceptance_protocol": "Given coupon, Then rules apply",
+                "review_cycle_id": "review_cycle_task_parent",
+                "max_review_iterations": 2,
+            },
+        )
+        requests = [
+            SubagentSpawnRequest(
+                scope=SubagentScope.FORMAL_SUBTASK,
+                goal="Repair coupon stacking rule",
+                task_slice="Only repair checkout stacking rule",
+                input_refs=["fix_task"],
+                input_excerpt={
+                    "username": "alice",
+                    "business_intent": "Repair coupon stacking rule",
+                    "machine_spec": "req_coupon:\nreq_trace:",
+                    "acceptance_protocol": "Given coupon, Then rules apply",
+                    "fix_tasks": [{"title": "Repair coupon stacking rule", "source_issue_ids": ["issue_coupon"]}],
+                },
+                allowed_tools=[],
+                output_schema={"implementation_summary": "string"},
+                budget=SubagentBudget(max_iterations=3, max_input_tokens=400, max_output_tokens=200, max_tool_calls=2, spawn_fanout_remaining=0),
+                task_type="spec_to_agent",
+                subtask_type="repair_coupon_rule",
+                join_step_id="review.followup",
+                acceptance_slice={"requirement_ids": ["req_coupon"]},
+                subtask_index=0,
+            ),
+            SubagentSpawnRequest(
+                scope=SubagentScope.FORMAL_SUBTASK,
+                goal="Repair traceability docs",
+                task_slice="Only repair traceability docs",
+                input_refs=["fix_task"],
+                input_excerpt={
+                    "username": "alice",
+                    "business_intent": "Repair traceability docs",
+                    "machine_spec": "req_coupon:\nreq_trace:",
+                    "acceptance_protocol": "Given coupon, Then rules apply",
+                    "fix_tasks": [{"title": "Repair traceability docs", "source_issue_ids": ["issue_trace"]}],
+                },
+                allowed_tools=[],
+                output_schema={"implementation_summary": "string"},
+                budget=SubagentBudget(max_iterations=3, max_input_tokens=400, max_output_tokens=200, max_tool_calls=2, spawn_fanout_remaining=0),
+                task_type="spec_to_agent",
+                subtask_type="repair_traceability",
+                join_step_id="review.followup",
+                acceptance_slice={"requirement_ids": ["req_trace"]},
+                subtask_index=1,
+            ),
+        ]
+
+        children = [service.spawn_formal_subtask(coordinator.task_id, request) for request in requests]
+        for index, child in enumerate(children):
+            service.complete_peer_collaboration(
+                child.task_id,
+                {
+                    "peer_target": "codex",
+                    "implementation_summary": f"Completed child {index}",
+                    "diff": f"+ child {index} fix",
+                    "artifacts": [{"path": f"src/child_{index}.py", "kind": "code"}],
+                },
+            )
+
+        refreshed_parent = storage.load_task(coordinator.task_id, service.registry)
+        event_types = [event.type for event in storage.read_events(coordinator.task_id)]
+        followup_review_id = refreshed_parent.context.inputs["latest_followup_review_id"]
+        followup_review = storage.load_task(followup_review_id, service.registry)
+
+        self.assertEqual(refreshed_parent.status, TaskStatus.COMPLETED)
+        self.assertIn("Completed child 0", refreshed_parent.context.inputs["delivery_bundle"]["implementation_summary"])
+        self.assertIn("Completed child 1", refreshed_parent.context.inputs["delivery_bundle"]["implementation_summary"])
+        self.assertEqual(followup_review.definition.type, "acceptance_review")
+        self.assertIn("subagent.run.completed", event_types)
+        self.assertIn("subagent.join.completed", event_types)
+        self.assertIn("review.followup.run.completed", event_types)
+
     def test_start_peer_collaboration_dispatches_registered_handler_and_records_result(self):
         """已注册 PeerAdapter handler 时，控制面应真实派发 agent package 并回收 result bundle。"""
         service, storage, _ = self.make_service()

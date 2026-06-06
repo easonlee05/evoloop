@@ -1,9 +1,14 @@
-"""Bounded AgentSession runtime for Evoloop 3.1."""
+"""Bounded AgentSession runtime for Evoloop 3.1.
+
+The runtime keeps Playbook topology deterministic while turning a single
+workflow agent step into an auditable bounded session with agenda recording,
+tool-use accounting, schema recovery, and explicit degraded outcomes.
+"""
 from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.core.errors import DomainError
 from app.core.session import AgentObservation, AgentRunResult, AgentSession, AgentSessionStatus, AgentTurn
@@ -32,9 +37,12 @@ def extract_json_from_text(text: str) -> str:
 class AgentRuntime:
     """Runs a bounded AgentSession through the existing LLM port.
 
-    Phase 1 supports strict JSON sessions. Tool-use sessions will be added later
-    without changing the workflow engine boundary.
+    The public entrypoint remains ``run_json_session()`` for workflow
+    compatibility, but the internals now manage a real bounded session loop
+    with agenda items, tool observations, and schema recovery state.
     """
+
+    MAX_AGENDA_ITEMS = 12
 
     def __init__(self, llm: Any, tool_service: Any = None):
         self.llm = llm
@@ -56,13 +64,30 @@ class AgentRuntime:
                 "AgentRuntime requires an LLM port for this session.",
                 {"session_id": session.session_id, "step_id": session.step_id},
             )
-            return AgentRunResult.blocked(session=session, content="", error=error, structured={"fallback_reason": error.message})
+            session.set_degradation_reason(error.message)
+            return AgentRunResult.blocked(
+                session=session,
+                content="",
+                error=error,
+                structured={"fallback_reason": error.message},
+                summary="AgentSession blocked before the runtime could start.",
+            )
 
         session.state.status = AgentSessionStatus.RUNNING
         required = list(required_keys or [])
         last_error = ""
         last_content = ""
         tool_messages: List[Dict[str, Any]] = []
+        used_tools: List[str] = []
+        session.set_runtime_contract(
+            self._allowed_tool_names_for_session(session, task_definition),
+            required,
+            {
+                "input_context_keys": sorted((context or session.input_context).keys()),
+                "max_iterations": session.max_iterations,
+                "estimated_tokens": max(1, len(json.dumps(context or session.input_context, ensure_ascii=False, default=str)) // 4),
+            },
+        )
 
         for iteration in range(1, session.max_iterations + 1):
             current_prompt = prompt
@@ -93,20 +118,28 @@ class AgentRuntime:
 
             try:
                 structured = structured_response or json.loads(extract_json_from_text(raw_content))
+                self._apply_agenda_operations(session, structured)
                 tool_calls = self._extract_tool_calls(structured)
                 if isinstance(tool_calls, list) and tool_calls:
-                    tool_error, tool_messages = self._execute_tool_calls(
+                    tool_error, tool_messages, newly_used_tools = self._execute_tool_calls(
                         session=session,
                         tool_calls=tool_calls,
                         task_definition=task_definition,
                         task_context=task_context,
                     )
+                    for tool_name in newly_used_tools:
+                        if tool_name not in used_tools:
+                            used_tools.append(tool_name)
                     if tool_error:
+                        session.set_degradation_reason(tool_error.message)
                         return AgentRunResult.blocked(
                             session=session,
                             content=raw_content,
                             error=tool_error,
                             structured={"fallback_reason": tool_error.message, "fallback_role": session.agent_role},
+                            summary="AgentSession blocked during controlled tool execution.",
+                            used_tools=used_tools,
+                            schema_errors=session.state.schema_errors,
                         )
                     continue
 
@@ -114,9 +147,18 @@ class AgentRuntime:
                 if missing:
                     raise ValueError(f"missing required keys: {', '.join(missing)}")
                 session.record_observation(AgentObservation(kind="schema", summary="valid json", data={"required_keys": required}))
-                return AgentRunResult.succeeded(session=session, content=raw_content, structured=structured)
+                session.set_final_output(structured, summary=self._summarize_structured_output(structured))
+                return AgentRunResult.succeeded(
+                    session=session,
+                    content=raw_content,
+                    structured=structured,
+                    summary="AgentSession completed with schema-valid output.",
+                    used_tools=used_tools,
+                    schema_errors=session.state.schema_errors,
+                )
             except Exception as exc:
                 last_error = str(exc)
+                session.record_schema_error(last_error)
                 session.record_observation(
                     AgentObservation(
                         kind="schema_error",
@@ -130,11 +172,15 @@ class AgentRuntime:
             "AgentSession exhausted bounded JSON validation attempts.",
             {"session_id": session.session_id, "step_id": session.step_id, "last_error": last_error},
         )
+        session.set_degradation_reason(last_error)
         return AgentRunResult.blocked(
             session=session,
             content=last_content,
             error=error,
             structured={"fallback_reason": last_error, "fallback_role": session.agent_role},
+            summary="AgentSession exhausted bounded schema recovery attempts.",
+            used_tools=used_tools,
+            schema_errors=session.state.schema_errors,
         )
 
     def _invoke_model(
@@ -197,6 +243,69 @@ class AgentRuntime:
             )
         return tools
 
+    def _allowed_tool_names_for_session(self, session: AgentSession, task_definition: Optional[TaskDefinition]) -> List[str]:
+        provider_tools = self._provider_tools_for_session(session, task_definition)
+        tool_names: List[str] = []
+        for tool in provider_tools:
+            function = tool.get("function", {})
+            canonical_name = self._canonical_tool_name(str(function.get("name") or ""))
+            if canonical_name and canonical_name not in tool_names:
+                tool_names.append(canonical_name)
+        return tool_names
+
+    def _apply_agenda_operations(self, session: AgentSession, structured: Dict[str, Any]) -> None:
+        if not isinstance(structured, dict):
+            return
+
+        for item in structured.get("agenda_add", []) or []:
+            if not isinstance(item, dict):
+                continue
+            if len(session.state.agenda_items) >= self.MAX_AGENDA_ITEMS:
+                session.record_observation(
+                    AgentObservation(
+                        kind="agenda",
+                        summary="agenda limit reached",
+                        data={"max_items": self.MAX_AGENDA_ITEMS, "ignored_title": item.get("title", "")},
+                    )
+                )
+                continue
+            title = str(item.get("title") or "").strip()
+            rationale = str(item.get("rationale") or "").strip()
+            if not title or not rationale:
+                continue
+            agenda_item = session.add_agenda_item(
+                title=title,
+                rationale=rationale,
+                priority=str(item.get("priority") or "medium"),
+            )
+            session.record_observation(
+                AgentObservation(
+                    kind="agenda",
+                    summary=f"agenda item added: {agenda_item.title}",
+                    data={"item_id": agenda_item.item_id, "title": agenda_item.title, "priority": agenda_item.priority},
+                )
+            )
+
+        for item in structured.get("agenda_update", []) or []:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("item_id") or "").strip()
+            if not item_id:
+                continue
+            updated = session.update_agenda_item(
+                item_id,
+                status=str(item.get("status") or "") or None,
+                note=item.get("note"),
+            )
+            if updated:
+                session.record_observation(
+                    AgentObservation(
+                        kind="agenda",
+                        summary=f"agenda item updated: {updated.title}",
+                        data={"item_id": updated.item_id, "status": updated.status, "note": updated.note},
+                    )
+                )
+
     def _execute_tool_calls(
         self,
         *,
@@ -204,7 +313,7 @@ class AgentRuntime:
         tool_calls: List[Dict[str, Any]],
         task_definition: Optional[TaskDefinition],
         task_context: Optional[TaskContext],
-    ) -> tuple[Optional[DomainError], List[Dict[str, Any]]]:
+    ) -> Tuple[Optional[DomainError], List[Dict[str, Any]], List[str]]:
         if not self.tool_service or not task_definition or not task_context:
             error = DomainError(
                 "agent_runtime.tool_bridge_unavailable",
@@ -212,9 +321,10 @@ class AgentRuntime:
                 {"session_id": session.session_id, "step_id": session.step_id},
             )
             session.record_observation(AgentObservation(kind="tool", summary=error.message, data={"status": "failed"}))
-            return error, []
+            return error, [], []
 
         tool_messages: List[Dict[str, Any]] = []
+        used_tools: List[str] = []
         for index, requested in enumerate(tool_calls):
             normalized = self._normalize_tool_call(requested)
             provider_tool_call_id = normalized.get("provider_tool_call_id")
@@ -243,6 +353,10 @@ class AgentRuntime:
                     },
                 )
             )
+            session.state.tool_call_count += 1
+            session.touch()
+            if tool_name not in used_tools:
+                used_tools.append(tool_name)
             tool_messages.append(
                 {
                     "role": "tool",
@@ -264,14 +378,21 @@ class AgentRuntime:
                     "agent_runtime.tool_call_denied",
                     f"Tool call denied by ToolPolicy: {tool_name}",
                     {"session_id": session.session_id, "step_id": session.step_id, "tool_name": tool_name},
-                ), tool_messages
+                ), tool_messages, used_tools
             if result.status != "succeeded":
                 return DomainError(
                     "agent_runtime.tool_call_failed",
                     f"Tool call failed: {tool_name}",
                     {"session_id": session.session_id, "step_id": session.step_id, "tool_name": tool_name},
-                ), tool_messages
-        return None, tool_messages
+                ), tool_messages, used_tools
+        return None, tool_messages, used_tools
+
+    @staticmethod
+    def _summarize_structured_output(structured: Dict[str, Any]) -> str:
+        if not structured:
+            return ""
+        keys = sorted(str(key) for key in structured.keys())
+        return ", ".join(keys[:5])
 
     @staticmethod
     def _normalize_tool_call(requested: Dict[str, Any]) -> Dict[str, Any]:

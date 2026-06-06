@@ -18,8 +18,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from app.core.errors import DomainError
 from app.core.session import AgentSession, AgentSessionStatus
+from app.core.subagent import SubagentBudget, SubagentScope, SubagentSpawnRequest
 from app.core.task import StepResult, StepStatus, Task, TaskDefinition, WorkflowSpec, WorkflowStep
 from app.services.agent_runtime import AgentRuntime
+from app.services.subagent_service import SubagentService
 from app.workflows.policies import build_default_tool_policy
 
 logger = logging.getLogger(__name__)
@@ -482,8 +484,8 @@ class OpenQuestionIdentifierExecutor:
             NonFunctionalDiagnoser(),
         ]
 
-    def _build_prompt(self, intent: str, constraints: List[str]) -> str:
-        return (
+    def _build_prompt(self, intent: str, constraints: List[str], helper_context: Optional[List[Dict[str, Any]]] = None) -> str:
+        prompt = (
             "You are the OpenQuestionIdentifier for a digital product manager.\n"
             "Analyze the business intent across domain model, state transitions, edge cases, and non-functional requirements.\n"
             "Ask only questions that block a trustworthy machine_spec. Do not ask implementation-style questions.\n"
@@ -496,6 +498,64 @@ class OpenQuestionIdentifierExecutor:
             f"INTENT:\n{intent}\n\n"
             f"CONSTRAINTS:\n{json.dumps(constraints, ensure_ascii=False)}"
         )
+        if helper_context:
+            prompt += (
+                "\n\nINTERNAL HELPER SNAPSHOT:\n"
+                "These helper findings are advisory only. Use them to refine ambiguity detection, "
+                "but still decide the final question list in this main session.\n"
+                f"{json.dumps(helper_context, ensure_ascii=False)}"
+            )
+        return prompt
+
+    def _run_internal_helpers(
+        self,
+        task: Task,
+        session: AgentSession,
+        inputs: Dict[str, Any],
+        active_llm: Any,
+    ) -> List[Dict[str, Any]]:
+        """Spawn a narrow helper when the task explicitly enables internal subagents."""
+        if not task.context.inputs.get("enable_subagents"):
+            return []
+
+        helper_request = SubagentSpawnRequest(
+            scope=SubagentScope.SESSION_HELPER,
+            goal="Inspect ambiguity hotspots before final question drafting.",
+            task_slice="Only inspect product ambiguity hotspots from the business intent and constraints.",
+            input_refs=["business_intent", "constraints"],
+            input_excerpt={
+                "business_intent": inputs["normalized_intent"],
+                "constraints": list(inputs["constraints"]),
+                "context_scope": inputs["context_scope"],
+            },
+            allowed_tools=["knowledge.retrieve"] if self.tool_service else [],
+            output_schema={"summary": "string", "findings": "array", "confidence": "string"},
+            budget=SubagentBudget(
+                max_iterations=2,
+                max_input_tokens=400,
+                max_output_tokens=160,
+                max_tool_calls=1,
+                spawn_fanout_remaining=1,
+            ),
+            depth=1,
+        )
+        run = SubagentService(llm=active_llm, tool_service=self.tool_service).run_helper(
+            parent_session=session,
+            request=helper_request,
+            task_definition=task.definition,
+            task_context=task.context,
+        )
+        if not run.result:
+            return []
+        return [
+            {
+                "summary": run.result.summary,
+                "findings": run.result.structured_output.get("findings", []),
+                "confidence": run.result.confidence,
+                "degraded": run.result.degraded,
+                "degradation_reason": run.result.degradation_reason,
+            }
+        ]
 
     def run(self, task: Task, step: WorkflowStep, *, run_id: Optional[str] = None, is_parallel: bool = False, llm: Any = None) -> StepResult:
         active_llm = llm or self.llm
@@ -515,10 +575,15 @@ class OpenQuestionIdentifierExecutor:
             },
             max_iterations=3,
         )
+        helper_context = self._run_internal_helpers(task, session, inputs, active_llm)
         run_result = AgentRuntime(llm=active_llm, tool_service=self.tool_service).run_json_session(
             session=session,
-            prompt=self._build_prompt(intent, inputs["constraints"]),
-            context={"intent": intent, "constraints": inputs["constraints"]},
+            prompt=self._build_prompt(intent, inputs["constraints"], helper_context),
+            context={
+                "intent": intent,
+                "constraints": inputs["constraints"],
+                "helper_context": helper_context,
+            },
             required_keys=["has_questions", "questions"],
             task_definition=task.definition,
             task_context=task.context,
@@ -652,7 +717,64 @@ class MachineSpecCompilerExecutor:
         """第一阶段: 整合归一化文本。"""
         return f"INTENT: {intent}\nCONSTRAINTS: {'; '.join(constraints)}"
 
-    def _main_compile(self, pre_compiled: str, active_llm: Any, session: AgentSession) -> Any:
+    def _run_internal_helpers(
+        self,
+        task: Task,
+        session: AgentSession,
+        inputs: Dict[str, Any],
+        pre_compiled: str,
+        active_llm: Any,
+    ) -> List[Dict[str, Any]]:
+        """Optionally run a narrow session helper before final AST compilation."""
+        if not task.context.inputs.get("enable_subagents"):
+            return []
+
+        helper_request = SubagentSpawnRequest(
+            scope=SubagentScope.SESSION_HELPER,
+            goal="Extract domain state and constraint hotspots before AST compilation.",
+            task_slice="Only inspect domain states, constraints, and structural hotspots from the normalized intent.",
+            input_refs=["business_intent", "constraints", "pre_compiled_data"],
+            input_excerpt={
+                "business_intent": inputs["normalized_intent"],
+                "constraints": list(inputs["constraints"]),
+                "pre_compiled_data": pre_compiled[:1200],
+            },
+            allowed_tools=["knowledge.retrieve"] if self.tool_service else [],
+            output_schema={"summary": "string", "states": "array", "confidence": "string"},
+            budget=SubagentBudget(
+                max_iterations=2,
+                max_input_tokens=450,
+                max_output_tokens=180,
+                max_tool_calls=1,
+                spawn_fanout_remaining=1,
+            ),
+            depth=1,
+        )
+        run = SubagentService(llm=active_llm, tool_service=self.tool_service).run_helper(
+            parent_session=session,
+            request=helper_request,
+            task_definition=task.definition,
+            task_context=task.context,
+        )
+        if not run.result:
+            return []
+        return [
+            {
+                "summary": run.result.summary,
+                "states": run.result.structured_output.get("states", []),
+                "confidence": run.result.confidence,
+                "degraded": run.result.degraded,
+                "degradation_reason": run.result.degradation_reason,
+            }
+        ]
+
+    def _main_compile(
+        self,
+        pre_compiled: str,
+        active_llm: Any,
+        session: AgentSession,
+        helper_context: Optional[List[Dict[str, Any]]] = None,
+    ) -> Any:
         """第二阶段: 通过 AgentRuntime 编译 AST 的 JSON 结构。"""
         prompt = (
             "You are the MachineSpecCompiler. You must compile the given input into a structural AST.\n"
@@ -665,10 +787,16 @@ class MachineSpecCompilerExecutor:
             '  "security": {"require_auth": true}\n'
             "}"
         )
+        if helper_context:
+            prompt += (
+                "\n\nINTERNAL HELPER SNAPSHOT:\n"
+                "Use these bounded helper findings only as advisory analysis hints while compiling the AST.\n"
+                f"{json.dumps(helper_context, ensure_ascii=False)}"
+            )
         return AgentRuntime(llm=active_llm, tool_service=self.tool_service).run_json_session(
             session=session,
             prompt=prompt,
-            context={"pre_compiled_data": pre_compiled},
+            context={"pre_compiled_data": pre_compiled, "helper_context": helper_context or []},
             required_keys=["primary_requirement", "dependencies", "strict_contracts", "environment", "security"],
             task_definition=session.input_context.get("task_definition"),
             task_context=session.input_context.get("task_context"),
@@ -701,7 +829,8 @@ class MachineSpecCompilerExecutor:
             },
             max_iterations=3,
         )
-        run_result = self._main_compile(pre_compiled, active_llm, session)
+        helper_context = self._run_internal_helpers(task, session, inputs, pre_compiled, active_llm)
+        run_result = self._main_compile(pre_compiled, active_llm, session, helper_context)
         content = run_result.content
         raw_ast = run_result.structured
         trace = session.to_trace()

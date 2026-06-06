@@ -54,6 +54,13 @@ app/core/session.py
   AgentSessionState
   AgentRunResult
 
+app/core/subagent.py
+  SubagentScope
+  SubagentBudget
+  SubagentSpawnRequest
+  SubagentRun
+  SubagentResult
+
 app/core/agent.py
   AgentDefinition
   AgentRole
@@ -65,12 +72,17 @@ app/core/agent.py
 
 当前状态：`app/core/session.py` 已落地第一版，包含 `AgentSession`、`AgentTurn`、`AgentObservation`、`AgentSessionState` 与 `AgentRunResult`。它只记录可审计的 turn、schema observation 和结构化结果，不暴露私有 chain-of-thought。
 
+当前状态：`app/core/subagent.py` 已落地统一内部 subagent 契约，包含 `session_helper` / `formal_subtask` 两种 scope、串行与 helper 并行两种 execution mode，以及预算、拒绝原因、结构化结果和可审计运行记录。该模块只定义对象模型，不直接调度、不直接访问 Tool。
+
 ### 3.2 Service
 
 ```text
 app/services/agent_runtime/__init__.py
 app/services/agent_runtime/runtime.py
   AgentRuntime
+
+app/services/subagent_service.py
+  SubagentService
 
 app/services/agent_runtime/context_builder.py
   SessionContextBuilder
@@ -93,23 +105,29 @@ app/services/agent_runtime/schema_validator.py
 
 两条路径都必须经过 `ToolService.invoke()` 与 `ToolPolicy` 白名单校验，并把工具结果写入 `AgentObservation(kind="tool")`，然后进入下一轮模型调用。未授权工具会返回 `agent_runtime.tool_call_denied` 并阻断 session。
 
-尚未落地：并行工具调用、ToolResult 结果压缩、session 持久化摘要、跨步骤 Agenda。
+当前第一版真实 Session 内核还已补齐：
+
+- `AgentSession.allowed_tools`、`output_schema_keys`、`context_budget`、`final_output`
+- `AgentSessionState.agenda_items`、`tool_call_count`、`schema_errors`、`final_output_summary`、`degradation_reason`
+- `AgentSessionState.helper_runs`，用于记录当前 session 内部 helper trace
+- runtime 内部 `agenda_add` / `agenda_update` 协议，写入 session trace，但不改写 workflow 外部拓扑
+
+当前状态：`app/services/subagent_service.py` 已落地第一版内部 subagent 执行服务。它是统一执行原语，负责 helper request 校验、budget gate、只读工具白名单、helper 串行/局部并行判定、结构化结果回收，以及 `subagent.run.created/started/denied/blocked/failed/completed` 事件输出。第一版 helper 只允许只读工具，默认不持久化完整 transcript。
+
+尚未落地：并行工具调用、ToolResult 结果压缩、session 持久化摘要、公开 `agenda.*` 受控工具，以及把 helper 并行判定扩展到更多 step。
 
 ### 3.2.1 Agenda
 
 ```text
-app/core/agenda.py
-  Agenda
+app/core/session.py
   AgendaItem
-  AgendaItemStatus
+  AgentSessionState.agenda_items
 
-app/services/agent_runtime/agenda_tools.py
-  agenda.add_item
-  agenda.update_status
-  agenda.list
+app/services/agent_runtime/runtime.py
+  agenda_add / agenda_update internal protocol
 ```
 
-Agenda 属于 `AgentSessionState`，用于单个 session 内部的临时计划和分析待办。Agenda 不改变 `WorkflowSpec.steps`，也不新增 workflow checkpoint 边界。
+Agenda 属于 `AgentSessionState`，用于单个 session 内部的临时计划和分析待办。Agenda 不改变 `WorkflowSpec.steps`，也不新增 workflow checkpoint 边界。当前已落地第一版 internal agenda protocol；公开 `agenda.add_item` / `agenda.update_status` / `agenda.list` 受控工具仍属于后续演进项。
 
 ### 3.2.2 Review Loop
 
@@ -132,7 +150,30 @@ app/services/task_service.py
 
 Review Loop 用于 Acceptance Review 未通过时生成修复工作项。当前已落地第一版有界控制面：`WorkItem` 已具备 iteration 元数据，`TaskService.fork_repair_work_item()` 可从 `review_result.fix_tasks` 派生下一轮 `spec_to_agent` 修复任务，`TaskService.handle_review_result()` 可根据 `verdict=changes_required|blocked` 触发 fork。当前实现仍然保持有界，不会无限自动修复。
 
-### 3.2.3 Product Memory
+当前状态：repair/review 场景已接入第一版 `formal_subtask`。它不新建第二套任务树，而是复用现有 `Task` / `WorkItem`：`TaskService.spawn_formal_subtask()` 会把 child task 作为标准任务落盘，并在 `TaskContext.inputs` 与 `WorkItem.metadata` 中写入 `subagent_scope`、`parent_task_id`、`root_task_id`、`subtask_type`、`join_step_id` 和 `spawn_depth`；`TaskService.join_formal_subtasks()` 会在所有 child 进入终态后汇总 `delivery_bundle`，再回流 follow-up acceptance review。当前只在相互独立的 `fix_tasks` repair fan-out 场景启用；不满足独立性时仍回退到单 repair task 路径。
+
+### 3.2.3 Internal Subagents
+
+```text
+session_helper
+  session-local helper run
+  read-only tools only
+  returns compact structured result
+
+formal_subtask
+  control-plane child task
+  reuses Task / WorkItem persistence
+  joins back before formal state transition continues
+```
+
+内部 subagent 不是新的主调度框架，而是 Playbook / AgentSession 控制面里的受控执行单元：
+
+- `session_helper` 只属于当前 `AgentSession`，默认不拥有父 session 的完整 turns、observations 或 artifact 原文。
+- `formal_subtask` 属于控制面，用于天然可分的 repair/review 子包；它的结果必须先 join，再允许正式事实状态继续推进。
+- 任何无法证明适合并行的情况默认串行。
+- 任何治理问题返回 `denied`，不伪装成 `failed`。
+
+### 3.2.4 Product Memory
 
 ```text
 app/services/gbrain_service.py
@@ -323,6 +364,11 @@ memory.learning_written
 4. `acceptance_protocol_generator`：已迁移到 `AgentRuntime.run_json_session()`。
 5. `requirement_coverage`：已迁移到 Reviewer `AgentRuntime.run_json_session()`。
 6. `diff_impact_analyzer`：语义审查分支已迁移到 Reviewer `AgentRuntime.run_json_session()`，静态插件分支保持确定性。
+7. `open_question_identifier` 已支持第一版 `session_helper` 接入，启用 `enable_subagents` 时会派发窄任务包 helper，并把结果写入 `agent_session_trace.state.helper_runs`。
+8. `machine_spec_compiler` 已支持第一版 `session_helper` 接入，用于在正式 AST 编译前抽取状态/约束热点。
+9. `requirement_coverage` 已支持第一版 `session_helper` 接入，用于在正式 coverage mapping 前识别高风险 requirement focus。
+10. `diff_impact_analyzer` 的语义审查分支已支持第一版 `session_helper` 接入，用于在正式风险判定前预扫 regression/compatibility 风险主题。
+11. `acceptance_review -> repair` 已支持第一版 `formal_subtask`，仅在 fix tasks 相互独立时 fan-out。
 
 成功标准：
 
@@ -450,7 +496,15 @@ Acceptance Review verdict == blocked
 
 Agenda 用于复杂意图的 session 内部动态任务分解。
 
-### 10.1 工具
+### 10.1 当前状态与后续工具
+
+当前代码状态：
+
+- `AgendaItem` 已并入 `app/core/session.py`
+- `AgentRuntime` 已支持 `agenda_add` / `agenda_update` 的内部协议
+- Agenda item 会进入 `agent_session_trace`
+
+后续如需把 Agenda 暴露为显式受控工具，再演进为：
 
 ```text
 agenda.add_item(title, rationale, priority)

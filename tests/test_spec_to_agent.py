@@ -233,6 +233,8 @@ class TestSpecToAgentExecutors(unittest.TestCase):
         self.assertTrue(result.outputs["agent_session_id"].startswith("session_"))
         self.assertEqual(result.outputs["agent_session_trace"]["step_id"], "machine_spec_compiler")
         self.assertEqual(result.outputs["agent_session_trace"]["state"]["status"], "succeeded")
+        self.assertIn("allowed_tools", result.outputs["agent_session_trace"])
+        self.assertIn("agenda_items", result.outputs["agent_session_trace"]["state"])
 
     def test_machine_spec_compiler_blocks_when_llm_json_degrades_to_fallback(self):
         """核心 source-of-truth 编译步骤不能把 LLM 解析失败伪装成成功产物。"""
@@ -316,6 +318,46 @@ class TestSpecToAgentExecutors(unittest.TestCase):
         self.assertEqual(observations[0]["data"]["tool_name"], "knowledge.retrieve")
         self.assertEqual(observations[0]["data"]["status"], "succeeded")
 
+    def test_machine_spec_compiler_records_helper_runs_when_enabled(self):
+        """启用内部 subagent 时，machine_spec_compiler 应记录 helper runs。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+        from app.workflows.spec_to_agent import MachineSpecCompilerExecutor, build_spec_to_agent_definition
+
+        class HelperAwareLLM:
+            def invoke(self, role, prompt, context):
+                if "SESSION HELPER" in prompt:
+                    return LLMResult(
+                        content='{"summary":"Mapped state edges","states":["anonymous","authenticated"],"confidence":"high"}'
+                    )
+                return LLMResult(
+                    content=(
+                        '{"primary_requirement":"Auth flow",'
+                        '"dependencies":["system"],'
+                        '"strict_contracts":["traceable"],'
+                        '"environment":{"os_target":"linux","node_version":"20.x"},'
+                        '"security":{"require_auth":true}}'
+                    )
+                )
+
+        definition = build_spec_to_agent_definition()
+        context = TaskContext(
+            task_id="task_exec_compiler_helpers",
+            task_type="spec_to_agent",
+            username="alice",
+            title="Compiler Helper Spec",
+            goal="Compile spec",
+            inputs={"business_intent": "Auth flow", "enable_subagents": True},
+        )
+        task = Task(definition=definition, context=context)
+        step = WorkflowStep(id="machine_spec_compiler", type="agent", title="Compiler Step", role="Compiler")
+
+        result = MachineSpecCompilerExecutor(llm=HelperAwareLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertGreaterEqual(len(result.outputs["agent_session_trace"]["state"]["helper_runs"]), 1)
+
     def test_open_question_identifier_runs_through_agent_session(self):
         """open_question_identifier 应通过 AgentSession 输出澄清问题与 trace。"""
         from app.core.task import Task, WorkflowStep
@@ -353,6 +395,40 @@ class TestSpecToAgentExecutors(unittest.TestCase):
         self.assertTrue(result.outputs["agent_session_id"].startswith("session_"))
         self.assertEqual(result.outputs["agent_session_trace"]["step_id"], "open_question_identifier")
         self.assertEqual(result.outputs["agent_session_trace"]["state"]["status"], "succeeded")
+
+    def test_open_question_identifier_records_helper_runs_when_enabled(self):
+        """启用内部 subagent 时，open_question_identifier 应记录 helper runs。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+        from app.workflows.spec_to_agent import OpenQuestionIdentifierExecutor, build_spec_to_agent_definition
+
+        class HelperAwareLLM:
+            def invoke(self, role, prompt, context):
+                if "SESSION HELPER" in prompt:
+                    return LLMResult(
+                        content='{"summary":"Found one ambiguity","findings":["SSO provider missing"],"confidence":"medium"}'
+                    )
+                return LLMResult(
+                    content='{"has_questions":true,"questions":["Which SSO provider should be used?"],"diagnostic_matrix_runs":1}'
+                )
+
+        definition = build_spec_to_agent_definition()
+        context = TaskContext(
+            task_id="task_open_questions_helpers",
+            task_type="spec_to_agent",
+            username="alice",
+            title="Open Questions",
+            goal="Clarify auth spec",
+            inputs={"business_intent": "Build login with SSO", "enable_subagents": True},
+        )
+        task = Task(definition=definition, context=context)
+        step = WorkflowStep(id="open_question_identifier", type="agent", title="Open Questions", role="Compiler")
+
+        result = OpenQuestionIdentifierExecutor(llm=HelperAwareLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertGreaterEqual(len(result.outputs["agent_session_trace"]["state"]["helper_runs"]), 1)
 
     def test_open_question_identifier_blocks_when_json_invalid(self):
         """open_question_identifier 不能在无法解析模型输出时假装没有问题。"""
