@@ -15,7 +15,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from app.core.artifact_graph import ArtifactEdge, ArtifactEdgeType, ArtifactGraph, ArtifactNode, ArtifactNodeType, ArtifactRef
 from app.core.errors import DomainError
 from app.core.review import RequirementCoverage, ReviewFixTask as FixTask, ReviewIssue, ReviewIssueSeverity as IssueSeverity, ReviewResult, ReviewVerdict
+from app.core.session import AgentSession, AgentSessionStatus
 from app.core.task import StepResult, StepStatus, Task, TaskDefinition, WorkflowSpec, WorkflowStep
+from app.services.agent_runtime import AgentRuntime
 from app.workflows.policies import build_default_tool_policy
 
 logger = logging.getLogger(__name__)
@@ -105,7 +107,11 @@ def _invoke_llm_with_retry(
 
     if fallback is not None:
         logger.warning("Exhausted retries, returning fallback data.")
-        return f"Failed after {retries} retries. Reason: {last_error}", fallback
+        degraded_fallback = dict(fallback)
+        degraded_fallback["degraded"] = True
+        degraded_fallback["fallback_reason"] = str(last_error)
+        degraded_fallback["fallback_role"] = role
+        return f"Failed after {retries} retries. Reason: {last_error}", degraded_fallback
         
     raise DomainError(
         "workflow.llm_retry_exhausted",
@@ -263,6 +269,11 @@ def ingest_acceptance_context_step(task: Task, step: WorkflowStep) -> StepResult
     return IngestAcceptanceContextExecutor().run(task, step)
 
 
+def requirement_coverage_step(task: Task, step: WorkflowStep, llm: Any = None, tool_service: Any = None) -> StepResult:
+    """快捷回调封装：通过 Reviewer AgentSession 评估需求覆盖率。"""
+    return RequirementCoverageExecutor(llm=llm, tool_service=tool_service).run(task, step)
+
+
 # ==============================================================================
 # 3. 需求追溯矩阵 RTM 评估 (RTM Evaluator)
 # ==============================================================================
@@ -276,8 +287,9 @@ class RequirementCoverageExecutor:
     step_type: str = "agent"
     step_id: str = "requirement_coverage"
 
-    def __init__(self, llm: Any = None):
+    def __init__(self, llm: Any = None, tool_service: Any = None):
         self.llm = llm
+        self.tool_service = tool_service
 
     def run(self, task: Task, step: WorkflowStep, *, run_id: Optional[str] = None, is_parallel: bool = False, llm: Any = None) -> StepResult:
         active_llm = llm or self.llm
@@ -291,35 +303,84 @@ class RequirementCoverageExecutor:
             '  "req_login": {"covered": true, "notes": "found", "evidence_refs": ["app/auth.py"]}\\n'
             "}"
         )
-        
-        fallback = {
-            req_id: {"covered": True, "notes": "Fallback Map-Reduce evaluation", "evidence_refs": []}
-            for req_id in req_ids
-        }
-        
-        content, structured = _invoke_llm_with_retry(
-            llm=active_llm,
-            role=step.role or "Reviewer",
+
+        session = AgentSession(
+            task_id=task.task_id,
+            step_id=step.id,
+            agent_role=step.role or "Reviewer",
+            goal="Evaluate whether the implementation diff covers every machine_spec requirement.",
+            input_context={
+                "req_ids": req_ids,
+                "diff_head": diff[:2000],
+                "task_definition": task.definition,
+                "task_context": task.context,
+            },
+            max_iterations=3,
+        )
+        run_result = AgentRuntime(llm=active_llm, tool_service=self.tool_service).run_json_session(
+            session=session,
             prompt=prompt,
             context={"req_ids": req_ids, "diff_head": diff[:2000]},
-            fallback=fallback,
+            required_keys=req_ids,
+            task_definition=task.definition,
+            task_context=task.context,
         )
+
+        trace = session.to_trace()
+        if run_result.status == AgentSessionStatus.BLOCKED or run_result.structured.get("degraded"):
+            structured = dict(run_result.structured)
+            structured["fallback_reason"] = structured.get("fallback_reason") or (run_result.error.message if run_result.error else "AgentSession blocked")
+            fallback_coverage = [
+                {
+                    "requirement_id": req_id,
+                    "covered": False,
+                    "evidence_refs": [],
+                    "notes": "Coverage review blocked; manual verification required.",
+                    "metadata": {"degraded": True, "fallback_reason": structured.get("fallback_reason")},
+                }
+                for req_id in req_ids
+            ]
+            return StepResult(
+                step.id,
+                StepStatus.SUCCEEDED,
+                "Requirement coverage Reviewer AgentSession degraded; emitting non-covered evidence for final blocked verdict.",
+                outputs={
+                    "content": run_result.content,
+                    "coverage": fallback_coverage,
+                    "degraded": True,
+                    "structured": structured,
+                    "agent_session_id": session.session_id,
+                    "agent_session_trace": trace,
+                    "degradation_error": {
+                        "code": "workflow.requirement_coverage_degraded",
+                        "message": "Requirement coverage exhausted AgentSession retries and refused to emit fake coverage success.",
+                        "agent_runtime_error": run_result.error.to_dict() if run_result.error else None,
+                    },
+                },
+            )
         
         coverage_results = []
         for req_id in req_ids:
-            req_data = structured.get(req_id, {"covered": True})
+            req_data = run_result.structured.get(req_id, {"covered": False, "metadata": {}})
             coverage_results.append({
                 "requirement_id": req_id,
-                "covered": req_data.get("covered", True),
+                "covered": req_data.get("covered", False),
                 "evidence_refs": req_data.get("evidence_refs", []),
                 "notes": req_data.get("notes", ""),
+                "metadata": {**req_data.get("metadata", {}), "degraded": req_data.get("metadata", {}).get("degraded", False)},
             })
             
         return StepResult(
             step.id,
             StepStatus.SUCCEEDED,
             "RTM Coverage generated via Map-Reduce logic.",
-            outputs={"content": content, "coverage": coverage_results},
+            outputs={
+                "content": run_result.content,
+                "coverage": coverage_results,
+                "degraded": False,
+                "agent_session_id": session.session_id,
+                "agent_session_trace": trace,
+            },
         )
 
 
@@ -478,8 +539,9 @@ class DiffImpactAnalyzerExecutor:
     step_type: str = "agent"
     step_id: str = "diff_impact_analyzer"
 
-    def __init__(self, llm: Any = None):
+    def __init__(self, llm: Any = None, tool_service: Any = None):
         self.llm = llm
+        self.tool_service = tool_service
         self.plugins: List[AuditPlugin] = [
             SecurityAuditExecutor(),
             ArchitectureAuditExecutor(),
@@ -506,10 +568,50 @@ class DiffImpactAnalyzerExecutor:
             prompt = (
                 "Output JSON: {\"issues\": [], \"fix_tasks\": []}"
             )
-            fallback = {"issues": [], "fix_tasks": []}
-            _, structured = _invoke_llm_with_retry(active_llm, "Reviewer", prompt, {"diff": diff[:1500]}, fallback=fallback)
-            all_issues.extend(structured.get("issues", []))
-            all_fixes.extend(structured.get("fix_tasks", []))
+
+            session = AgentSession(
+                task_id=task.task_id,
+                step_id=step.id,
+                agent_role=step.role or "Reviewer",
+                goal="Perform semantic review of implementation diff after static audit plugins find no deterministic issues.",
+                input_context={
+                    "diff_head": diff[:1500],
+                    "requirement_ids": task.context.step_outputs.get("ingest_acceptance_context", {}).get("requirement_ids", []),
+                    "task_definition": task.definition,
+                    "task_context": task.context,
+                },
+                max_iterations=3,
+            )
+            run_result = AgentRuntime(llm=active_llm, tool_service=self.tool_service).run_json_session(
+                session=session,
+                prompt=prompt,
+                context={"diff": diff[:1500]},
+                required_keys=["issues", "fix_tasks"],
+                task_definition=task.definition,
+                task_context=task.context,
+            )
+            trace = session.to_trace()
+            if run_result.status == AgentSessionStatus.BLOCKED or run_result.structured.get("degraded"):
+                all_issues.append({
+                    "issue_id": "issue_review_degraded",
+                    "summary": "语义审查降级，无法确认交付物安全通过",
+                    "severity": "major",
+                    "recommendation": "人工复核本次交付，或重新运行 Reviewer AgentSession 后再验收。",
+                    "related_requirement_ids": task.context.step_outputs.get("ingest_acceptance_context", {}).get("requirement_ids", []),
+                    "metadata": {"degraded": True, "fallback_reason": run_result.structured.get("fallback_reason")},
+                })
+                all_fixes.append({
+                    "title": "人工复核降级的语义审查结果",
+                    "priority": "high",
+                    "source_issue_ids": ["issue_review_degraded"],
+                    "metadata": {"degraded": True},
+                })
+            else:
+                all_issues.extend(run_result.structured.get("issues", []))
+                all_fixes.extend(run_result.structured.get("fix_tasks", []))
+        else:
+            trace = None
+            session = None
         
         # 补齐防伪追踪 ID
         for idx, issue in enumerate(all_issues):
@@ -523,8 +625,19 @@ class DiffImpactAnalyzerExecutor:
             step.id,
             StepStatus.SUCCEEDED,
             f"Diff impact analysis completed. Found {len(all_issues)} issues.",
-            outputs={"content": "Matrix complete", "issues": all_issues, "fix_tasks": all_fixes},
+            outputs={
+                "content": "Matrix complete",
+                "issues": all_issues,
+                "fix_tasks": all_fixes,
+                "degraded": any(issue.get("metadata", {}).get("degraded") for issue in all_issues),
+                **({"agent_session_id": session.session_id, "agent_session_trace": trace} if session and trace else {}),
+            },
         )
+
+
+def diff_impact_analyzer_step(task: Task, step: WorkflowStep, llm: Any = None, tool_service: Any = None) -> StepResult:
+    """快捷回调封装：通过插件矩阵与 Reviewer AgentSession 审查 diff 风险。"""
+    return DiffImpactAnalyzerExecutor(llm=llm, tool_service=tool_service).run(task, step)
 
 
 # ==============================================================================
@@ -580,22 +693,31 @@ class ReviewResultCompilerExecutor:
         issues_data = task.context.step_outputs.get("diff_impact_analyzer", {}).get("issues", [])
         fix_tasks = task.context.step_outputs.get("diff_impact_analyzer", {}).get("fix_tasks", [])
         parsed_files = task.context.step_outputs.get("ingest_acceptance_context", {}).get("parsed_diff_files", [])
+        coverage_degraded = bool(task.context.step_outputs.get("requirement_coverage", {}).get("degraded"))
+        impact_degraded = bool(task.context.step_outputs.get("diff_impact_analyzer", {}).get("degraded"))
         
         health_score = HealthScoreCalculator.calculate(issues_data)
         risk_level = RegressionRiskEstimator.estimate(task.context.inputs.get("diff", ""), parsed_files)
         
         verdict = ReviewVerdict.PASS
         uncovered = [c for c in coverage_data if not c.get("covered", True)]
+        if coverage_degraded or impact_degraded:
+            verdict = ReviewVerdict.BLOCKED
         
         # 存在任意断层/关键隐患或健康分过低，判定为不通过
-        if uncovered or health_score < 75 or any(i.get("severity") == "critical" for i in issues_data):
+        if verdict != ReviewVerdict.BLOCKED and (uncovered or health_score < 75 or any(i.get("severity") == "critical" for i in issues_data)):
             verdict = ReviewVerdict.CHANGES_REQUIRED
             
         # 维持原始严格判定机制
-        if issues_data and health_score < 100:
+        if verdict != ReviewVerdict.BLOCKED and issues_data and health_score < 100:
              verdict = ReviewVerdict.CHANGES_REQUIRED
             
-        summary = "All checks passed." if verdict == ReviewVerdict.PASS else f"Detected issues: {', '.join([i.get('summary', '') for i in issues_data])}"
+        if verdict == ReviewVerdict.PASS:
+            summary = "All checks passed."
+        elif verdict == ReviewVerdict.BLOCKED:
+            summary = "Review blocked because one or more review agents degraded before producing trustworthy evidence."
+        else:
+            summary = f"Detected issues: {', '.join([i.get('summary', '') for i in issues_data])}"
 
         review_result = {
             "work_id": task.task_id,
@@ -621,7 +743,8 @@ class ReviewResultCompilerExecutor:
                     "source_issue_ids": fix.get("source_issue_ids", []),
                     "owner_hint": "Developer",
                 } for idx, fix in enumerate(fix_tasks)
-            ]
+            ],
+            "metadata": {"coverage_degraded": coverage_degraded, "impact_degraded": impact_degraded},
         }
         
         # 测试桩追溯映射兼容处理 (如果发现有 issue，保证映射到指定的 req_login 用例)
@@ -728,8 +851,8 @@ def build_acceptance_review_definition(public_task_type: str = "acceptance_revie
                 "ingest_acceptance_context": ingest_acceptance_context_step,
             },
             "custom_agent_handlers": {
-                "requirement_coverage": lambda task, step, llm=None: RequirementCoverageExecutor(llm=llm).run(task, step),
-                "diff_impact_analyzer": lambda task, step, llm=None: DiffImpactAnalyzerExecutor(llm=llm).run(task, step),
+                "requirement_coverage": requirement_coverage_step,
+                "diff_impact_analyzer": diff_impact_analyzer_step,
                 "review_result_compiler": lambda task, step, llm=None: ReviewResultCompilerExecutor(llm=llm).run(task, step),
             },
             "custom_gate_handlers": {
@@ -901,4 +1024,3 @@ def render_review_result_artifact(task: Task) -> str:
         acceptance_protocol_ref=review_result.acceptance_protocol_ref,
     )
     return serialize_review_result(review_result)
-

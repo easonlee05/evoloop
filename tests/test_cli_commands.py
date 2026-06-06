@@ -347,6 +347,34 @@ class TestCLICommands(unittest.TestCase):
         self.assertIn("Review Verdict", content)
         self.assertIn("r2", content)
 
+    def test_review_command_non_fake_does_not_unconditionally_pass_todo_delivery(self):
+        """非 fake 模式必须走真实验收评审链路，不能固定输出 PASS。"""
+        spec_file = self.output_dir / "machine_spec.yaml"
+        spec_data = {
+            "title": "鉴权网关",
+            "objective": "保护内部微服务",
+            "requirements": [{"requirement_id": "r2", "statement": "拦截未授权请求"}],
+        }
+        self._write_mock_spec(spec_file, spec_data)
+
+        acc_file = self.output_dir / "acceptance.md"
+        acc_file.write_text("# 验收协议\n- 拦截未授权请求需返回 401\n", encoding="utf-8")
+
+        review_file = self.output_dir / "review_result.md"
+
+        review_cmd(
+            spec_path=str(spec_file),
+            acceptance_path=str(acc_file),
+            delivery_text_or_path="+ // TODO: 鉴权失败分支尚未实现",
+            output_path=str(review_file),
+            fake=False,
+        )
+
+        content = review_file.read_text(encoding="utf-8")
+        self.assertIn("Verdict: blocked", content)
+        self.assertIn("存在未完成的 TODO 开发项", content)
+        self.assertNotIn("Review Verdict: PASS", content)
+
 
 class TestCLIMain(unittest.TestCase):
     """
@@ -413,4 +441,3 @@ class TestCLIMain(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

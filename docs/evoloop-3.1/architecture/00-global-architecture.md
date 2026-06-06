@@ -20,7 +20,7 @@ ToolPolicy 控权限
 Acceptance Review 控闭环
 ```
 
-这里的 Peer 是“平级协作同事”，不是“下游”。Codex、Claude Code、Cursor、Antigravity 与数字 PM 的关系应被描述为产品经理与技术同事之间的协作关系：数字 PM 负责规格、裁决、验收和产品记忆；AI 技术同事负责实现、重构、联调、设计执行或代码审查。双方通过 `machine_spec`、`agent_package`、`acceptance_protocol`、result bundle 和 review result 协作，不存在组织意义上的上下游关系。
+这里的 Peer 是“平级协作同事”，不是从属关系。Codex、Claude Code、Cursor、Antigravity 与数字 PM 的关系应被描述为产品经理与技术同事之间的协作关系：数字 PM 负责规格、裁决、验收和产品记忆；AI 技术同事负责实现、重构、联调、设计执行或代码审查。双方通过 `machine_spec`、`agent_package`、`acceptance_protocol`、result bundle 和 review result 协作，不存在组织意义上的从属关系。
 
 这个判断来自当前代码状态：现有 `WorkflowEngine`、`WorkflowSpec`、`TaskDefinition` 已经能提供稳定的流程、checkpoint、暂停恢复、事件流和 artifact 输出；但 `type="agent"` 的步骤本质仍是 Executor 函数，缺少独立会话、多轮推理、原生 tool use、短期记忆和 schema 约束。
 
@@ -148,6 +148,26 @@ Knowledge & Storage Layer
 (task_type, step_id, agent_role, session_id, tool_name) -> allow / deny
 ```
 
+### 4.5 No Fake Success Boundary
+
+3.1 的控制面允许降级，但不允许“假成功”。
+
+生产链路中的 LLM、Tool、GBrain、PeerAdapter 或 Acceptance Review 只要无法产生可信证据，控制面只能选择三种结果：
+
+- `degraded`：能力不可用或结果可信度不足，但仍可继续收集上下文。
+- `blocked`：该步骤是 source-of-truth 或验收关口，不能继续产出正式 artifact。
+- `needs_arbitration`：需要用户裁决、补充材料或选择降级策略。
+
+禁止的行为：
+
+- LLM JSON 解析失败后生成看似完整的 `machine_spec`。
+- 覆盖率评审失败后默认把需求标记为 covered。
+- 对抗性审查失败后返回空 issues 并让 review pass。
+- CLI 或 API 在非测试模式下固定输出 PASS 报告。
+- 前端静态 mock 数据伪装成真实项目知识、可信规则或回收站记录。
+
+允许保留的 fake 只能位于测试边界，例如 `FakeLLM`、`FakeKnowledge`、`FakeStorage`，并且必须通过显式测试装配或 `--fake` 开关启用。默认生产入口不得依赖它们来制造业务成功。
+
 ## 5. 核心对象模型
 
 ### 5.1 WorkItem
@@ -236,6 +256,8 @@ AgentSession
   updated_at
 ```
 
+当前第一版真实 `AgentSession` 已落地在 `app/core/session.py`，并由 `app/services/agent_runtime/runtime.py` 执行 bounded JSON session。`spec_to_agent` 主链路中的 4 个 agent 步骤已接入：`open_question_identifier`、`machine_spec_compiler`、`agent_package_generator`、`acceptance_protocol_generator`。它们现在先创建 session，再委托 `AgentRuntime.run_json_session()` 做 provider-native/JSON-compatible tool-use、JSON/schema 收敛，最后把 `agent_session_id` 和 `agent_session_trace` 回写到 step output。
+
 `AgentSession` 的边界：
 
 - 只存在于单个 workflow step 内部。
@@ -250,7 +272,7 @@ AgentSession
 ```text
 AgentRuntime.run(session)
   1. build messages
-  2. call LLM with native tools
+  2. call LLM with provider-native tools when available
   3. if tool_call: ToolService.invoke
   4. append tool result observation
   5. validate output schema
@@ -272,7 +294,7 @@ PeerAdapter
   result_intake_policy
 ```
 
-3.1 明确：PeerAdapter 是平级协作边界，不是 PM Agent 内核，也不表示上下游关系。
+3.1 明确：PeerAdapter 是平级协作边界，不是 PM Agent 内核，也不表示从属关系。
 
 ## 6. 主链路
 
@@ -338,6 +360,14 @@ implementation result bundle
 - 每一轮 redo 都必须继续引用同一份 `machine_spec` 与 `acceptance_protocol`，避免修复任务漂移。
 - 达到最大轮数、遇到互斥需求或缺少业务裁决时，必须进入 Decision Gate，而不是继续自动重试。
 - Review-Redo Loop 的目标是减少人肉回归测试，不是取消人类裁决。
+
+当前实现状态：
+
+- `WorkItem` 已新增 `iteration`、`parent_work_id`、`review_cycle_id`、`max_review_iterations` 契约字段。
+- `TaskService.fork_repair_work_item()` 已可基于 `review_result.fix_tasks` fork 出下一轮 `spec_to_agent` 修复任务。
+- `TaskService.handle_review_result()` 已可在 `changes_required` 或带 fix_tasks 的 `blocked` 结果下触发有界 redo fork，并记录 `review.redo.forked` / `review.redo.max_iterations_reached` 事件。
+- `TaskService.create_followup_acceptance_review()` 已可在修复任务完成后创建下一轮 `acceptance_review` 任务，并保持同一 `review_cycle_id`。
+- 当前已完成控制面上的 “Review -> Redo -> Create next Review task -> Auto-run follow-up Review -> Re-enter bounded Redo when needed” 入口：`TaskService.handle_repair_completion()` 会在 repair task 完成后自动创建并运行下一轮 `acceptance_review`；若 follow-up review 仍未通过，则继续复用 review gate 逻辑有界 fork 下一轮 repair。与此同时，`TaskService.start_peer_collaboration()` / `POST /api/tasks/{task_id}/peer-dispatch` 已可主动派发已注册 handler，`TaskService.complete_peer_collaboration()` / `POST /api/tasks/{task_id}/peer-result` 已打通第一版 delivery bundle 真实回传。默认服务现已自动注册第一版真实 `codex` CLI handler；尚未自动化的部分仍是更多 peer handler 与更强执行治理。
 
 ### 6.5 AgentSession Agenda
 
@@ -410,29 +440,33 @@ Evoloop 的任务域是“把业务意图编译为 AI 技术同事可执行的�
 
 ### 8.1 第一阶段必须改
 
+- 清退 source-of-truth 路径上的静默 fallback：失败要显式 `degraded` / `blocked` / `needs_arbitration`
 - 新增 `app/core/session.py`
 - 可选新增 `app/core/agent.py`
 - 新增 `app/services/agent_runtime/`
 - 扩展 LLM port 支持 native tool use
-- 将 `open_question_identifier` 与 `machine_spec_compiler` 接入 AgentRuntime
+- 将 `spec_to_agent` 主链路 agent 步骤接入 AgentRuntime
+- 当前已完成 `open_question_identifier`、`machine_spec_compiler`、`agent_package_generator`、`acceptance_protocol_generator` 接入
+- 当前已完成 `acceptance_review.requirement_coverage` 接入；`diff_impact_analyzer` 的语义审查分支已接入，静态插件分支保持确定性
 - 增加 AgentSession 事件与 trace 字段
+- Acceptance Review 不得在 reviewer 降级时默认 PASS
 
 ### 8.2 第一阶段不应改
 
 - 不重写 `WorkflowEngine`
 - 不迁移 legacy manual/prd playbook
 - 不改前端视觉样式
-- 不接真实 Codex/Claude/Cursor peer handler
+- 不在第一阶段同时接入多种真实 peer handler；先只接一条最小真实链路并保持可审计
 - 不让 agent 直接 shell 或直接文件读写
 
 ### 8.3 第二阶段
 
 - `workspace.inspect` 只读工具
-- `agent_package_generator` / `acceptance_protocol_generator` 接入 AgentRuntime
+- 评估 `review_result_compiler` 是否继续作为确定性汇总器
 - `AgentSession.agenda` 与 `agenda.*` 受控工具
 - GBrain 检索接入 `context_normalizer` 与 `open_question_identifier`
 - PeerAdapterService 接入真实 AI 技术同事 handler
-- Peer result bundle intake
+- PeerAdapter dispatch handler 与 result bundle intake 的更完整执行链
 - Acceptance Review 自动生成 fix_tasks 并驱动有界 Review-Redo Loop
 
 ## 9. 真相源约束

@@ -35,7 +35,9 @@ except Exception:  # pragma: no cover - 允许在无 fastapi 等 Web 依赖时�
 
 from app.api.schemas import CreateTaskRequest, DecisionRequest, MaterialUploadResponse
 from app.services.fakes import FakeLLM, FakeStorage
+from app.services.codex_cli_handler import CodexCLIHandler
 from app.services.gbrain_service import GBrainKnowledge
+from app.services.peer_adapter_service import PeerAdapterService
 from app.services.task_service import TaskService
 from app.services.tool_service import ToolService
 from app.services.llm import OpenAILLM
@@ -83,7 +85,14 @@ def build_default_task_service(root: Path | None = None) -> TaskService:
     llm = OpenAILLM(api_key=api_key, base_url=base_url)
     
     engine = WorkflowEngine(tool_service=tool_service, llm=llm, storage=storage)
-    return TaskService(registry=build_task_registry(), engine=engine, storage=storage)
+    peer_adapter = PeerAdapterService()
+    peer_adapter.register_adapter("codex", CodexCLIHandler(workspace_root=project_root))
+    return TaskService(
+        registry=build_task_registry(),
+        engine=engine,
+        storage=storage,
+        peer_adapter=peer_adapter,
+    )
 
 
 # 租户服务映射表，按租户 ID 隔离其各自的 TaskService 实例
@@ -223,6 +232,64 @@ def create_app(task_service: TaskService | None = None):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"task_id": task.task_id, "taskId": task.task_id, "id": task.task_id, "status": task.status.value}
+
+    @app.post("/api/tasks/{task_id}/peer-result")
+    async def submit_peer_result(
+        task_id: str,
+        payload: Dict[str, Any] = Body(...),
+        service: TaskService = Depends(get_task_service),
+    ) -> Dict[str, Any]:
+        """接收 AI 技术同事回传的 result bundle，并推进 repair -> review 闭环。"""
+        try:
+            result_task = service.complete_peer_collaboration(task_id, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="task not found") from exc
+
+        response = {
+            "task_id": task_id,
+            "status": "completed",
+            "delivery_bundle_recorded": True,
+            "followup_review_id": None,
+        }
+        if result_task.definition.type == "acceptance_review":
+            response["followup_review_id"] = result_task.task_id
+            response["followup_review_status"] = result_task.status.value
+        else:
+            response["result_task_id"] = result_task.task_id
+            response["result_task_status"] = result_task.status.value
+        return response
+
+    @app.post("/api/tasks/{task_id}/peer-dispatch")
+    async def dispatch_peer_collaboration(
+        task_id: str,
+        payload: Dict[str, Any] = Body(default={}),
+        service: TaskService = Depends(get_task_service),
+    ) -> Dict[str, Any]:
+        """根据任务内的 agent package 与 peer_target 主动派发 AI 技术同事协作。"""
+        try:
+            result_task = service.start_peer_collaboration(task_id, payload.get("peer_target"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="task not found") from exc
+
+        refreshed = service.get_task(task_id)
+        delivery_bundle = dict(refreshed.context.inputs.get("delivery_bundle") or {})
+        response = {
+            "task_id": task_id,
+            "status": "completed",
+            "peer_target": delivery_bundle.get("peer_target") or payload.get("peer_target"),
+            "delivery_bundle_recorded": bool(delivery_bundle),
+        }
+        if result_task.definition.type == "acceptance_review":
+            response["followup_review_id"] = result_task.task_id
+            response["followup_review_status"] = result_task.status.value
+        else:
+            response["result_task_id"] = result_task.task_id
+            response["result_task_status"] = result_task.status.value
+        return response
 
     @app.get("/api/tasks")
     async def list_tasks(service: TaskService = Depends(get_task_service)) -> Dict[str, Any]:

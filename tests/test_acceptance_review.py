@@ -30,6 +30,7 @@ from app.workflows.acceptance_review import (
     serialize_review_result,
     verify_and_update_artifact_graph,
     DiffImpactAnalyzerExecutor,
+    RequirementCoverageExecutor,
 )
 
 
@@ -220,6 +221,162 @@ class TestAcceptanceReviewWorkflow(unittest.TestCase):
         self.assertEqual(len(fail_result.outputs["fix_tasks"]), 1)
         self.assertIn("req_login", fail_result.outputs["issues"][0]["related_requirement_ids"])
 
+    def test_requirement_coverage_degradation_does_not_mark_requirements_covered(self):
+        """覆盖率评审降级时不能默认把所有需求标记为 covered=True。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+
+        class InvalidJsonLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(content="not json", structured={})
+
+        context = TaskContext(
+            task_id="task_exec_coverage_degraded",
+            task_type="acceptance_review",
+            username="alice",
+            title="Coverage Test",
+            goal="Coverage Test",
+            inputs={"diff": "+ add partial login", "machine_spec": "req_login:"},
+        )
+        context.step_outputs["ingest_acceptance_context"] = {"requirement_ids": ["req_login"]}
+        task = Task(definition=build_acceptance_review_definition(), context=context)
+        step = WorkflowStep(id="requirement_coverage", type="agent", title="Coverage", role="Reviewer")
+
+        result = RequirementCoverageExecutor(llm=InvalidJsonLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertTrue(result.outputs["degraded"])
+        self.assertEqual(result.outputs["coverage"][0]["covered"], False)
+        self.assertTrue(result.outputs["coverage"][0]["metadata"]["degraded"])
+
+    def test_requirement_coverage_runs_through_agent_session(self):
+        """requirement_coverage 应通过 Reviewer AgentSession 产生 coverage trace。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+
+        class CoverageLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(
+                    content='{"req_login":{"covered":true,"notes":"implemented","evidence_refs":["app/auth.py"]}}'
+                )
+
+        context = TaskContext(
+            task_id="task_exec_coverage_session",
+            task_type="acceptance_review",
+            username="alice",
+            title="Coverage Test",
+            goal="Coverage Test",
+            inputs={"diff": "+ add login", "machine_spec": "req_login:"},
+        )
+        context.step_outputs["ingest_acceptance_context"] = {"requirement_ids": ["req_login"]}
+        task = Task(definition=build_acceptance_review_definition(), context=context)
+        step = WorkflowStep(id="requirement_coverage", type="agent", title="Coverage", role="Reviewer")
+
+        result = RequirementCoverageExecutor(llm=CoverageLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(result.outputs["coverage"][0]["covered"], True)
+        self.assertTrue(result.outputs["agent_session_id"].startswith("session_"))
+        self.assertEqual(result.outputs["agent_session_trace"]["step_id"], "requirement_coverage")
+        self.assertEqual(result.outputs["agent_session_trace"]["state"]["status"], "succeeded")
+
+    def test_requirement_coverage_marks_degraded_when_agent_session_invalid(self):
+        """requirement_coverage 不能在模型不可解析时继续伪装成可信 coverage。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+
+        class InvalidJsonLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(content="not json", structured={})
+
+        context = TaskContext(
+            task_id="task_exec_coverage_blocked",
+            task_type="acceptance_review",
+            username="alice",
+            title="Coverage Test",
+            goal="Coverage Test",
+            inputs={"diff": "+ add login", "machine_spec": "req_login:"},
+        )
+        context.step_outputs["ingest_acceptance_context"] = {"requirement_ids": ["req_login"]}
+        task = Task(definition=build_acceptance_review_definition(), context=context)
+        step = WorkflowStep(id="requirement_coverage", type="agent", title="Coverage", role="Reviewer")
+
+        result = RequirementCoverageExecutor(llm=InvalidJsonLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertTrue(result.outputs["degraded"])
+        self.assertEqual(result.outputs["coverage"][0]["covered"], False)
+        self.assertTrue(result.outputs["coverage"][0]["metadata"]["degraded"])
+        self.assertTrue(result.outputs["agent_session_id"].startswith("session_"))
+
+    def test_diff_impact_degradation_creates_visible_issue(self):
+        """语义审查降级时必须生成显性 issue/fix_task，不能返回空列表假装无问题。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+
+        class InvalidJsonLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(content="not json", structured={})
+
+        context = TaskContext(
+            task_id="task_exec_diff_degraded",
+            task_type="acceptance_review",
+            username="alice",
+            title="Diff Test",
+            goal="Diff Test",
+            inputs={"diff": "+ add login flow", "implementation_summary": "login changed"},
+        )
+        context.step_outputs["ingest_acceptance_context"] = {
+            "parsed_diff_files": [],
+            "requirement_ids": ["req_login"],
+        }
+        task = Task(definition=build_acceptance_review_definition(), context=context)
+        step = WorkflowStep(id="diff_impact_analyzer", type="agent", title="Diff Check", role="Reviewer")
+
+        result = DiffImpactAnalyzerExecutor(llm=InvalidJsonLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertTrue(result.outputs["degraded"])
+        self.assertEqual(result.outputs["issues"][0]["summary"], "语义审查降级，无法确认交付物安全通过")
+        self.assertEqual(result.outputs["fix_tasks"][0]["title"], "人工复核降级的语义审查结果")
+
+    def test_diff_impact_semantic_review_runs_through_agent_session(self):
+        """静态插件无命中时，diff_impact_analyzer 应通过 Reviewer AgentSession 做语义审查。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+
+        class SemanticLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(content='{"issues":[],"fix_tasks":[]}')
+
+        context = TaskContext(
+            task_id="task_exec_diff_session",
+            task_type="acceptance_review",
+            username="alice",
+            title="Diff Test",
+            goal="Diff Test",
+            inputs={"diff": "+ add login flow", "implementation_summary": "login changed"},
+        )
+        context.step_outputs["ingest_acceptance_context"] = {
+            "parsed_diff_files": [],
+            "requirement_ids": ["req_login"],
+        }
+        task = Task(definition=build_acceptance_review_definition(), context=context)
+        step = WorkflowStep(id="diff_impact_analyzer", type="agent", title="Diff Check", role="Reviewer")
+
+        result = DiffImpactAnalyzerExecutor(llm=SemanticLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertFalse(result.outputs["degraded"])
+        self.assertTrue(result.outputs["agent_session_id"].startswith("session_"))
+        self.assertEqual(result.outputs["agent_session_trace"]["step_id"], "diff_impact_analyzer")
+        self.assertEqual(result.outputs["agent_session_trace"]["state"]["status"], "succeeded")
+
     def test_graph_validation(self):
         """
         验证 verify_and_update_artifact_graph 能成功构建产物图并校验通过。
@@ -241,4 +398,3 @@ class TestAcceptanceReviewWorkflow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

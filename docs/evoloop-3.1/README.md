@@ -18,7 +18,7 @@ Deterministic Playbook + Bounded Agent Sessions + Peer Collaboration Loop
 Playbook 控流程，AgentSession 控推理，ToolPolicy 控权限，Acceptance Review 控闭环。
 ```
 
-这里的 Peer 是平级协作同事，不是“下游”。Codex、Claude Code、Cursor、Antigravity 与数字 PM 的关系应被描述为产品经理与技术同事之间的协作：数字 PM 负责规格、裁决和验收，AI 技术同事负责实现、重构、联调或设计执行，双方通过明确的契约协作。
+这里的 Peer 是平级协作同事，不是从属关系。Codex、Claude Code、Cursor、Antigravity 与数字 PM 的关系应被描述为产品经理与技术同事之间的协作：数字 PM 负责规格、裁决和验收，AI 技术同事负责实现、重构、联调或设计执行，双方通过明确的契约协作。
 
 ## 与 3.0 的关系
 

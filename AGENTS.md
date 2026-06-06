@@ -18,6 +18,7 @@
 **重要：**
 - `docs/evoloop-2.0-fullchain/` 和 `docs/vision/pm_agent_v2_vision.md` 只作为历史参考，不再作为当前目标架构真相源。
 - 如果 2.0/3.0 文档与 3.1 文档冲突，始终以 3.1 文档为准。
+- **注释与代码同步**：不管修改、新增或重构什么代码，**必须同步新增/修改对应的注释与 Docstrings**，以确保代码注释与最新实现的逻辑完全一致。
 
 **默认不读：**
 - `.env`：可能含凭证
@@ -39,7 +40,7 @@
 3.1 的主方向是：
 
 - 把业务意图编译为 AI 可执行规格、任务包和验收协议
-- 让 Codex / Claude Code / Cursor / Antigravity 等 AI 技术同事与数字 PM 平级协作，就像产品经理与工程师协作，而不是上下游关系
+- 让 Codex / Claude Code / Cursor / Antigravity 等 AI 技术同事与数字 PM 平级协作，就像产品经理与工程师协作，而不是从属关系
 - 采用 “Playbook 控流程，AgentSession 控推理，ToolPolicy 控权限，Acceptance Review 控闭环” 的 3.1 形态
 - 通过 Decision Gate、Artifact Graph、Acceptance Review 和长期产品记忆形成闭环
 

@@ -28,6 +28,7 @@ from app.core.ports import LLMResult
 from app.core.task import TaskStatus
 from app.core.tools import ToolCall
 from app.services.fakes import FakeKnowledge, FakeLLM, FakeStorage
+from app.services.peer_adapter_service import PeerAdapterService
 from app.services.task_service import TaskService
 from app.services.tool_service import ToolService
 from app.workflows.definitions import build_task_registry
@@ -56,7 +57,12 @@ class BackendPhase1Tests(unittest.TestCase):
         storage = FakeStorage(root)
         tool_service = ToolService.default(root=root, knowledge=FakeKnowledge())
         engine = WorkflowEngine(tool_service=tool_service, llm=FakeLLM(), storage=storage)
-        service = TaskService(registry=registry, engine=engine, storage=storage)
+        service = TaskService(
+            registry=registry,
+            engine=engine,
+            storage=storage,
+            peer_adapter=PeerAdapterService(),
+        )
         # 注册清理回调，防止临时文件残留
         self.addCleanup(temp.cleanup)
         return service, storage, tool_service
@@ -98,6 +104,14 @@ class BackendPhase1Tests(unittest.TestCase):
         )
 
         self.assertEqual(task.definition.type, "spec_to_agent")
+
+    def test_default_task_service_registers_real_codex_handler(self):
+        """默认 TaskService 应自动注册真实 codex handler，作为第一版 peer dispatch 基线。"""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        service = build_default_task_service(root=Path(temp.name))
+
+        self.assertIn("codex", service.peer_adapter.adapters)
 
     def test_create_task_api_accepts_spec_to_agent_business_intent(self):
         """
@@ -156,6 +170,73 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(task.context.inputs["acceptance_protocol"], "case_login: 校验登录成功")
         self.assertEqual(task.context.inputs["implementation_summary"], "已完成登录接口与前端流程")
         self.assertEqual(task.context.inputs["diff"], "+ add login handler")
+
+    def test_peer_result_api_records_delivery_bundle_and_runs_followup_review(self):
+        """外部 AI 技术同事应能通过 API 回传 result bundle，并触发 follow-up review。"""
+        service, storage, _ = self.make_service()
+        client = TestClient(create_app(service))
+        repair_task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "Repair auth branch",
+                "parent_work_id": "task_review_parent",
+                "iteration": 1,
+                "review_cycle_id": "review_cycle_task_review_parent",
+                "machine_spec": "req_login:",
+                "acceptance_protocol": "Given unauthenticated request, Then return 401",
+            },
+        )
+
+        response = client.post(
+            f"/api/tasks/{repair_task.task_id}/peer-result",
+            json={
+                "peer_target": "codex",
+                "implementation_summary": "Auth failure branch implemented by peer collaborator",
+                "diff": "+ return 401 when token missing",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        refreshed_repair = storage.load_task(repair_task.task_id, service.registry)
+        followup_review = storage.load_task(payload["followup_review_id"], service.registry)
+
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(refreshed_repair.context.inputs["delivery_bundle"]["peer_target"], "codex")
+        self.assertEqual(followup_review.definition.type, "acceptance_review")
+
+    def test_peer_dispatch_api_runs_registered_handler_and_records_completion(self):
+        """控制面应能通过 API 主动派发已注册的 PeerAdapter handler。"""
+        service, storage, _ = self.make_service()
+        client = TestClient(create_app(service))
+
+        class CodexHandler:
+            def execute(self, task, package_text):
+                return {
+                    "peer_target": "codex",
+                    "implementation_summary": "Peer completed the implementation",
+                    "diff": "+ add implementation",
+                }
+
+        service.peer_adapter.register_adapter("codex", CodexHandler())
+        task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "Implement login flow",
+            },
+        )
+        service.run_task(task.task_id)
+
+        response = client.post(f"/api/tasks/{task.task_id}/peer-dispatch", json={})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        refreshed_task = storage.load_task(task.task_id, service.registry)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["peer_target"], "codex")
+        self.assertEqual(refreshed_task.context.inputs["delivery_bundle"]["peer_target"], "codex")
 
     def test_default_app_wiring_accepts_native_spec_to_agent_post(self):
         """
@@ -563,7 +644,7 @@ class BackendPhase1Tests(unittest.TestCase):
         """
         class ArbitrationLLM(FakeLLM):
             def invoke(self, role, prompt, context):
-                if role == "Compiler" and "missing Domain-Driven Design" in prompt:
+                if role == "Compiler" and ("missing Domain-Driven Design" in prompt or "OpenQuestionIdentifier" in prompt):
                     return LLMResult(
                         content='{"has_questions": true, "questions": ["Is consistency required?"]}',
                         structured={"has_questions": True, "questions": ["Is consistency required?"]}
@@ -609,7 +690,7 @@ class BackendPhase1Tests(unittest.TestCase):
         """
         class ArbitrationLLM(FakeLLM):
             def invoke(self, role, prompt, context):
-                if role == "Compiler" and "missing Domain-Driven Design" in prompt:
+                if role == "Compiler" and ("missing Domain-Driven Design" in prompt or "OpenQuestionIdentifier" in prompt):
                     return LLMResult(
                         content='{"has_questions": true, "questions": ["Is consistency required?"]}',
                         structured={"has_questions": True, "questions": ["Is consistency required?"]}
@@ -729,6 +810,293 @@ class BackendPhase1Tests(unittest.TestCase):
         self.assertEqual(denied.status, "denied")
         self.assertEqual(denied.error.code, "tool.denied")
 
+    def test_fork_repair_work_item_creates_bounded_iteration_task(self):
+        """Acceptance Review 未通过时应能 fork 有界修复 WorkItem，而不是静默结束。"""
+        service, storage, _ = self.make_service()
+        review_task = service.create_task(
+            "acceptance_review",
+            {
+                "username": "alice",
+                "machine_spec": "req_login:",
+                "acceptance_protocol": "Given unauthenticated request, Then return 401",
+                "implementation_summary": "TODO auth branch",
+                "diff": "+ // TODO: auth branch",
+                "machine_spec_ref": "memory://machine_spec",
+                "acceptance_protocol_ref": "memory://acceptance",
+                "max_review_iterations": 2,
+            },
+        )
+        review_task.context.inputs["iteration"] = 0
+        storage.save_context(review_task.context)
+        review_result = {
+            "verdict": "changes_required",
+            "fix_tasks": [
+                {
+                    "task_id": "fix_0",
+                    "priority": "high",
+                    "title": "Implement auth failure branch",
+                    "source_issue_ids": ["issue_0"],
+                }
+            ],
+        }
+
+        repair_task = service.fork_repair_work_item(review_task.task_id, review_result)
+        repair_context = storage.load_context(repair_task.task_id)
+        repair_work_item = service.get_work_item(repair_task.task_id)
+        event_types = [event.type for event in storage.read_events(review_task.task_id)]
+
+        self.assertEqual(repair_task.definition.type, "spec_to_agent")
+        self.assertEqual(repair_context.inputs["parent_work_id"], review_task.task_id)
+        self.assertEqual(repair_context.inputs["iteration"], 1)
+        self.assertEqual(repair_context.inputs["review_cycle_id"], f"review_cycle_{review_task.task_id}")
+        self.assertEqual(repair_context.inputs["fix_tasks"][0]["title"], "Implement auth failure branch")
+        self.assertEqual(repair_work_item.parent_work_id, review_task.task_id)
+        self.assertEqual(repair_work_item.iteration, 1)
+        self.assertIn("review.redo.forked", event_types)
+
+    def test_handle_review_result_forks_repair_for_changes_required(self):
+        """Review verdict=changes_required 时控制面应自动 fork 下一轮修复任务。"""
+        service, storage, _ = self.make_service()
+        review_task = service.create_task(
+            "acceptance_review",
+            {
+                "username": "alice",
+                "machine_spec": "req_login:",
+                "acceptance_protocol": "Given unauthenticated request, Then return 401",
+                "implementation_summary": "TODO auth branch",
+                "diff": "+ // TODO: auth branch",
+                "max_review_iterations": 2,
+            },
+        )
+        review_task.context.step_outputs["review_result_compiler"] = {
+            "review_result": {
+                "verdict": "changes_required",
+                "fix_tasks": [
+                    {
+                        "task_id": "fix_0",
+                        "priority": "high",
+                        "title": "Implement auth failure branch",
+                        "source_issue_ids": ["issue_0"],
+                    }
+                ],
+            }
+        }
+        storage.save_context(review_task.context)
+
+        repair_task = service.handle_review_result(review_task.task_id)
+        refreshed_review = storage.load_task(review_task.task_id, service.registry)
+        event_types = [event.type for event in storage.read_events(review_task.task_id)]
+
+        self.assertIsNotNone(repair_task)
+        self.assertEqual(repair_task.definition.type, "spec_to_agent")
+        self.assertEqual(refreshed_review.context.inputs["latest_repair_work_id"], repair_task.task_id)
+        self.assertIn("review.redo.forked", event_types)
+
+    def test_create_followup_acceptance_review_from_repair_task(self):
+        """修复任务完成后，控制面应能自动创建下一轮 acceptance_review。"""
+        service, storage, _ = self.make_service()
+        repair_task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "Repair auth branch",
+                "parent_work_id": "task_review_parent",
+                "iteration": 1,
+                "review_cycle_id": "review_cycle_task_review_parent",
+                "machine_spec": "req_login:",
+                "acceptance_protocol": "Given unauthenticated request, Then return 401",
+                "delivery_bundle": {
+                    "implementation_summary": "Auth failure branch implemented",
+                    "diff": "+ return 401 when token missing",
+                },
+            },
+        )
+
+        followup_review = service.create_followup_acceptance_review(repair_task.task_id)
+        followup_context = storage.load_context(followup_review.task_id)
+        followup_work_item = service.get_work_item(followup_review.task_id)
+        event_types = [event.type for event in storage.read_events(repair_task.task_id)]
+
+        self.assertEqual(followup_review.definition.type, "acceptance_review")
+        self.assertEqual(followup_context.inputs["machine_spec"], "req_login:")
+        self.assertEqual(followup_context.inputs["acceptance_protocol"], "Given unauthenticated request, Then return 401")
+        self.assertEqual(followup_context.inputs["implementation_summary"], "Auth failure branch implemented")
+        self.assertEqual(followup_context.inputs["diff"], "+ return 401 when token missing")
+        self.assertEqual(followup_context.inputs["parent_work_id"], repair_task.task_id)
+        self.assertEqual(followup_context.inputs["iteration"], 1)
+        self.assertEqual(followup_context.inputs["review_cycle_id"], "review_cycle_task_review_parent")
+        self.assertEqual(followup_work_item.parent_work_id, repair_task.task_id)
+        self.assertEqual(followup_work_item.iteration, 1)
+        self.assertIn("review.followup.created", event_types)
+
+    def test_handle_repair_completion_runs_followup_acceptance_review(self):
+        """修复任务完成后，控制面应自动运行下一轮复审并产出 review_result.md。"""
+        service, storage, _ = self.make_service()
+        repair_task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "Repair auth branch",
+                "parent_work_id": "task_review_parent",
+                "iteration": 1,
+                "review_cycle_id": "review_cycle_task_review_parent",
+                "machine_spec": "req_login:",
+                "acceptance_protocol": "Given unauthenticated request, Then return 401",
+                "delivery_bundle": {
+                    "implementation_summary": "Auth failure branch implemented",
+                    "diff": "+ return 401 when token missing",
+                },
+            },
+        )
+        repair_task.status = TaskStatus.COMPLETED
+        storage.save_task(repair_task)
+
+        followup_review = service.handle_repair_completion(repair_task.task_id)
+        refreshed_repair = storage.load_task(repair_task.task_id, service.registry)
+        followup_artifact_names = [artifact.name for artifact in storage.list_artifacts(followup_review.task_id)]
+        event_types = [event.type for event in storage.read_events(repair_task.task_id)]
+
+        self.assertEqual(followup_review.definition.type, "acceptance_review")
+        self.assertEqual(followup_review.status, TaskStatus.COMPLETED)
+        self.assertEqual(refreshed_repair.context.inputs["latest_followup_review_id"], followup_review.task_id)
+        self.assertIn("review_result.md", followup_artifact_names)
+        self.assertIn("review.followup.created", event_types)
+        self.assertIn("review.followup.run.completed", event_types)
+
+    def test_handle_repair_completion_reenters_bounded_redo_when_followup_review_fails(self):
+        """follow-up review 再次未通过时，控制面应继续有界 fork 下一轮 repair。"""
+        service, storage, _ = self.make_service()
+        repair_task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "Repair auth branch",
+                "parent_work_id": "task_review_parent",
+                "iteration": 1,
+                "review_cycle_id": "review_cycle_task_review_parent",
+                "max_review_iterations": 3,
+                "machine_spec": "req_login:",
+                "acceptance_protocol": "Given unauthenticated request, Then return 401",
+                "delivery_bundle": {
+                    "implementation_summary": "Auth branch still incomplete",
+                    "diff": "+ // TODO: token missing path still not handled",
+                },
+            },
+        )
+        repair_task.status = TaskStatus.COMPLETED
+        storage.save_task(repair_task)
+
+        followup_review = service.handle_repair_completion(repair_task.task_id)
+        refreshed_review = storage.load_task(followup_review.task_id, service.registry)
+        next_repair_task_id = refreshed_review.context.inputs.get("latest_repair_work_id")
+        next_repair_task = storage.load_task(next_repair_task_id, service.registry)
+        review_event_types = [event.type for event in storage.read_events(followup_review.task_id)]
+
+        self.assertEqual(followup_review.status, TaskStatus.COMPLETED)
+        self.assertIsNotNone(next_repair_task_id)
+        self.assertEqual(next_repair_task.definition.type, "spec_to_agent")
+        self.assertEqual(next_repair_task.context.inputs["iteration"], 2)
+        self.assertEqual(next_repair_task.context.inputs["parent_work_id"], followup_review.task_id)
+        self.assertIn("review.redo.forked", review_event_types)
+
+    def test_complete_peer_collaboration_persists_delivery_bundle_and_triggers_followup_review(self):
+        """PeerAdapter 返回真实 result bundle 后，控制面应写入 delivery_bundle 并自动进入 follow-up review。"""
+        service, storage, _ = self.make_service()
+        repair_task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "Repair auth branch",
+                "parent_work_id": "task_review_parent",
+                "iteration": 1,
+                "review_cycle_id": "review_cycle_task_review_parent",
+                "machine_spec": "req_login:",
+                "acceptance_protocol": "Given unauthenticated request, Then return 401",
+            },
+        )
+
+        peer_result = {
+            "peer_target": "codex",
+            "implementation_summary": "Auth failure branch implemented by peer collaborator",
+            "diff": "+ return 401 when token missing",
+            "artifacts": [{"path": "src/auth.py", "kind": "code"}],
+        }
+
+        followup_review = service.complete_peer_collaboration(repair_task.task_id, peer_result)
+        refreshed_repair = storage.load_task(repair_task.task_id, service.registry)
+        event_types = [event.type for event in storage.read_events(repair_task.task_id)]
+
+        self.assertEqual(refreshed_repair.status, TaskStatus.COMPLETED)
+        self.assertEqual(
+            refreshed_repair.context.inputs["delivery_bundle"]["implementation_summary"],
+            "Auth failure branch implemented by peer collaborator",
+        )
+        self.assertEqual(
+            refreshed_repair.context.inputs["delivery_bundle"]["diff"],
+            "+ return 401 when token missing",
+        )
+        self.assertEqual(refreshed_repair.context.inputs["delivery_bundle"]["peer_target"], "codex")
+        self.assertEqual(followup_review.definition.type, "acceptance_review")
+        self.assertIn("peer.delivery_bundle.recorded", event_types)
+        self.assertIn("peer.collaboration.completed", event_types)
+        self.assertIn("review.followup.run.completed", event_types)
+
+    def test_start_peer_collaboration_dispatches_registered_handler_and_records_result(self):
+        """已注册 PeerAdapter handler 时，控制面应真实派发 agent package 并回收 result bundle。"""
+        service, storage, _ = self.make_service()
+
+        class CodexHandler:
+            def execute(self, task, package_text):
+                self.task_id = task.task_id
+                self.package_text = package_text
+                return {
+                    "peer_target": "codex",
+                    "implementation_summary": "Peer completed the implementation",
+                    "diff": "+ add implementation",
+                }
+
+        handler = CodexHandler()
+        service.peer_adapter.register_adapter("codex", handler)
+        task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "Implement login flow",
+            },
+        )
+        service.run_task(task.task_id)
+
+        completed_task = service.start_peer_collaboration(task.task_id)
+        refreshed_task = storage.load_task(task.task_id, service.registry)
+        event_types = [event.type for event in storage.read_events(task.task_id)]
+
+        self.assertEqual(handler.task_id, task.task_id)
+        self.assertIn("# Agent Package For AI Technical Peer", handler.package_text)
+        self.assertEqual(completed_task.status, TaskStatus.COMPLETED)
+        self.assertEqual(refreshed_task.context.inputs["delivery_bundle"]["peer_target"], "codex")
+        self.assertIn("peer.collaboration.dispatch.started", event_types)
+        self.assertIn("peer.collaboration.completed", event_types)
+
+    def test_start_peer_collaboration_rejects_unregistered_handler_without_fake_success(self):
+        """未注册 PeerAdapter handler 时，控制面应明确拒绝派发，而不是伪装成功。"""
+        service, storage, _ = self.make_service()
+        task = service.create_task(
+            "spec_to_agent",
+            {
+                "username": "alice",
+                "business_intent": "Implement login flow",
+            },
+        )
+        service.run_task(task.task_id)
+
+        with self.assertRaises(ValueError):
+            service.start_peer_collaboration(task.task_id)
+
+        refreshed_task = storage.load_task(task.task_id, service.registry)
+        event_types = [event.type for event in storage.read_events(task.task_id)]
+        self.assertNotIn("delivery_bundle", refreshed_task.context.inputs)
+        self.assertIn("peer.collaboration.dispatch.failed", event_types)
+
     def test_artifact_write_is_idempotent_by_logical_name(self):
         """
         验证 artifact.write 写入操作的逻辑幂等性。
@@ -843,4 +1211,3 @@ class BackendPhase1Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

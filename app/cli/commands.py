@@ -47,7 +47,9 @@ def build_cli_task_service(output_dir: str, fake: bool = False) -> TaskService:
         
     if fake:
         # 使用伪造的外部组件以支持快速的 CLI 离线试跑或本地单元测试
+        from app.services.codex_cli_handler import CodexCLIHandler
         from app.services.fakes import FakeStorage, FakeKnowledge, FakeLLM
+        from app.services.peer_adapter_service import PeerAdapterService
         from app.workflows.engine import WorkflowEngine
         from app.services.tool_service import ToolService
         
@@ -56,7 +58,14 @@ def build_cli_task_service(output_dir: str, fake: bool = False) -> TaskService:
         storage = FakeStorage(storage_root)
         tool_service = ToolService.default(root=storage, knowledge=FakeKnowledge())
         engine = WorkflowEngine(tool_service=tool_service, llm=FakeLLM(), storage=storage)
-        return TaskService(registry=registry, engine=engine, storage=storage)
+        peer_adapter = PeerAdapterService()
+        peer_adapter.register_adapter("codex", CodexCLIHandler(workspace_root=Path.cwd()))
+        return TaskService(
+            registry=registry,
+            engine=engine,
+            storage=storage,
+            peer_adapter=peer_adapter,
+        )
     else:
         # 链接后端真实的 API 级别服务配置进行落地执行
         from app.api.server import build_default_task_service
@@ -95,7 +104,7 @@ def _call_llm(prompt: str, fake: bool, fake_response: str) -> str:
 def compile_cmd(intent: str, materials: List[str], output_dir: str, fake: bool = False) -> None:
     """执行 compile 编译指令。
 
-    将业务意图与参考文档输入编译为下游 AI 可直接消费的 machine_spec.yaml 以及 human_brief.md，
+    将业务意图与参考文档输入编译为 AI 技术同事可消费的 machine_spec.yaml 以及 human_brief.md，
     并在过程中处理人工交互裁决决策，最后通过产物依赖图自检进行验证。
 
     Args:
@@ -264,7 +273,7 @@ def compile_cmd(intent: str, materials: List[str], output_dir: str, fake: bool =
 def package_cmd(spec_path: str, output_path: str, fake: bool = False) -> None:
     """执行 package 子命令。
 
-    根据已有的 machine_spec.yaml 将架构拆解编译生成面向下游 AI 研发 Workers 的开发包 agent_package.md。
+    根据已有的 machine_spec.yaml 将架构拆解编译生成面向 AI 技术同事的协作包 agent_package.md。
 
     Args:
         spec_path (str): 输入 machine_spec.yaml 文件的路径。
@@ -285,7 +294,7 @@ def package_cmd(spec_path: str, output_path: str, fake: bool = False) -> None:
     requirements = spec_data.get("requirements", [])
     
     prompt = (
-        f"You are a Digital PM. Please compile this machine_spec into an agent package for down-stream workers:\n"
+        f"You are a Digital PM. Please compile this machine_spec into an agent package for peer AI technical colleagues:\n"
         f"Title: {title}\nObjective: {objective}\nRequirements: {requirements}\n"
         f"Output should be markdown format containing task details and execution instructions."
     )
@@ -293,7 +302,7 @@ def package_cmd(spec_path: str, output_path: str, fake: bool = False) -> None:
     fake_response = (
         f"# Agent Package: {title}\n\n"
         f"## Objective\n{objective}\n\n"
-        f"## Target Workers\nCodex / Claude Code\n\n"
+        f"## Target AI Technical Peers\nCodex / Claude Code\n\n"
         f"## Tasks Breakdown\n"
         + "\n".join(f"- Task for req {req.get('requirement_id')}: {req.get('statement')}" for req in requirements)
     )
@@ -444,13 +453,29 @@ def review_cmd(
     title = spec_data.get("title", "Unnamed Spec")
     requirements = spec_data.get("requirements", [])
     
-    prompt = (
-        f"Perform acceptance review. Spec: {title}. Requirements: {requirements}.\n"
-        f"Acceptance Protocol: {acc_content}\nDelivery outputs: {delivery_content}\n"
-        f"Determine verdict (PASS, CHANGES_REQUIRED) and requirement coverage."
-    )
-    
     print("[*] Performing acceptance review...")
+    if not fake:
+        machine_spec_text = Path(spec_path).read_text(encoding="utf-8")
+        service = build_cli_task_service(str(Path(output_path).parent), fake=False)
+        payload = {
+            "username": "cli_user",
+            "machine_spec": machine_spec_text,
+            "acceptance_protocol": acc_content,
+            "implementation_summary": delivery_content[:1200],
+            "diff": delivery_content,
+        }
+        task = service.create_task("acceptance_review", payload)
+        result = service.run_task(task.task_id)
+        artifacts = service.storage.list_artifacts(result.task_id)
+        review_artifact = next((artifact for artifact in artifacts if artifact.name == "review_result.md"), None)
+        if not review_artifact:
+            print("[!] Error: acceptance_review did not produce review_result.md.", file=sys.stderr)
+            sys.exit(1)
+        review_result = service.storage.read_artifact(review_artifact.artifact_id)
+        Path(output_path).write_text(review_result.content, encoding="utf-8")
+        print(f"[✓] Real acceptance review written to {output_path}")
+        return
+
     # 构建 Mock 审核结果
     fake_verdict = ReviewVerdict.PASS
     fake_coverages = [

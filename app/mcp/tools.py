@@ -1,7 +1,7 @@
 """Evoloop 3.0 MCP 协议工具能力集定义。
 
-该模块通过 MCP 协议暴露各种业务管理与控制功能（如意图编译、规则提取、任务决策、下游分包打包、上下文局部检索等），
-支持 AI Worker 直接通过工具调用形式触发 Evoloop 3.0 底层核心工作流。
+该模块通过 MCP 协议暴露各种业务管理与控制功能（如意图编译、规则提取、任务决策、AI 技术同事协作包打包、上下文局部检索等），
+支持 AI 技术同事通过工具调用形式触发 Evoloop 3.0 底层核心工作流。
 """
 import os
 import json
@@ -188,7 +188,7 @@ def register_tools(mcp):
 
     @mcp.tool()
     def get_agent_package(spec_path: str, output_path: str) -> str:
-        """根据指定的 machine_spec.yaml 自动编译并打包生成 agent_package.md，交接下游智能体。
+        """根据指定的 machine_spec.yaml 自动编译并打包生成 agent_package.md，交接 AI 技术同事。
 
         Args:
             spec_path (str): 机器规范文件的输入绝对路径。

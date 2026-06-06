@@ -1,7 +1,8 @@
-"""面向下游 AI 执行的 Worker 适配器分发服务。
+"""Legacy worker adapter compatibility layer.
 
-本模块提供了一个抽象分发层，用于将打包的智能体任务包（Agent Package）
-分配给下游不同的执行智能体（如 CLI 工具、MCP 服务器、Claude Code 或 Codex），以驱动下游 Worker 任务闭环。
+该模块保留 3.0 时期的 `Worker*` 命名以兼容旧代码，
+但语义上应理解为 AI 技术同事协作适配层，而不是“下游从属执行器”。
+在 3.1 中，这一层的目标名称是 PeerAdapter / peer collaboration。
 """
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ from typing import Dict, Any, Protocol
 
 
 class WorkerTargetType:
-    """下游 AI 执行智能体的类型常量定义。"""
+    """兼容旧命名的 AI 技术同事协作目标类型常量定义。"""
     CLI = "cli"
     MCP = "mcp"
     CLAUDE_CODE = "claude_code"
@@ -17,10 +18,7 @@ class WorkerTargetType:
 
 
 class WorkerHandler(Protocol):
-    """下游 AI 适配器执行处理器协议。
-
-    定义了所有对接下游 Worker 的适配器所需实现的基本接口规范。
-    """
+    """兼容旧命名的协作适配器执行处理器协议。"""
     
     def execute(self, package_path: str) -> Dict[str, Any]:
         """执行指定路径下的智能体任务包。
@@ -35,9 +33,9 @@ class WorkerHandler(Protocol):
 
 
 class WorkerAdapterService:
-    """下游 AI Worker 分发与适配管理服务类。
+    """兼容旧命名的协作适配器分发服务类。
 
-    抽象并隔离底层不同 Worker 执行器的细节，通过注册适配器实现对各种执行端的派发。
+    抽象并隔离不同 AI 技术同事执行端的细节，通过注册适配器实现对各种协作通道的派发。
     """
     
     def __init__(self, sandbox_manager: Any = None):
@@ -80,4 +78,3 @@ class WorkerAdapterService:
             
         print(f"[*] Dispatching {package_path} to worker type: {target_type}")
         return handler.execute(package_path)
-

@@ -229,8 +229,261 @@ class TestSpecToAgentExecutors(unittest.TestCase):
         
         # 断言编译器执行成功，并测试输出内容
         self.assertEqual(result.status.value, "succeeded")
-        self.assertIn("JSONDecodeError", result.outputs["content"])
         self.assertEqual(result.outputs["structured"]["primary_requirement"], "Auth flow")
+        self.assertTrue(result.outputs["agent_session_id"].startswith("session_"))
+        self.assertEqual(result.outputs["agent_session_trace"]["step_id"], "machine_spec_compiler")
+        self.assertEqual(result.outputs["agent_session_trace"]["state"]["status"], "succeeded")
+
+    def test_machine_spec_compiler_blocks_when_llm_json_degrades_to_fallback(self):
+        """核心 source-of-truth 编译步骤不能把 LLM 解析失败伪装成成功产物。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+        from app.workflows.spec_to_agent import MachineSpecCompilerExecutor, build_spec_to_agent_definition
+
+        class InvalidJsonLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(content="not json", structured={})
+
+        definition = build_spec_to_agent_definition()
+        context = TaskContext(
+            task_id="task_exec_degraded",
+            task_type="spec_to_agent",
+            username="alice",
+            title="Compiler Spec",
+            goal="Compile spec",
+            inputs={"business_intent": "Auth flow"},
+        )
+        task = Task(definition=definition, context=context)
+        step = WorkflowStep(id="machine_spec_compiler", type="agent", title="Compiler Step", role="Compiler")
+
+        result = MachineSpecCompilerExecutor(llm=InvalidJsonLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "blocked")
+        self.assertIsNotNone(result.error)
+        self.assertEqual(result.error.code, "workflow.llm_degraded_fallback")
+        self.assertTrue(result.outputs["structured"].get("degraded"))
+
+    def test_machine_spec_compiler_can_use_allowed_tool_inside_agent_session(self):
+        """machine_spec_compiler 的 AgentSession 可通过 ToolService 调用白名单只读工具。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+        from app.services.fakes import FakeKnowledge, FakeStorage
+        from app.services.tool_service import ToolService
+        from app.workflows.spec_to_agent import MachineSpecCompilerExecutor, build_spec_to_agent_definition
+
+        class ToolCallingLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def invoke(self, role, prompt, context):
+                self.calls += 1
+                if self.calls == 1:
+                    return LLMResult(content='{"tool_calls":[{"tool_name":"knowledge.retrieve","arguments":{"query":"auth"}}]}')
+                return LLMResult(
+                    content=(
+                        '{"primary_requirement":"Auth flow",'
+                        '"dependencies":["system"],'
+                        '"strict_contracts":["traceable"],'
+                        '"environment":{"os_target":"linux","node_version":"20.x"},'
+                        '"security":{"require_auth":true}}'
+                    )
+                )
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        storage = FakeStorage(root)
+        tool_service = ToolService.default(root=storage, knowledge=FakeKnowledge())
+        definition = build_spec_to_agent_definition()
+        context = TaskContext(
+            task_id="task_exec_tool",
+            task_type="spec_to_agent",
+            username="alice",
+            title="Compiler Tool Spec",
+            goal="Compile spec",
+            inputs={"business_intent": "Auth flow"},
+        )
+        task = Task(definition=definition, context=context)
+        step = WorkflowStep(id="machine_spec_compiler", type="agent", title="Compiler Step", role="Compiler")
+
+        result = MachineSpecCompilerExecutor(llm=ToolCallingLLM(), tool_service=tool_service).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        observations = result.outputs["agent_session_trace"]["state"]["observations"]
+        self.assertEqual(observations[0]["kind"], "tool")
+        self.assertEqual(observations[0]["data"]["tool_name"], "knowledge.retrieve")
+        self.assertEqual(observations[0]["data"]["status"], "succeeded")
+
+    def test_open_question_identifier_runs_through_agent_session(self):
+        """open_question_identifier 应通过 AgentSession 输出澄清问题与 trace。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+        from app.workflows.spec_to_agent import OpenQuestionIdentifierExecutor, build_spec_to_agent_definition
+
+        class QuestionLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(
+                    content=(
+                        '{"has_questions":true,'
+                        '"questions":["Which auth provider should be used?","What is the session timeout?"]}'
+                    )
+                )
+
+        definition = build_spec_to_agent_definition()
+        context = TaskContext(
+            task_id="task_open_questions",
+            task_type="spec_to_agent",
+            username="alice",
+            title="Open Questions",
+            goal="Clarify auth spec",
+            inputs={"business_intent": "Build login with SSO"},
+        )
+        task = Task(definition=definition, context=context)
+        step = WorkflowStep(id="open_question_identifier", type="agent", title="Open Questions", role="Compiler")
+
+        result = OpenQuestionIdentifierExecutor(llm=QuestionLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertTrue(result.outputs["structured"]["has_questions"])
+        self.assertEqual(len(result.outputs["structured"]["questions"]), 2)
+        self.assertEqual(result.outputs["structured"]["diagnostic_matrix_runs"], 1)
+        self.assertTrue(result.outputs["agent_session_id"].startswith("session_"))
+        self.assertEqual(result.outputs["agent_session_trace"]["step_id"], "open_question_identifier")
+        self.assertEqual(result.outputs["agent_session_trace"]["state"]["status"], "succeeded")
+
+    def test_open_question_identifier_blocks_when_json_invalid(self):
+        """open_question_identifier 不能在无法解析模型输出时假装没有问题。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+        from app.workflows.spec_to_agent import OpenQuestionIdentifierExecutor, build_spec_to_agent_definition
+
+        class InvalidJsonLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(content="not json")
+
+        definition = build_spec_to_agent_definition()
+        context = TaskContext(
+            task_id="task_open_questions_bad",
+            task_type="spec_to_agent",
+            username="alice",
+            title="Open Questions",
+            goal="Clarify auth spec",
+            inputs={"business_intent": "Build login with SSO"},
+        )
+        task = Task(definition=definition, context=context)
+        step = WorkflowStep(id="open_question_identifier", type="agent", title="Open Questions", role="Compiler")
+
+        result = OpenQuestionIdentifierExecutor(llm=InvalidJsonLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "blocked")
+        self.assertIsNotNone(result.error)
+        self.assertEqual(result.error.code, "workflow.open_question_identifier_blocked")
+        self.assertTrue(result.outputs["structured"].get("degraded"))
+
+    def test_agent_package_generator_runs_through_agent_session_and_uses_peer_target(self):
+        """agent_package_generator 应通过 AgentSession 选择平级 AI 技术同事。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+        from app.workflows.spec_to_agent import AgentPackageGeneratorExecutor, build_spec_to_agent_definition
+
+        class PeerLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(content='{"peer_target":"claude"}')
+
+        definition = build_spec_to_agent_definition()
+        context = TaskContext(
+            task_id="task_agent_package",
+            task_type="spec_to_agent",
+            username="alice",
+            title="Package",
+            goal="Package spec",
+        )
+        context.step_outputs["machine_spec_compiler"] = {
+            "structured": {"primary_requirement": "Refactor billing", "source_of_truth": "machine_spec"}
+        }
+        task = Task(definition=definition, context=context)
+        step = WorkflowStep(id="agent_package_generator", type="agent", title="Package", role="Compiler")
+
+        result = AgentPackageGeneratorExecutor(llm=PeerLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(result.outputs["structured"]["peer_target"], "claude")
+        self.assertNotIn("worker_target", result.outputs["structured"])
+        self.assertTrue(result.outputs["agent_session_id"].startswith("session_"))
+        self.assertEqual(result.outputs["agent_session_trace"]["step_id"], "agent_package_generator")
+        self.assertEqual(result.outputs["agent_session_trace"]["state"]["status"], "succeeded")
+
+    def test_acceptance_protocol_generator_runs_through_agent_session(self):
+        """acceptance_protocol_generator 应通过 AgentSession 生成验收向量。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+        from app.workflows.spec_to_agent import AcceptanceProtocolGeneratorExecutor, build_spec_to_agent_definition
+
+        class AcceptanceLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(
+                    content='{"test_vectors":["Given a paid order, When refund is requested, Then ledger is reconciled"]}'
+                )
+
+        definition = build_spec_to_agent_definition()
+        context = TaskContext(
+            task_id="task_acceptance_protocol",
+            task_type="spec_to_agent",
+            username="alice",
+            title="Acceptance",
+            goal="Generate acceptance",
+        )
+        context.step_outputs["machine_spec_compiler"] = {
+            "structured": {"primary_requirement": "Refund flow", "source_of_truth": "machine_spec"}
+        }
+        task = Task(definition=definition, context=context)
+        step = WorkflowStep(id="acceptance_protocol_generator", type="agent", title="Acceptance", role="Compiler")
+
+        result = AcceptanceProtocolGeneratorExecutor(llm=AcceptanceLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "succeeded")
+        self.assertEqual(result.outputs["structured"]["test_vectors"][0], "Given a paid order, When refund is requested, Then ledger is reconciled")
+        self.assertTrue(result.outputs["agent_session_id"].startswith("session_"))
+        self.assertEqual(result.outputs["agent_session_trace"]["step_id"], "acceptance_protocol_generator")
+        self.assertEqual(result.outputs["agent_session_trace"]["state"]["status"], "succeeded")
+
+    def test_acceptance_protocol_generator_blocks_when_json_invalid(self):
+        """acceptance_protocol_generator 不能在模型失败时用 fallback 向量假装成功。"""
+        from app.core.task import Task, WorkflowStep
+        from app.core.context import TaskContext
+        from app.core.ports import LLMResult
+        from app.workflows.spec_to_agent import AcceptanceProtocolGeneratorExecutor, build_spec_to_agent_definition
+
+        class InvalidJsonLLM:
+            def invoke(self, role, prompt, context):
+                return LLMResult(content="not json")
+
+        definition = build_spec_to_agent_definition()
+        context = TaskContext(
+            task_id="task_acceptance_protocol_bad",
+            task_type="spec_to_agent",
+            username="alice",
+            title="Acceptance",
+            goal="Generate acceptance",
+        )
+        context.step_outputs["machine_spec_compiler"] = {
+            "structured": {"primary_requirement": "Refund flow", "source_of_truth": "machine_spec"}
+        }
+        task = Task(definition=definition, context=context)
+        step = WorkflowStep(id="acceptance_protocol_generator", type="agent", title="Acceptance", role="Compiler")
+
+        result = AcceptanceProtocolGeneratorExecutor(llm=InvalidJsonLLM()).run(task, step)
+
+        self.assertEqual(result.status.value, "blocked")
+        self.assertIsNotNone(result.error)
+        self.assertEqual(result.error.code, "workflow.acceptance_protocol_generator_blocked")
+        self.assertTrue(result.outputs["structured"].get("degraded"))
 
     def test_human_decision_gate_executor(self):
         """验证 HumanDecisionGateExecutor 在无阻塞或模拟情况下能够正确做出放行（Pass）决策。"""

@@ -110,8 +110,8 @@ class OpenAILLM:
         goal = context.get("goal") or "无特定目标"
         
         role_map = {
-            "compiler": "规范编译器 (Compiler)，负责将非结构化的业务意图进行标准化术语解析、AST抽象语法树生成，并生成下游 Worker 可执行的任务包与验收协议。",
-            "reviewer": "验收评审器 (Reviewer)，负责对比需求规格，对下游 Worker 提交的代码与产物进行需求覆盖度、变更影响及安全审计，确保交付质量与规格契约一致。",
+            "compiler": "规范编译器 (Compiler)，负责将非结构化的业务意图进行标准化术语解析、AST抽象语法树生成，并生成 AI 技术同事可执行的任务包与验收协议。",
+            "reviewer": "验收评审器 (Reviewer)，负责对比需求规格，对 AI 技术同事提交的代码与产物进行需求覆盖度、变更影响及安全审计，确保交付质量与规格契约一致。",
             "writer": "产物写入器 (Writer)，负责将编译或评审结论，按标准格式写入最终的交付资产（如 machine_spec、human_brief 或 review_result 等）。"
         }
         role_desc = role_map.get(role.lower(), f"专业协作角色: {role}")
@@ -260,6 +260,103 @@ class OpenAILLM:
         except Exception as e:
             error_msg = f"LLM 调用失败: {str(e)}"
             return LLMResult(content=error_msg, structured={"role": role, "error": str(e), "model": model})
+
+    def invoke_with_tools(
+        self,
+        role: str,
+        prompt: str,
+        context: Dict[str, Any],
+        tools: List[Dict[str, Any]],
+        tool_messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> LLMResult:
+        """执行 OpenAI-compatible provider-native tool calling 请求。
+
+        返回值的 structured.tool_calls 保留 provider 原生 tool call 结构，具体工具执行仍由
+        AgentRuntime -> ToolService -> ToolPolicy 完成。
+        """
+        model = context.get("model") or "gpt-5.4"
+        title = context.get("title") or "未命名任务"
+        goal = context.get("goal") or "无特定目标"
+        system_prompt, messages, _ = self._build_prompts(role, prompt, context, is_stream=False)
+
+        for tool_message in tool_messages or []:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_message.get("tool_call_id"),
+                    "name": tool_message.get("name"),
+                    "content": tool_message.get("content", ""),
+                }
+            )
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        data: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+        }
+        if tools:
+            data["tools"] = tools
+            data["tool_choice"] = "auto"
+
+        url = f"{self.base_url}/chat/completions"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                result = json.loads(response.read().decode("utf-8"))
+                message = result["choices"][0]["message"]
+                content = message.get("content") or ""
+                return LLMResult(
+                    content=content,
+                    structured={
+                        "role": role,
+                        "title": title,
+                        "goal": goal,
+                        "model": model,
+                        "provider_format": "chat.tools",
+                        "tool_calls": message.get("tool_calls") or [],
+                    },
+                )
+        except urllib.error.HTTPError as e:
+            try:
+                error_body = e.read().decode("utf-8")
+                error_json = json.loads(error_body)
+                error_msg = error_json.get("error", {}).get("message") or error_body
+            except Exception:
+                error_msg = str(e)
+
+            # 不是所有兼容网关都支持 tools；此处明确降级到 JSON tool_calls 协议，而不是假装原生成功。
+            if tools and ("tool" in error_msg.lower() or "不支持" in error_msg or "unsupported" in error_msg.lower()):
+                compatibility_prompt = (
+                    f"{prompt}\n\n"
+                    "The current provider rejected native tool calling. If you need a tool, return raw JSON only:\n"
+                    "{\"tool_calls\":[{\"tool_name\":\"knowledge.retrieve\",\"arguments\":{\"query\":\"...\"}}]}\n"
+                    "If no tool is needed, return the final raw JSON output."
+                )
+                fallback = self.invoke(role, compatibility_prompt, context)
+                fallback.structured["provider_format"] = "json.tool_calls.compat"
+                fallback.structured["native_tool_calling_degraded"] = True
+                fallback.structured["native_tool_calling_error"] = error_msg
+                return fallback
+
+            return LLMResult(
+                content=f"LLM tool calling failed: {error_msg}",
+                structured={"role": role, "error": error_msg, "model": model, "provider_format": "chat.tools"},
+            )
+        except Exception as e:
+            return LLMResult(
+                content=f"LLM tool calling failed: {str(e)}",
+                structured={"role": role, "error": str(e), "model": model, "provider_format": "chat.tools"},
+            )
 
     def invoke_stream(self, role: str, prompt: str, context: Dict[str, Any], telemetry: Optional[TelemetryCallback] = None):
         """执行流式 (Server-Sent Events) LLM 请求的生成器。

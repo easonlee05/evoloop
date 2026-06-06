@@ -2,7 +2,7 @@
 
 该模块实现了 `ContextCompilerService`，负责将步骤执行中积累的动态上下文，
 渲染输出为系统所需的各种类型产物元数据与物理文档。它作为 2.0 遗留产物（如 PRD.md、模块操作手册）
-和 3.0 原资产物（如机器规范 machine_spec.yaml、人类简报 human_brief.md、下游执行包 agent_package_codex.md 等）的翻译与表达媒介。
+和 3.0 原资产物（如机器规范 machine_spec.yaml、人类简报 human_brief.md、AI 技术同事协作包 agent_package_codex.md 等）的翻译与表达媒介。
 """
 from __future__ import annotations
 
@@ -244,7 +244,7 @@ class ContextCompilerService:
         )
 
     def render_agent_package(self, task: Task) -> str:
-        """渲染生成供下游 AI Worker（如 Codex 等）执行的任务包描述（agent_package_codex.md）。
+        """渲染生成供 AI 技术同事（如 Codex 等）执行的任务包描述（agent_package_codex.md）。
 
         Args:
             task (Task): 任务对象。
@@ -253,7 +253,7 @@ class ContextCompilerService:
             str: 执行包文档内容。
         """
         return (
-            f"# Agent Package For Codex\n\n"
+            f"# Agent Package For AI Technical Peer\n\n"
             f"- Work ID: {task.task_id}\n"
             f"- Source of Truth: `machine_spec.yaml`\n"
             f"- Objective: {task.context.goal}\n"
@@ -295,7 +295,7 @@ class ContextCompilerService:
             f"# Review Checklist\n\n"
             f"- [ ] `machine_spec.yaml` reflects `{task.context.inputs.get('business_intent', task.context.goal)}`.\n"
             f"- [ ] `human_brief.md` is readable by stakeholders.\n"
-            f"- [ ] `agent_package_codex.md` is executable by downstream workers.\n"
+            f"- [ ] `agent_package_codex.md` is executable by AI technical peers.\n"
             f"- [ ] `acceptance.md` defines clear pass/fail checks.\n"
             f"- [ ] `traceability.json` anchors outputs back to `req_primary`.\n"
         )

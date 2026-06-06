@@ -36,6 +36,21 @@ class LLMPort(Protocol):
         """
         ...
 
+    def invoke_with_tools(
+        self,
+        role: str,
+        prompt: str,
+        context: Dict[str, Any],
+        tools: List[Dict[str, Any]],
+        tool_messages: List[Dict[str, Any]] | None = None,
+    ) -> LLMResult:
+        """调用支持 provider-native tool calling 的大语言模型。
+
+        该方法是 AgentSession 运行时的优先路径；不支持原生工具协议的实现可不提供，
+        AgentRuntime 会自动退回到普通 invoke() + JSON tool_calls 兼容协议。
+        """
+        ...
+
 
 class KnowledgePort(Protocol):
     """知识库/检索服务端口协议，定义了内核向外部知识底座查询信息的抽象接口。"""

@@ -70,6 +70,10 @@ class WorkItem(FilePersistenceMixin):
     status: WorkStatus = WorkStatus.CREATED
     work_id: str = field(default_factory=lambda: f"work_{uuid4().hex[:12]}")
     current_decision_gate_id: Optional[str] = None
+    iteration: int = 0
+    parent_work_id: Optional[str] = None
+    review_cycle_id: Optional[str] = None
+    max_review_iterations: int = 2
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -110,9 +114,12 @@ class WorkItem(FilePersistenceMixin):
             artifact_graph_ref=data["artifact_graph_ref"],
             status=WorkStatus(data.get("status", WorkStatus.CREATED.value)),
             current_decision_gate_id=data.get("current_decision_gate_id"),
+            iteration=int(data.get("iteration", 0)),
+            parent_work_id=data.get("parent_work_id"),
+            review_cycle_id=data.get("review_cycle_id"),
+            max_review_iterations=int(data.get("max_review_iterations", 2)),
             created_at=data.get("created_at", utc_now_iso()),
             updated_at=data.get("updated_at", utc_now_iso()),
             metadata=dict(data.get("metadata", {})),
         )
-
 

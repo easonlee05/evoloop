@@ -35,6 +35,35 @@ class FakeLLM:
         Returns:
             LLMResult: 模拟的 LLM 响应结果。
         """
+        if "Evaluate Requirement Coverage" in prompt:
+            req_ids = context.get("req_ids") or ["req_default"]
+            payload = {
+                req_id: {"covered": True, "notes": "Verified by FakeLLM", "evidence_refs": []}
+                for req_id in req_ids
+            }
+            return LLMResult(content=json.dumps(payload), structured=payload)
+        if "Output JSON: {\"issues\": [], \"fix_tasks\": []}" in prompt:
+            payload = {"issues": [], "fix_tasks": []}
+            return LLMResult(content=json.dumps(payload), structured=payload)
+        if "structural AST" in prompt and "primary_requirement" in prompt:
+            requirement = context.get("pre_compiled_data", "").splitlines()[0].replace("INTENT:", "").strip()
+            payload = {
+                "primary_requirement": requirement or "未命名任务",
+                "dependencies": ["system"],
+                "strict_contracts": ["编译结果必须可追溯到原始意图"],
+                "environment": {"os_target": "linux", "node_version": "20.x"},
+                "security": {"require_auth": True},
+            }
+            return LLMResult(content=json.dumps(payload, ensure_ascii=False), structured=payload)
+        if "OpenQuestionIdentifier" in prompt and "has_questions" in prompt:
+            payload = {"has_questions": False, "questions": [], "diagnostic_matrix_runs": 1}
+            return LLMResult(content=json.dumps(payload, ensure_ascii=False), structured=payload)
+        if "select the most appropriate peer AI technical colleague" in prompt:
+            payload = {"peer_target": "codex"}
+            return LLMResult(content=json.dumps(payload), structured=payload)
+        if "Generate Behavior-Driven Development" in prompt:
+            payload = {"test_vectors": ["Given the compiled requirement, When implementation is reviewed, Then acceptance criteria are satisfied"]}
+            return LLMResult(content=json.dumps(payload), structured=payload)
         if role == "Reviewer":
             return LLMResult(content="PASS", structured={"role": role})
         title = context.get("title") or context.get("feature") or context.get("module_name") or "未命名任务"

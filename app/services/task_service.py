@@ -18,6 +18,7 @@ from app.core.playbook import (
 from app.core.artifact_graph import (
     ArtifactGraph, ArtifactNode, ArtifactNodeType, ArtifactEdge, ArtifactEdgeType, ArtifactRef
 )
+from app.services.peer_adapter_service import PeerAdapterService
 
 
 class TaskService:
@@ -37,17 +38,25 @@ class TaskService:
         "legacy_prd": "legacy_prd",
     }
 
-    def __init__(self, registry: Dict[str, TaskDefinition], engine: Any, storage: Any):
+    def __init__(
+        self,
+        registry: Dict[str, TaskDefinition],
+        engine: Any,
+        storage: Any,
+        peer_adapter: Any | None = None,
+    ):
         """初始化任务服务。
 
         Args:
             registry: 任务定义的注册表，映射任务类型到具体 TaskDefinition。
             engine: 工作流引擎实例，用于执行和恢复任务。
             storage: 持久化存储层实例，支持加载/保存 TaskContext 与 Task 实例，附加事件等。
+            peer_adapter: AI 技术同事协作适配服务；未提供时使用空注册表实例。
         """
         self.registry = registry
         self.engine = engine
         self.storage = storage
+        self.peer_adapter = peer_adapter or PeerAdapterService()
         self._running_tasks = set()
 
     def create_task(self, task_type: str, payload: Dict[str, Any]) -> Task:
@@ -223,6 +232,407 @@ class TaskService:
         """
         return self.storage.load_task(task_id, self.registry)
 
+    def fork_repair_work_item(self, review_task_id: str, review_result: Dict[str, Any]) -> Task:
+        """从未通过的 Acceptance Review 派生下一轮修复 WorkItem。
+
+        该方法只负责有界 fork，不自动执行修复或复审，避免无限自修复。
+        """
+        parent = self.storage.load_task(review_task_id, self.registry)
+        current_iteration = int(parent.context.inputs.get("iteration", 0))
+        max_iterations = int(parent.context.inputs.get("max_review_iterations", 2))
+        review_cycle_id = parent.context.inputs.get("review_cycle_id") or f"review_cycle_{parent.task_id}"
+        fix_tasks = list(review_result.get("fix_tasks") or [])
+
+        if current_iteration >= max_iterations:
+            self.storage.append_event(
+                Event(
+                    task_id=parent.task_id,
+                    type="review.redo.max_iterations_reached",
+                    status="blocked",
+                    payload={
+                        "iteration": current_iteration,
+                        "max_review_iterations": max_iterations,
+                        "review_cycle_id": review_cycle_id,
+                        "verdict": review_result.get("verdict"),
+                    },
+                )
+            )
+            raise ValueError("max_review_iterations_reached")
+        if not fix_tasks:
+            raise ValueError("repair fork requires at least one fix task")
+
+        repair_payload = {
+            "username": parent.context.username,
+            "business_intent": self._repair_business_intent(parent, fix_tasks),
+            "title": f"Repair iteration {current_iteration + 1}: {parent.context.title}",
+            "goal": "Apply Acceptance Review fix tasks while preserving machine_spec and acceptance_protocol.",
+            "parent_work_id": parent.task_id,
+            "iteration": current_iteration + 1,
+            "review_cycle_id": review_cycle_id,
+            "max_review_iterations": max_iterations,
+            "fix_tasks": fix_tasks,
+            "machine_spec": parent.context.inputs.get("machine_spec", ""),
+            "acceptance_protocol": parent.context.inputs.get("acceptance_protocol", ""),
+            "machine_spec_ref": parent.context.inputs.get("machine_spec_ref", ""),
+            "acceptance_protocol_ref": parent.context.inputs.get("acceptance_protocol_ref", ""),
+        }
+        repair_task = self.create_task("spec_to_agent", repair_payload)
+        self.storage.append_event(
+            Event(
+                task_id=parent.task_id,
+                type="review.redo.forked",
+                status="created",
+                payload={
+                    "parent_work_id": parent.task_id,
+                    "repair_work_id": repair_task.task_id,
+                    "review_cycle_id": review_cycle_id,
+                    "iteration": current_iteration + 1,
+                    "max_review_iterations": max_iterations,
+                    "fix_task_count": len(fix_tasks),
+                },
+            )
+        )
+        return repair_task
+
+    def handle_review_result(self, review_task_id: str) -> Optional[Task]:
+        """处理 Acceptance Review 结果，并在需要修复时 fork 下一轮修复任务。"""
+        task = self.storage.load_task(review_task_id, self.registry)
+        review_result = task.context.step_outputs.get("review_result_compiler", {}).get("review_result", {})
+        verdict = review_result.get("verdict")
+
+        if verdict == "pass":
+            self.storage.append_event(
+                Event(
+                    task_id=task.task_id,
+                    type="review.redo.not_needed",
+                    status="completed",
+                    payload={"verdict": verdict},
+                )
+            )
+            return None
+
+        if verdict in {"changes_required", "blocked"}:
+            repair_task = self.fork_repair_work_item(task.task_id, review_result)
+            task = self.storage.load_task(review_task_id, self.registry)
+            task.context.inputs["latest_repair_work_id"] = repair_task.task_id
+            task.context.inputs["review_cycle_id"] = task.context.inputs.get("review_cycle_id") or f"review_cycle_{task.task_id}"
+            self.storage.save_context(task.context)
+            self.storage.save_task(task)
+            return repair_task
+
+        raise ValueError(f"unsupported review verdict for redo handling: {verdict}")
+
+    def create_followup_acceptance_review(self, repair_task_id: str) -> Task:
+        """在修复任务完成后，创建下一轮 acceptance_review 任务。"""
+        repair_task = self.storage.load_task(repair_task_id, self.registry)
+        delivery_bundle = dict(repair_task.context.inputs.get("delivery_bundle") or {})
+        machine_spec = repair_task.context.inputs.get("machine_spec", "")
+        acceptance_protocol = repair_task.context.inputs.get("acceptance_protocol", "")
+
+        if not machine_spec or not acceptance_protocol:
+            raise ValueError("followup acceptance review requires machine_spec and acceptance_protocol")
+
+        payload = {
+            "username": repair_task.context.username,
+            "machine_spec": machine_spec,
+            "acceptance_protocol": acceptance_protocol,
+            "implementation_summary": delivery_bundle.get("implementation_summary") or repair_task.context.goal,
+            "diff": delivery_bundle.get("diff") or "",
+            "machine_spec_ref": repair_task.context.inputs.get("machine_spec_ref", ""),
+            "acceptance_protocol_ref": repair_task.context.inputs.get("acceptance_protocol_ref", ""),
+            "parent_work_id": repair_task.task_id,
+            "iteration": int(repair_task.context.inputs.get("iteration", 0)),
+            "review_cycle_id": repair_task.context.inputs.get("review_cycle_id"),
+            "max_review_iterations": int(repair_task.context.inputs.get("max_review_iterations", 2)),
+        }
+        followup = self.create_task("acceptance_review", payload)
+        self.storage.append_event(
+            Event(
+                task_id=repair_task.task_id,
+                type="review.followup.created",
+                status="created",
+                payload={
+                    "repair_work_id": repair_task.task_id,
+                    "review_work_id": followup.task_id,
+                    "review_cycle_id": repair_task.context.inputs.get("review_cycle_id"),
+                    "iteration": int(repair_task.context.inputs.get("iteration", 0)),
+                },
+            )
+        )
+        return followup
+
+    def handle_repair_completion(self, repair_task_id: str) -> Task:
+        """在修复任务完成后自动回流下一轮复审，并按评审结论决定是否继续有界 redo。
+
+        控制面在这一层只负责有界再入：
+        1. 校验 repair task 已处于 COMPLETED。
+        2. 创建 follow-up acceptance_review 任务。
+        3. 记录 repair -> review 的审计事件并立即运行 follow-up review。
+        4. 若 follow-up review 仍未通过，则继续复用 review gate 逻辑 fork 下一轮 repair。
+
+        Args:
+            repair_task_id: 已完成修复任务的任务 ID。
+
+        Returns:
+            Task: 已实际运行过的 follow-up acceptance_review 任务。
+
+        Raises:
+            ValueError: 当修复任务尚未完成，或缺少 follow-up review 所需输入时。
+        """
+        repair_task = self.storage.load_task(repair_task_id, self.registry)
+        if repair_task.status != TaskStatus.COMPLETED:
+            raise ValueError("repair task must be completed before followup review")
+
+        followup = self.create_followup_acceptance_review(repair_task.task_id)
+
+        repair_task = self.storage.load_task(repair_task_id, self.registry)
+        repair_task.context.inputs["latest_followup_review_id"] = followup.task_id
+        self.storage.save_context(repair_task.context)
+        self.storage.save_task(repair_task)
+        self.storage.append_event(
+            Event(
+                task_id=repair_task.task_id,
+                type="review.followup.run.started",
+                status="running",
+                payload={
+                    "repair_work_id": repair_task.task_id,
+                    "review_work_id": followup.task_id,
+                    "review_cycle_id": repair_task.context.inputs.get("review_cycle_id"),
+                    "iteration": int(repair_task.context.inputs.get("iteration", 0)),
+                },
+            )
+        )
+
+        completed_review = self.run_task(followup.task_id)
+        next_repair_task = None
+        if completed_review.status == TaskStatus.COMPLETED:
+            next_repair_task = self.handle_review_result(completed_review.task_id)
+
+        self.storage.append_event(
+            Event(
+                task_id=repair_task.task_id,
+                type="review.followup.run.completed",
+                status=completed_review.status.value,
+                payload={
+                    "repair_work_id": repair_task.task_id,
+                    "review_work_id": completed_review.task_id,
+                    "review_cycle_id": repair_task.context.inputs.get("review_cycle_id"),
+                    "iteration": int(repair_task.context.inputs.get("iteration", 0)),
+                    "review_status": completed_review.status.value,
+                    "next_repair_work_id": next_repair_task.task_id if next_repair_task else None,
+                },
+            )
+        )
+        return self.storage.load_task(completed_review.task_id, self.registry)
+
+    def record_peer_delivery_bundle(self, task_id: str, peer_result: Dict[str, Any]) -> Dict[str, Any]:
+        """将 AI 技术同事返回的结构化 result bundle 写回控制面上下文。
+
+        该入口用于替代手工向 repair task 输入 `delivery_bundle` 的方式，
+        让后续 follow-up review 始终基于可审计的协作结果回传。
+
+        Args:
+            task_id: 接收协作结果的任务 ID。
+            peer_result: AI 技术同事返回的结构化结果字典。
+
+        Returns:
+            Dict[str, Any]: 归一化后的 delivery bundle。
+
+        Raises:
+            ValueError: 当结果中缺少 follow-up review 所需的最小字段时。
+        """
+        task = self.storage.load_task(task_id, self.registry)
+        incoming_bundle = dict(peer_result.get("delivery_bundle") or {})
+        implementation_summary = (
+            incoming_bundle.get("implementation_summary")
+            or peer_result.get("implementation_summary")
+            or peer_result.get("summary")
+            or ""
+        )
+        diff = incoming_bundle.get("diff")
+        if diff is None:
+            diff = peer_result.get("diff", "")
+        peer_target = (
+            incoming_bundle.get("peer_target")
+            or peer_result.get("peer_target")
+            or peer_result.get("target")
+            or task.context.inputs.get("peer_target")
+            or ""
+        )
+        artifacts = incoming_bundle.get("artifacts") or peer_result.get("artifacts") or []
+
+        if not implementation_summary:
+            raise ValueError("peer delivery bundle requires implementation_summary")
+        if diff is None:
+            raise ValueError("peer delivery bundle requires diff")
+
+        delivery_bundle = {
+            "implementation_summary": implementation_summary,
+            "diff": diff,
+            "peer_target": peer_target,
+            "artifacts": artifacts,
+        }
+        task.context.inputs["delivery_bundle"] = delivery_bundle
+        task.context.inputs["latest_peer_result"] = dict(peer_result)
+        self.storage.save_context(task.context)
+        self.storage.append_event(
+            Event(
+                task_id=task.task_id,
+                type="peer.delivery_bundle.recorded",
+                status="succeeded",
+                payload={
+                    "peer_target": peer_target,
+                    "artifact_count": len(artifacts) if isinstance(artifacts, list) else 0,
+                    "has_diff": bool(diff),
+                },
+            )
+        )
+        return delivery_bundle
+
+    def complete_peer_collaboration(self, task_id: str, peer_result: Dict[str, Any]) -> Task:
+        """接收 AI 技术同事的执行结果并完成该协作任务。
+
+        对于普通协作任务，该方法会把 result bundle 写回并将任务标记为 completed。
+        对于 review loop 中的 repair task，该方法还会自动进入 follow-up review 闭环。
+
+        Args:
+            task_id: 接收协作结果的任务 ID。
+            peer_result: AI 技术同事返回的结构化结果字典。
+
+        Returns:
+            Task: 普通任务返回更新后的任务；repair task 返回自动运行后的 follow-up review 任务。
+        """
+        task = self.storage.load_task(task_id, self.registry)
+        delivery_bundle = self.record_peer_delivery_bundle(task_id, peer_result)
+        task = self.storage.load_task(task_id, self.registry)
+        task.status = TaskStatus.COMPLETED
+        self.storage.save_task(task)
+        self.storage.append_event(
+            Event(
+                task_id=task.task_id,
+                type="peer.collaboration.completed",
+                status=task.status.value,
+                payload={
+                    "peer_target": delivery_bundle.get("peer_target"),
+                    "has_diff": bool(delivery_bundle.get("diff")),
+                    "has_review_cycle": bool(task.context.inputs.get("review_cycle_id")),
+                },
+            )
+        )
+
+        if (
+            task.context.inputs.get("review_cycle_id")
+            and task.context.inputs.get("machine_spec")
+            and task.context.inputs.get("acceptance_protocol")
+        ):
+            return self.handle_repair_completion(task.task_id)
+        return self.storage.load_task(task.task_id, self.registry)
+
+    def start_peer_collaboration(self, task_id: str, peer_target: Optional[str] = None) -> Task:
+        """根据任务中的 `peer_target` 与 agent package 真实派发协作 handler。
+
+        该入口负责：
+        1. 从任务上下文解析目标 AI 技术同事。
+        2. 读取已写出的 `agent_package_codex.md` 产物文本。
+        3. 调用已注册的 PeerAdapter handler。
+        4. 将 handler 结果回收到 `delivery_bundle`，并沿用既有 review loop。
+
+        Args:
+            task_id: 待派发的任务 ID。
+            peer_target: 可选的显式目标覆盖值。
+
+        Returns:
+            Task: 普通任务返回完成后的任务；repair task 返回后续 follow-up review 任务。
+
+        Raises:
+            ValueError: 当目标缺失、任务包缺失或目标 handler 未注册时抛出。
+        """
+        task = self.storage.load_task(task_id, self.registry)
+        resolved_target = (
+            peer_target
+            or task.context.inputs.get("peer_target")
+            or task.context.step_outputs.get("agent_package_generator", {}).get("structured", {}).get("peer_target")
+            or task.context.step_outputs.get("agent_package_generator", {}).get("structured", {}).get("worker_target")
+        )
+        if not resolved_target:
+            self.storage.append_event(
+                Event(
+                    task_id=task.task_id,
+                    type="peer.collaboration.dispatch.failed",
+                    status="failed",
+                    payload={"reason": "missing_peer_target"},
+                )
+            )
+            raise ValueError("peer collaboration requires peer_target")
+
+        package_artifact = next((artifact for artifact in task.context.artifacts if artifact.name == "agent_package_codex.md"), None)
+        if not package_artifact:
+            self.storage.append_event(
+                Event(
+                    task_id=task.task_id,
+                    type="peer.collaboration.dispatch.failed",
+                    status="failed",
+                    payload={"reason": "missing_agent_package", "peer_target": resolved_target},
+                )
+            )
+            raise ValueError("peer collaboration requires agent_package_codex.md artifact")
+
+        package_text = self.storage.read_artifact(package_artifact.artifact_id).content or ""
+        self.storage.append_event(
+            Event(
+                task_id=task.task_id,
+                type="peer.collaboration.dispatch.started",
+                status="running",
+                payload={
+                    "peer_target": resolved_target,
+                    "artifact_id": package_artifact.artifact_id,
+                    "artifact_name": package_artifact.name,
+                },
+            )
+        )
+        try:
+            peer_result = self.peer_adapter.dispatch(task, package_text, resolved_target)
+        except Exception as exc:
+            self.storage.append_event(
+                Event(
+                    task_id=task.task_id,
+                    type="peer.collaboration.dispatch.failed",
+                    status="failed",
+                    payload={
+                        "peer_target": resolved_target,
+                        "error": str(exc),
+                    },
+                )
+            )
+            raise
+
+        self.storage.append_event(
+            Event(
+                task_id=task.task_id,
+                type="peer.collaboration.dispatch.completed",
+                status="succeeded",
+                payload={"peer_target": resolved_target},
+            )
+        )
+        return self.complete_peer_collaboration(task.task_id, peer_result)
+
+    @staticmethod
+    def _repair_business_intent(parent: Task, fix_tasks: list[dict[str, Any]]) -> str:
+        lines = [
+            "Apply the following Acceptance Review fix tasks as a repair iteration.",
+            "Preserve the existing machine_spec and acceptance_protocol as the source of truth.",
+        ]
+        for index, fix in enumerate(fix_tasks, start=1):
+            title = fix.get("title", "Untitled fix task")
+            priority = fix.get("priority", "high")
+            source_ids = ", ".join(fix.get("source_issue_ids", []))
+            lines.append(f"{index}. [{priority}] {title} (source issues: {source_ids})")
+        if parent.context.inputs.get("machine_spec"):
+            lines.append("\nMachine Spec Snapshot:\n" + str(parent.context.inputs.get("machine_spec"))[:2000])
+        if parent.context.inputs.get("acceptance_protocol"):
+            lines.append("\nAcceptance Protocol Snapshot:\n" + str(parent.context.inputs.get("acceptance_protocol"))[:2000])
+        return "\n".join(lines)
+
     def _validate_required(self, definition: TaskDefinition, payload: Dict[str, Any]) -> None:
         """验证 payload 是否提供了该任务定义所必需的入参。
 
@@ -294,6 +704,10 @@ class TaskService:
             artifact_graph_ref=f"graph_{task.task_id}",
             status=work_status,
             current_decision_gate_id=task.waiting_step_id,
+            iteration=int(task.context.inputs.get("iteration", 0)),
+            parent_work_id=task.context.inputs.get("parent_work_id"),
+            review_cycle_id=task.context.inputs.get("review_cycle_id"),
+            max_review_iterations=int(task.context.inputs.get("max_review_iterations", 2)),
             metadata={
                 "legacy_task_id": task.task_id,
                 "legacy_bridge": True,

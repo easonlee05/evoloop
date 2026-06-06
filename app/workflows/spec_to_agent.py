@@ -2,7 +2,7 @@
 
 该模块实现了 3.0 架构的控制面核心，旨在把非结构化的业务意图（Business Intent）
 通过三阶段编译器（Terminology Normalization -> LLM AST Gen -> AST Validation）
-编译为机器可读的单事实来源（machine_spec.yaml），并自动分派与生成下游 Agent 可执行的任务包（Agent Package）及 BDD 验收协议。
+编译为机器可读的单事实来源（machine_spec.yaml），并生成 AI 技术同事可执行的任务包（Agent Package）及 BDD 验收协议。
 """
 from __future__ import annotations
 
@@ -17,7 +17,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from app.core.errors import DomainError
+from app.core.session import AgentSession, AgentSessionStatus
 from app.core.task import StepResult, StepStatus, Task, TaskDefinition, WorkflowSpec, WorkflowStep
+from app.services.agent_runtime import AgentRuntime
 from app.workflows.policies import build_default_tool_policy
 
 logger = logging.getLogger(__name__)
@@ -205,7 +207,11 @@ def _invoke_llm_with_retry(
 
     if fallback is not None:
         logger.warning("Exhausted retries, returning safe fallback data.")
-        return f"Failed after {retries} retries. Reason: {last_error}", fallback
+        degraded_fallback = dict(fallback)
+        degraded_fallback["degraded"] = True
+        degraded_fallback["fallback_reason"] = str(last_error)
+        degraded_fallback["fallback_role"] = role
+        return f"Failed after {retries} retries. Reason: {last_error}", degraded_fallback
         
     raise DomainError(
         "workflow.llm_retry_exhausted",
@@ -467,41 +473,99 @@ class OpenQuestionIdentifierExecutor:
     step_type: str = "agent"
     step_id: str = "open_question_identifier"
 
-    def __init__(self, llm: Any = None):
+    def __init__(self, llm: Any = None, tool_service: Any = None):
         self.llm = llm
+        self.tool_service = tool_service
         self.diagnosers = [
             DomainModelDiagnoser(),
             StateTransitionDiagnoser(),
             NonFunctionalDiagnoser(),
         ]
 
+    def _build_prompt(self, intent: str, constraints: List[str]) -> str:
+        return (
+            "You are the OpenQuestionIdentifier for a digital product manager.\n"
+            "Analyze the business intent across domain model, state transitions, edge cases, and non-functional requirements.\n"
+            "Ask only questions that block a trustworthy machine_spec. Do not ask implementation-style questions.\n"
+            "Output STRICTLY in JSON format matching this schema:\n"
+            "{\n"
+            '  "has_questions": true,\n'
+            '  "questions": ["Question 1"],\n'
+            '  "diagnostic_matrix_runs": 1\n'
+            "}\n\n"
+            f"INTENT:\n{intent}\n\n"
+            f"CONSTRAINTS:\n{json.dumps(constraints, ensure_ascii=False)}"
+        )
+
     def run(self, task: Task, step: WorkflowStep, *, run_id: Optional[str] = None, is_parallel: bool = False, llm: Any = None) -> StepResult:
         active_llm = llm or self.llm
         inputs = _spec_inputs(task)
         intent = inputs["normalized_intent"]
-        
-        fallback = {"has_questions": False, "questions": []}
-        all_q_lists = []
-        
-        # 顺序执行多维诊断矩阵并合并提问
-        for diag in self.diagnosers:
-            res = diag.analyze(intent, active_llm, fallback)
-            all_q_lists.append(res.get("questions", []))
-        
-        merged_questions = DeduplicationEngine.deduplicate(all_q_lists)
-        has_questions = len(merged_questions) > 0
-            
+
+        session = AgentSession(
+            task_id=task.task_id,
+            step_id=step.id,
+            agent_role=step.role or "Compiler",
+            goal="Identify only the open product questions that block a trustworthy machine_spec.",
+            input_context={
+                "normalized_intent": intent,
+                "constraints": inputs["constraints"],
+                "task_definition": task.definition,
+                "task_context": task.context,
+            },
+            max_iterations=3,
+        )
+        run_result = AgentRuntime(llm=active_llm, tool_service=self.tool_service).run_json_session(
+            session=session,
+            prompt=self._build_prompt(intent, inputs["constraints"]),
+            context={"intent": intent, "constraints": inputs["constraints"]},
+            required_keys=["has_questions", "questions"],
+            task_definition=task.definition,
+            task_context=task.context,
+        )
+
+        trace = session.to_trace()
+        if run_result.status == AgentSessionStatus.BLOCKED or run_result.structured.get("degraded"):
+            structured = dict(run_result.structured)
+            structured["fallback_reason"] = structured.get("fallback_reason") or (run_result.error.message if run_result.error else "AgentSession blocked")
+            return StepResult(
+                step.id,
+                StepStatus.BLOCKED,
+                "Open question identifier AgentSession blocked before producing trustworthy ambiguity analysis.",
+                outputs={
+                    "content": run_result.content,
+                    "structured": structured,
+                    "agent_session_id": session.session_id,
+                    "agent_session_trace": trace,
+                },
+                error=DomainError(
+                    "workflow.open_question_identifier_blocked",
+                    "Open question identifier exhausted AgentSession retries and refused to emit fake no-questions success.",
+                    {"step_id": step.id, "agent_runtime_error": run_result.error.to_dict() if run_result.error else None},
+                ),
+            )
+
+        raw_questions = run_result.structured.get("questions", [])
+        if not isinstance(raw_questions, list):
+            raw_questions = []
+        merged_questions = DeduplicationEngine.deduplicate([raw_questions])
+        has_questions = bool(run_result.structured.get("has_questions")) or len(merged_questions) > 0
         safe_structured = {
             "has_questions": has_questions,
             "questions": merged_questions,
-            "diagnostic_matrix_runs": len(self.diagnosers)
+            "diagnostic_matrix_runs": int(run_result.structured.get("diagnostic_matrix_runs") or 1),
         }
         
         return StepResult(
             step.id,
             StepStatus.SUCCEEDED,
-            "Matrix ambiguity analysis complete.",
-            outputs={"content": "Matrix analysis complete", "structured": safe_structured},
+            "AgentSession ambiguity analysis complete.",
+            outputs={
+                "content": run_result.content,
+                "structured": safe_structured,
+                "agent_session_id": session.session_id,
+                "agent_session_trace": trace,
+            },
         )
 
 
@@ -580,15 +644,16 @@ class MachineSpecCompilerExecutor:
     step_type: str = "agent"
     step_id: str = "machine_spec_compiler"
 
-    def __init__(self, llm: Any = None):
+    def __init__(self, llm: Any = None, tool_service: Any = None):
         self.llm = llm
+        self.tool_service = tool_service
 
     def _pre_compile(self, intent: str, constraints: List[str]) -> str:
         """第一阶段: 整合归一化文本。"""
         return f"INTENT: {intent}\nCONSTRAINTS: {'; '.join(constraints)}"
 
-    def _main_compile(self, pre_compiled: str, active_llm: Any) -> Tuple[str, Dict]:
-        """第二阶段: 调用大模型编译 AST 的 JSON 结构。"""
+    def _main_compile(self, pre_compiled: str, active_llm: Any, session: AgentSession) -> Any:
+        """第二阶段: 通过 AgentRuntime 编译 AST 的 JSON 结构。"""
         prompt = (
             "You are the MachineSpecCompiler. You must compile the given input into a structural AST.\n"
             "Output STRICTLY in JSON format matching this schema:\n"
@@ -600,24 +665,14 @@ class MachineSpecCompilerExecutor:
             '  "security": {"require_auth": true}\n'
             "}"
         )
-        
-        fallback = {
-            "primary_requirement": "Fallback requirement",
-            "dependencies": ["system"],
-            "strict_contracts": ["Fallback contract"],
-            "environment": {"os_target": "linux", "node_version": "20.x"},
-            "security": {"require_auth": True}
-        }
-        
-        content, structured = _invoke_llm_with_retry(
-            llm=active_llm,
-            role="Compiler",
+        return AgentRuntime(llm=active_llm, tool_service=self.tool_service).run_json_session(
+            session=session,
             prompt=prompt,
             context={"pre_compiled_data": pre_compiled},
-            retries=3,
-            fallback=fallback,
+            required_keys=["primary_requirement", "dependencies", "strict_contracts", "environment", "security"],
+            task_definition=session.input_context.get("task_definition"),
+            task_context=session.input_context.get("task_context"),
         )
-        return content, structured
 
     def _post_compile(self, ast_dict: Dict, default_intent: str) -> Dict:
         """第三阶段: 转换校验为正式的 AST 并进行后置填充。"""
@@ -631,25 +686,55 @@ class MachineSpecCompilerExecutor:
         active_llm = llm or self.llm
         inputs = _spec_inputs(task)
         
-        # 依次通过三阶段管道编译 AST
+        # 依次通过三阶段管道编译 AST；主编译阶段由 AgentRuntime 执行 bounded session。
         pre_compiled = self._pre_compile(inputs["normalized_intent"], inputs["constraints"])
-        content, raw_ast = self._main_compile(pre_compiled, active_llm)
+        session = AgentSession(
+            task_id=task.task_id,
+            step_id=step.id,
+            agent_role=step.role or "Compiler",
+            goal="Compile normalized product intent into Evoloop Machine Spec AST.",
+            input_context={
+                "pre_compiled_data": pre_compiled,
+                "normalized_intent": inputs["normalized_intent"],
+                "task_definition": task.definition,
+                "task_context": task.context,
+            },
+            max_iterations=3,
+        )
+        run_result = self._main_compile(pre_compiled, active_llm, session)
+        content = run_result.content
+        raw_ast = run_result.structured
+        trace = session.to_trace()
+
+        if run_result.status == AgentSessionStatus.BLOCKED or raw_ast.get("degraded"):
+            raw_ast["fallback_reason"] = raw_ast.get("fallback_reason") or (run_result.error.message if run_result.error else "AgentSession blocked")
+            return StepResult(
+                step.id,
+                StepStatus.BLOCKED,
+                "Machine Spec compiler AgentSession blocked before producing a trustworthy source-of-truth artifact.",
+                outputs={"content": content, "structured": raw_ast, "agent_session_id": session.session_id, "agent_session_trace": trace},
+                error=DomainError(
+                    "workflow.llm_degraded_fallback",
+                    "Machine Spec compiler exhausted AgentSession retries and refused to emit a fallback source-of-truth artifact.",
+                    {"step_id": step.id, "agent_runtime_error": run_result.error.to_dict() if run_result.error else None},
+                ),
+            )
         final_ast = self._post_compile(raw_ast, inputs["normalized_intent"])
         
         return StepResult(
             step.id,
             StepStatus.SUCCEEDED,
-            "Machine Spec successfully compiled through the 3-stage pipeline.",
-            outputs={"content": content, "structured": final_ast},
+            "Machine Spec successfully compiled through AgentSession.",
+            outputs={"content": content, "structured": final_ast, "agent_session_id": session.session_id, "agent_session_trace": trace},
         )
 
 
 # ==============================================================================
-# 7. 下游 Agent 交付分包 (方言适配策略与 BDD 协议生成)
+# 7. AI 技术同事交付分包 (方言适配策略与 BDD 协议生成)
 # ==============================================================================
 
 class DialectStrategy(ABC):
-    """方言适配策略抽象基类。用于根据下游不同 AI 执行者适配专有的 prompt 和命令配置。"""
+    """方言适配策略抽象基类。用于根据不同 AI 技术同事适配专有的 prompt 和命令配置。"""
 
     @abstractmethod
     def get_system_prompt(self, spec: Dict) -> str:
@@ -661,14 +746,14 @@ class DialectStrategy(ABC):
 
 
 class CodexDialect(DialectStrategy):
-    """面向底层后台自动化编写者 Codex 的方言适配。"""
+    """面向工程实现同事 Codex 的方言适配。"""
 
     def get_system_prompt(self, spec: Dict) -> str:
-        return "You are an autonomous Codex Worker. Write pythonic code avoiding side-effects."
+        return "You are Codex, an AI technical peer. Implement against the provided product contract without bypassing tests or tool policy."
         
     def generate_payload(self, spec: Dict) -> Dict:
         return {
-            "worker_target": "codex", 
+            "peer_target": "codex",
             "commands": ["npm run build", "pytest tests/"],
             "dialect_prompt": self.get_system_prompt(spec)
         }
@@ -678,11 +763,11 @@ class ClaudeDialect(DialectStrategy):
     """面向逻辑与重构专家 Claude Code 的方言适配。"""
 
     def get_system_prompt(self, spec: Dict) -> str:
-        return "You are Claude Engineer. Focus on readability and standard libraries."
+        return "You are Claude Code, an AI technical peer. Focus on readability, refactoring safety, and explicit review notes."
         
     def generate_payload(self, spec: Dict) -> Dict:
         return {
-            "worker_target": "claude", 
+            "peer_target": "claude",
             "commands": ["make all", "make test"],
             "dialect_prompt": self.get_system_prompt(spec)
         }
@@ -692,11 +777,11 @@ class CursorDialect(DialectStrategy):
     """面向本地 IDE 联调联创助手 Cursor 的方言适配。"""
 
     def get_system_prompt(self, spec: Dict) -> str:
-        return "You are an IDE Co-pilot. Suggest inline completions based on local context."
+        return "You are Cursor, an AI technical peer in the IDE. Coordinate local edits against the stable API/SSE contract."
         
     def generate_payload(self, spec: Dict) -> Dict:
         return {
-            "worker_target": "cursor", 
+            "peer_target": "cursor",
             "commands": ["yarn build"],
             "dialect_prompt": self.get_system_prompt(spec)
         }
@@ -711,8 +796,9 @@ class AgentPackageGeneratorExecutor:
     step_type: str = "agent"
     step_id: str = "agent_package_generator"
 
-    def __init__(self, llm: Any = None):
+    def __init__(self, llm: Any = None, tool_service: Any = None):
         self.llm = llm
+        self.tool_service = tool_service
         
     def _get_dialect(self, target: str) -> DialectStrategy:
         target = target.lower().strip()
@@ -725,28 +811,67 @@ class AgentPackageGeneratorExecutor:
         machine_spec = task.context.step_outputs.get("machine_spec_compiler", {}).get("structured", {})
         
         prompt = (
-            "Analyze the Machine Spec and select the most appropriate AI worker backend.\n"
-            "Choices: codex (for deep backend), claude (for logic/refactor), cursor (for frontend/inline).\n"
-            "Output JSON: {\"worker_target\": \"codex\"}"
+            "Analyze the Machine Spec and select the most appropriate peer AI technical colleague.\n"
+            "Choices: codex (implementation/build/test), claude (logic/refactor/review), cursor (IDE/frontend/inline).\n"
+            "Output STRICTLY JSON: {\"peer_target\": \"codex\"}"
         )
-        
-        content, structured = _invoke_llm_with_retry(
-            llm=active_llm,
-            role="Compiler",
+
+        session = AgentSession(
+            task_id=task.task_id,
+            step_id=step.id,
+            agent_role=step.role or "Compiler",
+            goal="Select the peer AI technical colleague and package the compiled machine spec for collaboration.",
+            input_context={
+                "machine_spec": machine_spec,
+                "task_definition": task.definition,
+                "task_context": task.context,
+            },
+            max_iterations=3,
+        )
+        run_result = AgentRuntime(llm=active_llm, tool_service=self.tool_service).run_json_session(
+            session=session,
             prompt=prompt,
             context={"machine_spec": machine_spec},
-            fallback={"worker_target": "codex"},
+            required_keys=["peer_target"],
+            task_definition=task.definition,
+            task_context=task.context,
         )
+
+        trace = session.to_trace()
+        if run_result.status == AgentSessionStatus.BLOCKED or run_result.structured.get("degraded"):
+            structured = dict(run_result.structured)
+            structured["fallback_reason"] = structured.get("fallback_reason") or (run_result.error.message if run_result.error else "AgentSession blocked")
+            return StepResult(
+                step.id,
+                StepStatus.BLOCKED,
+                "Agent package generator AgentSession blocked before selecting a trustworthy peer target.",
+                outputs={
+                    "content": run_result.content,
+                    "structured": structured,
+                    "agent_session_id": session.session_id,
+                    "agent_session_trace": trace,
+                },
+                error=DomainError(
+                    "workflow.agent_package_generator_blocked",
+                    "Agent package generator exhausted AgentSession retries and refused to emit fake peer package success.",
+                    {"step_id": step.id, "agent_runtime_error": run_result.error.to_dict() if run_result.error else None},
+                ),
+            )
         
-        target = structured.get("worker_target", "codex")
+        target = run_result.structured.get("peer_target") or run_result.structured.get("worker_target") or "codex"
         dialect = self._get_dialect(target)
         safe_structured = dialect.generate_payload(machine_spec)
         
         return StepResult(
             step.id,
             StepStatus.SUCCEEDED,
-            f"Agent package generated for dialect: {target}",
-            outputs={"content": content, "structured": safe_structured},
+            f"Agent package generated for peer target: {target}",
+            outputs={
+                "content": run_result.content,
+                "structured": safe_structured,
+                "agent_session_id": session.session_id,
+                "agent_session_trace": trace,
+            },
         )
 
 
@@ -759,8 +884,9 @@ class AcceptanceProtocolGeneratorExecutor:
     step_type: str = "agent"
     step_id: str = "acceptance_protocol_generator"
 
-    def __init__(self, llm: Any = None):
+    def __init__(self, llm: Any = None, tool_service: Any = None):
         self.llm = llm
+        self.tool_service = tool_service
 
     def run(self, task: Task, step: WorkflowStep, *, run_id: Optional[str] = None, is_parallel: bool = False, llm: Any = None) -> StepResult:
         active_llm = llm or self.llm
@@ -774,22 +900,52 @@ class AcceptanceProtocolGeneratorExecutor:
             '  "test_vectors": ["Given the user is logged in, When they click buy, Then the item is added to the cart"]\n'
             "}"
         )
-        
-        fallback = {
-            "test_vectors": ["Given system init, When task executes, Then expect success"],
-        }
-        
-        content, structured = _invoke_llm_with_retry(
-            llm=active_llm,
-            role="Compiler",
+
+        session = AgentSession(
+            task_id=task.task_id,
+            step_id=step.id,
+            agent_role=step.role or "Compiler",
+            goal="Generate acceptance protocol test vectors from the source-of-truth machine spec.",
+            input_context={
+                "machine_spec": machine_spec,
+                "task_definition": task.definition,
+                "task_context": task.context,
+            },
+            max_iterations=3,
+        )
+        run_result = AgentRuntime(llm=active_llm, tool_service=self.tool_service).run_json_session(
+            session=session,
             prompt=prompt,
             context={"machine_spec": machine_spec},
-            fallback=fallback,
+            required_keys=["test_vectors"],
+            task_definition=task.definition,
+            task_context=task.context,
         )
-        
-        vectors = structured.get("test_vectors", [])
+
+        trace = session.to_trace()
+        if run_result.status == AgentSessionStatus.BLOCKED or run_result.structured.get("degraded"):
+            structured = dict(run_result.structured)
+            structured["fallback_reason"] = structured.get("fallback_reason") or (run_result.error.message if run_result.error else "AgentSession blocked")
+            return StepResult(
+                step.id,
+                StepStatus.BLOCKED,
+                "Acceptance protocol generator AgentSession blocked before producing trustworthy test vectors.",
+                outputs={
+                    "content": run_result.content,
+                    "structured": structured,
+                    "agent_session_id": session.session_id,
+                    "agent_session_trace": trace,
+                },
+                error=DomainError(
+                    "workflow.acceptance_protocol_generator_blocked",
+                    "Acceptance protocol generator exhausted AgentSession retries and refused to emit fallback test vectors as success.",
+                    {"step_id": step.id, "agent_runtime_error": run_result.error.to_dict() if run_result.error else None},
+                ),
+            )
+
+        vectors = run_result.structured.get("test_vectors", [])
         if not isinstance(vectors, list) or len(vectors) == 0:
-            vectors = fallback["test_vectors"]
+            vectors = []
             
         # 强制性校验并前缀化 BDD 语法格式，确保格式合格
         validated_vectors = []
@@ -801,14 +957,20 @@ class AcceptanceProtocolGeneratorExecutor:
         
         safe_structured = {
             "test_vectors": validated_vectors,
-            "framework_target": "cucumber/pytest-bdd"
+            "framework_target": "cucumber/pytest-bdd",
+            "degraded": False,
         }
         
         return StepResult(
             step.id,
             StepStatus.SUCCEEDED,
             "Strict BDD Acceptance protocol generated.",
-            outputs={"content": "Generated", "structured": safe_structured},
+            outputs={
+                "content": run_result.content,
+                "structured": safe_structured,
+                "agent_session_id": session.session_id,
+                "agent_session_trace": trace,
+            },
         )
 
 
@@ -821,9 +983,9 @@ def context_normalizer_step(task: Task, step: WorkflowStep) -> StepResult:
     return ContextNormalizerExecutor().run(task, step)
 
 
-def open_question_identifier_step(task: Task, step: WorkflowStep, llm: Any = None) -> StepResult:
+def open_question_identifier_step(task: Task, step: WorkflowStep, llm: Any = None, tool_service: Any = None) -> StepResult:
     """多维需求歧义推演步骤回调包装。"""
-    return OpenQuestionIdentifierExecutor(llm=llm).run(task, step)
+    return OpenQuestionIdentifierExecutor(llm=llm, tool_service=tool_service).run(task, step)
 
 
 def human_decision_gate_step(task: Task, step: WorkflowStep) -> StepResult:
@@ -831,9 +993,19 @@ def human_decision_gate_step(task: Task, step: WorkflowStep) -> StepResult:
     return HumanDecisionGateExecutor().run(task, step)
 
 
-def machine_spec_compiler_step(task: Task, step: WorkflowStep, llm: Any = None) -> StepResult:
+def machine_spec_compiler_step(task: Task, step: WorkflowStep, llm: Any = None, tool_service: Any = None) -> StepResult:
     """三段式 AST 编译步骤回调包装。"""
-    return MachineSpecCompilerExecutor(llm=llm).run(task, step)
+    return MachineSpecCompilerExecutor(llm=llm, tool_service=tool_service).run(task, step)
+
+
+def agent_package_generator_step(task: Task, step: WorkflowStep, llm: Any = None, tool_service: Any = None) -> StepResult:
+    """AI 技术同事协作包生成步骤回调包装。"""
+    return AgentPackageGeneratorExecutor(llm=llm, tool_service=tool_service).run(task, step)
+
+
+def acceptance_protocol_generator_step(task: Task, step: WorkflowStep, llm: Any = None, tool_service: Any = None) -> StepResult:
+    """验收协议生成步骤回调包装。"""
+    return AcceptanceProtocolGeneratorExecutor(llm=llm, tool_service=tool_service).run(task, step)
 
 
 def build_spec_to_agent_definition(public_task_type: str = "spec_to_agent") -> TaskDefinition:
@@ -904,12 +1076,11 @@ def build_spec_to_agent_definition(public_task_type: str = "spec_to_agent") -> T
             "custom_agent_handlers": {
                 "open_question_identifier": open_question_identifier_step,
                 "machine_spec_compiler": machine_spec_compiler_step,
-                "agent_package_generator": lambda task, step, llm=None: AgentPackageGeneratorExecutor(llm=llm).run(task, step),
-                "acceptance_protocol_generator": lambda task, step, llm=None: AcceptanceProtocolGeneratorExecutor(llm=llm).run(task, step),
+                "agent_package_generator": agent_package_generator_step,
+                "acceptance_protocol_generator": acceptance_protocol_generator_step,
             },
             "custom_gate_handlers": {
                 "human_decision_gate": human_decision_gate_step,
             },
         },
     )
-

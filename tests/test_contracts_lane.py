@@ -56,6 +56,9 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(d["work_type"], "spec_to_agent")
         self.assertEqual(d["status"], "created")
         self.assertEqual(d["playbook_id"], "playbook_123")
+        self.assertEqual(d["iteration"], 0)
+        self.assertIsNone(d["parent_work_id"])
+        self.assertEqual(d["max_review_iterations"], 2)
 
         # 从字典反序列化还原
         item2 = WorkItem.from_dict(d)
@@ -63,6 +66,37 @@ class TestContractsLane(unittest.TestCase):
         self.assertEqual(item2.work_type, WorkType.SPEC_TO_AGENT)
         self.assertEqual(item2.title, "Test Work Item")
         self.assertEqual(item2.product_context_ref, "ctx_ref_001")
+        self.assertEqual(item2.iteration, 0)
+        self.assertIsNone(item2.parent_work_id)
+        self.assertEqual(item2.max_review_iterations, 2)
+
+    def test_work_item_review_iteration_fields_round_trip(self):
+        """WorkItem 应持久化有界 Review-Redo Loop 所需的迭代元数据。"""
+        item = WorkItem(
+            work_type=WorkType.ACCEPTANCE_REVIEW,
+            playbook_id="acceptance_review.compiler.pipeline.v3.enterprise",
+            title="Review Billing",
+            objective="Review implementation",
+            workspace_id="workspace_abc",
+            product_context_ref="ctx_ref_001",
+            artifact_graph_ref="graph_ref_001",
+            iteration=1,
+            parent_work_id="task_parent",
+            review_cycle_id="review_cycle_123",
+            max_review_iterations=3,
+        )
+
+        data = item.to_dict()
+        restored = WorkItem.from_dict(data)
+
+        self.assertEqual(data["iteration"], 1)
+        self.assertEqual(data["parent_work_id"], "task_parent")
+        self.assertEqual(data["review_cycle_id"], "review_cycle_123")
+        self.assertEqual(data["max_review_iterations"], 3)
+        self.assertEqual(restored.iteration, 1)
+        self.assertEqual(restored.parent_work_id, "task_parent")
+        self.assertEqual(restored.review_cycle_id, "review_cycle_123")
+        self.assertEqual(restored.max_review_iterations, 3)
 
     def test_playbook_serialization(self):
         """测试 Playbook 及其内部步骤 PlaybookStep 的序列化与反序列化。
@@ -1071,5 +1105,4 @@ class TestContractsLane(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 

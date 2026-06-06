@@ -289,6 +289,8 @@ class DelegatingStepExecutor:
                 kwargs["is_parallel"] = is_parallel
             if "llm" in signature.parameters and hasattr(self.callback, "__self__"):
                 kwargs["llm"] = getattr(self.callback.__self__, "llm", None)
+            if "tool_service" in signature.parameters and hasattr(self.callback, "__self__"):
+                kwargs["tool_service"] = getattr(self.callback.__self__, "tool_service", None)
             return custom_handler(task, step, **kwargs)
             
         # 否则，退回到调用默认的委托回调，并利用内省适配其所需的函数签名参数
@@ -357,16 +359,16 @@ class DefaultStepExecutorRegistryFactory:
             
             # spec_to_agent 剧本节点执行器
             ContextNormalizerExecutor(),
-            OpenQuestionIdentifierExecutor(llm=self.llm),
+            OpenQuestionIdentifierExecutor(llm=self.llm, tool_service=self.tool_service),
             HumanDecisionGateExecutor(),
-            MachineSpecCompilerExecutor(llm=self.llm),
-            AgentPackageGeneratorExecutor(llm=self.llm),
-            AcceptanceProtocolGeneratorExecutor(llm=self.llm),
+            MachineSpecCompilerExecutor(llm=self.llm, tool_service=self.tool_service),
+            AgentPackageGeneratorExecutor(llm=self.llm, tool_service=self.tool_service),
+            AcceptanceProtocolGeneratorExecutor(llm=self.llm, tool_service=self.tool_service),
             
             # acceptance_review 剧本节点执行器
             IngestAcceptanceContextExecutor(),
-            RequirementCoverageExecutor(llm=self.llm),
-            DiffImpactAnalyzerExecutor(llm=self.llm),
+            RequirementCoverageExecutor(llm=self.llm, tool_service=self.tool_service),
+            DiffImpactAnalyzerExecutor(llm=self.llm, tool_service=self.tool_service),
             ReviewResultCompilerExecutor(llm=self.llm),
             ReviewGateExecutor(),
         ]
@@ -401,4 +403,3 @@ class DefaultStepExecutorRegistryFactory:
         def run(task: Task, step: WorkflowStep, *, run_id: Optional[str] = None, is_parallel: bool = False) -> StepResult:
             return StepResult(step.id, StepStatus.FAILED, error=DomainError("workflow.executor_not_bound", f"No delegate bound for {step_type} step."))
         return run
-
