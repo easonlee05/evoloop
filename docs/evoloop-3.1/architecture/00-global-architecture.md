@@ -125,6 +125,12 @@ Knowledge & Storage Layer
 
 这两者都必须服从 `Playbook 控流程、AgentSession 控推理、ToolPolicy 控权限、Acceptance Review 控闭环` 的主结构，不能反向长出第二套自治树。
 
+当前实现边界也需要明确：
+
+- `session_helper` 默认只允许只读工具，不允许直接写 artifact、执行外部命令或继续派生新的 helper/subtask。
+- `formal_subtask` 当前只在 `acceptance_review -> fix_tasks -> repair` 这一类天然可 join 的子包场景启用。
+- 不确定是否适合并行时，一律退回串行；治理问题返回 `denied`，而不是伪装成 `failed`。
+
 ### 4.3 State & Memory Layer
 
 3.1 明确区分四种状态：
@@ -143,6 +149,11 @@ Knowledge & Storage Layer
 - `session_helper` trace 进入父 `AgentSessionState.helper_runs`，但不进入正式任务树。
 - `formal_subtask` 进入正式 `Task` / `WorkItem` 持久化体系，并保留 `parent_task_id`、`root_task_id`、`subtask_type` 和 `join_step_id`。
 - 两类 subagent 都不能获得未裁剪的父上下文全文。
+
+当前 rollout 的可观测实现是：
+
+- `open_question_identifier`、`machine_spec_compiler`、`requirement_coverage`、`diff_impact_analyzer` 语义审查分支可在显式打开 `enable_subagents` 时记录 helper trace。
+- `formal_subtask` 的 join 结果会回写父任务 `delivery_bundle`，再进入 follow-up acceptance review。
 
 ### 4.4 Tool & Governance Layer
 

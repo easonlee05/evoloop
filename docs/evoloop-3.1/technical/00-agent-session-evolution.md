@@ -114,7 +114,7 @@ app/services/agent_runtime/schema_validator.py
 
 当前状态：`app/services/subagent_service.py` 已落地第一版内部 subagent 执行服务。它是统一执行原语，负责 helper request 校验、budget gate、只读工具白名单、helper 串行/局部并行判定、结构化结果回收，以及 `subagent.run.created/started/denied/blocked/failed/completed` 事件输出。第一版 helper 只允许只读工具，默认不持久化完整 transcript。
 
-尚未落地：并行工具调用、ToolResult 结果压缩、session 持久化摘要、公开 `agenda.*` 受控工具，以及把 helper 并行判定扩展到更多 step。
+尚未落地：并行工具调用、ToolResult 结果压缩、session 持久化摘要、公开 `agenda.*` 受控工具，以及把 helper 并行判定扩展到更多 workflow families。
 
 ### 3.2.1 Agenda
 
@@ -173,6 +173,13 @@ formal_subtask
 - 任何无法证明适合并行的情况默认串行。
 - 任何治理问题返回 `denied`，不伪装成 `failed`。
 
+当前 rollout 边界：
+
+- `session_helper` 只有在显式输入 `enable_subagents=true` 时才会启用，不默认自动放大 token 开销。
+- helper 输入必须是窄任务包：`goal`、`task_slice`、`input_refs`、`input_excerpt`、`allowed_tools`、`output_schema`、`budget`。
+- helper 结果只作为父 session 的 advisory context，不直接改写正式 artifact 或 review verdict。
+- `formal_subtask` 当前只允许在 repair/review 子包里派生，主 `spec_to_agent` 拓扑仍保持单主链。
+
 ### 3.2.4 Product Memory
 
 ```text
@@ -222,6 +229,15 @@ app/workflows/acceptance_review.py
 当前 `spec_to_agent` 主链路中的 4 个 agent executor 已接入 AgentRuntime：`open_question_identifier`、`machine_spec_compiler`、`agent_package_generator`、`acceptance_protocol_generator`。
 
 当前 `acceptance_review` 中的 Reviewer agent 已部分接入 AgentRuntime：`requirement_coverage` 全量通过 Reviewer AgentSession 生成 coverage；`diff_impact_analyzer` 的静态插件仍保持确定性执行，只有插件无命中的语义审查分支通过 Reviewer AgentSession 执行。`review_result_compiler` 暂时保持确定性汇总器，不作为推理 Agent 迁移。
+
+当前 helper-enabled step：
+
+- `open_question_identifier`：helper 预扫需求歧义与缺失约束。
+- `machine_spec_compiler`：helper 预抽取状态/约束热点，再进入正式 AST 编译。
+- `requirement_coverage`：helper 预识别 coverage hotspot，再进入 requirement mapping。
+- `diff_impact_analyzer` 语义审查分支：helper 预扫 regression / compatibility 风险主题，再进入最终 reviewer 判断。
+
+这些 helper 都是 step 内部的局部分析，不会改变 Playbook 拓扑，也不会绕过 `AgentRuntime` 的最终 schema 校验。
 
 ## 4. AgentRuntime 行为规范
 
@@ -378,6 +394,8 @@ memory.learning_written
 - 失败不再静默 fallback 为假成功。
 - source-of-truth 产物生成步骤遇到 LLM 解析失败时返回 `blocked`，不能写正式 artifact。
 - Acceptance Review 遇到 reviewer 降级时返回 `blocked` 或 `changes_required`，不能默认 PASS。
+- `session_helper` 只在显式启用时运行，并把结果写入 `agent_session_trace.state.helper_runs`。
+- `formal_subtask` 只在满足独立性与 join 成本可控时 fan-out，否则退回单 repair task。
 - schema validation 失败可观测。
 - 现有 `WorkflowEngine` checkpoint/resume 不被破坏。
 - `tests/test_spec_to_agent.py` 和 `tests/test_backend_phase1.py` 继续通过或按新契约更新。

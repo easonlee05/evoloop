@@ -1,9 +1,3 @@
-/**
- * @file index.jsx
- * @description 任务工作台页面组件。作为核心操作面板，它展示了多 Agent 协同讨论的实时过程，
- * 支持用户与 Agent 进行交互、上传参考附件、打断正在推演的讨论，并能够在右侧拉出文档区进行 PRD 等文档的实时编辑与预览。
- */
-
 import React, { useState, useRef, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
@@ -12,87 +6,71 @@ import { apiGet, apiPost, apiPut, apiUrl, apiUpload } from '../../api';
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import { Markdown } from 'tiptap-markdown';
+import { shouldAutoRunTaskOnOpen } from './workspaceSession';
 import {
-  appendQuoteDraft,
-  buildDecisionPayload,
-  buildQuoteDraft,
-  buildQuoteTooltipLines,
-  clearQuoteDraft,
-  getQuoteTooltipLineClamp,
-  summarizeQuoteDraft,
-} from './quoteSelection';
-import { shouldAutoOpenDocument, shouldAutoRunTaskOnOpen } from './workspaceSession';
-import { getDocumentActionLabel, shouldShowRunPrompt } from './workspaceActions';
-import {
-  Zap, Settings2, Maximize2,
-  Bold, Italic, Underline, List, Code,
-  Mic, Paperclip, Wrench, Send, ChevronDown,
-  RotateCcw, Share2, MessageSquare,
-  Square, CheckCircle2, ChevronRight, X,
-  Briefcase, Terminal, ShieldCheck, PenTool, Bot,
-  BookOpen, Pencil, PanelRightOpen
+  Zap, Settings2, Send, Mic, Paperclip,
+  Square, CheckCircle2, ChevronRight, ChevronDown, ChevronUp, X,
+  BookOpen, AlertCircle, Clock, Loader2, Terminal, Bot,
+  Bold, Italic, Underline, List, Code, RotateCcw, PanelRight,
 } from 'lucide-react';
+import './workspace.css';
 
-/**
- * 根据 Agent 类型返回对应的背景色、图标及文字样式的头像 DOM。
- * @param {string} avatarStr - Agent 缩写或标识（如 PM, Tech, QA, Writer）
- * @returns {React.ReactNode} 头像节点
- */
-function getAgentAvatar(avatarStr) {
-  let bgColor = '#f4f4f5'; 
-  let iconColor = '#52525b';
-  let IconCmp = Bot;
-  
-  if (avatarStr === 'PM') {
-    bgColor = '#f3e8ff'; // pastel purple
-    iconColor = '#7e22ce'; // deep purple
-    IconCmp = Briefcase;
-  } else if (avatarStr === 'T' || avatarStr === 'Tech') {
-    bgColor = '#e0f2fe'; // pastel blue
-    iconColor = '#0369a1'; // deep blue
-    IconCmp = Terminal;
-  } else if (avatarStr === 'QA') {
-    bgColor = '#ffedd5'; // pastel orange
-    iconColor = '#c2410c'; // deep orange
-    IconCmp = ShieldCheck;
-  } else if (avatarStr === 'W' || avatarStr === 'Writer') {
-    bgColor = '#dcfce3'; // pastel green
-    iconColor = '#15803d'; // deep green
-    IconCmp = PenTool;
-  }
-  
-  return (
-    <div className="msg-avatar-inner" style={{ backgroundColor: bgColor, color: iconColor }}>
-      <IconCmp size={14} strokeWidth={2.5} />
-    </div>
-  );
+// ── Mock 数据 ──
+const MOCK_STEPS = [
+  {
+    id: 's1', role: 'Compiler', title: '分析需求', status: 'done', expanded: false,
+    summary: '已提取核心目标：积分防刷网关，包含幂等校验、熔断降级、布隆过滤器三个关键模块。',
+    output: '已提取核心目标：积分防刷网关，包含幂等校验、熔断降级、布隆过滤器三个关键模块。\n\n识别到高优先级约束：P95 延迟 < 100ms，日志留存率 100%。',
+    startedAt: new Date(Date.now() - 65000).toISOString(),
+    endedAt: new Date(Date.now() - 53000).toISOString(),
+  },
+  {
+    id: 's2', role: 'Reviewer', title: '质量评审', status: 'done', expanded: false,
+    summary: '方案健壮性通过评审。建议补充业务方接入规范说明，其余逻辑符合预期。',
+    output: '方案健壮性通过评审。\n\n**建议**：\n1. 强调业务方接入规范（流水唯一、设备指纹）\n2. 影子模式需明确切换条件\n3. 熔断阈值建议写入配置文件而非硬编码',
+    startedAt: new Date(Date.now() - 52000).toISOString(),
+    endedAt: new Date(Date.now() - 38000).toISOString(),
+  },
+  {
+    id: 's3', role: 'Writer', title: '生成文档', status: 'running', expanded: true,
+    summary: null, output: '',
+    startedAt: new Date(Date.now() - 12000).toISOString(), endedAt: null,
+  },
+];
+const MOCK_DOC = `# Spec：积分防刷网关\n\n## 核心目标\n\n- 拦截作弊积分获取\n- 杜绝重复发奖\n- 控制误杀率\n\n## 非功能性要求\n\n- P95 延迟 < 100ms\n- 日志留存率 100%\n`;
+const MOCK_STREAM = '正在将评审意见整合进 Spec 初稿，补充业务方接入规范章节……▋';
+
+// ── 常量 ──
+const STEP_LABELS = { Compiler: '分析需求', Reviewer: '质量评审', Writer: '生成文档', SYSTEM: '系统调度' };
+const STEP_COLORS = { Compiler: '#7c3aed', Reviewer: '#d97706', Writer: '#16a34a', SYSTEM: '#6b7280' };
+const stepLabel = (role) => STEP_LABELS[role] || role || '执行中';
+const stepColor = (role) => STEP_COLORS[role] || '#6b7280';
+
+// ── 子组件 ──
+function StepIcon({ status, color }) {
+  if (status === 'running') return <Loader2 size={14} className="spin" style={{ color }} />;
+  if (status === 'done') return <CheckCircle2 size={14} style={{ color: '#16a34a' }} />;
+  if (status === 'failed') return <AlertCircle size={14} style={{ color: '#dc2626' }} />;
+  return <div className="step-dot-pending" />;
 }
 
-function LiveTimer({ startTime, endTime }) {
-  const [duration, setDuration] = useState('00:00');
-  
+function LiveTimer({ startedAt, endedAt }) {
+  const [label, setLabel] = useState('');
   useEffect(() => {
-    if (!startTime) return;
-    const start = new Date(startTime).getTime();
-    
-    const update = () => {
-      let end = endTime ? new Date(endTime).getTime() : Date.now();
-      let diff = end - start;
-      if (diff < 0) diff = 0;
-      const totalSecs = Math.floor(diff / 1000);
-      const m = Math.floor(totalSecs / 60);
-      const s = totalSecs % 60;
-      setDuration(`${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`);
+    if (!startedAt) return;
+    const start = new Date(startedAt).getTime();
+    const fmt = () => {
+      const end = endedAt ? new Date(endedAt).getTime() : Date.now();
+      const s = Math.max(0, Math.floor((end - start) / 1000));
+      setLabel(`${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`);
     };
-    
-    update();
-    if (endTime) return;
-    
-    const timer = setInterval(update, 1000);
-    return () => clearInterval(timer);
-  }, [startTime, endTime]);
-  
-  return <span>{duration}</span>;
+    fmt();
+    if (endedAt) return;
+    const t = setInterval(fmt, 1000);
+    return () => clearInterval(t);
+  }, [startedAt, endedAt]);
+  if (!label) return null;
+  return <span className="step-timer"><Clock size={10} />{label}</span>;
 }
 
 function cleanContent(text) {
@@ -100,974 +78,421 @@ function cleanContent(text) {
   return text.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').replace(/^\s+|\s+$/g, '');
 }
 
-function getSelectionRect(selection) {
-  if (!selection || selection.rangeCount === 0) return null;
-  const range = selection.getRangeAt(0);
-  const rect = range.getBoundingClientRect();
-  if (rect && (rect.width || rect.height)) {
-    return rect;
-  }
-  const rects = range.getClientRects();
-  return rects.length ? rects[0] : null;
-}
-
-function QuoteTooltip({ quoteDraft }) {
-  const lines = buildQuoteTooltipLines(quoteDraft);
-  if (!lines.length) return null;
-  const lineClamp = getQuoteTooltipLineClamp(quoteDraft.items.length);
-
-  const tooltipTextByIndex = new Map();
-  for (let index = 0; index < lines.length; index += 2) {
-    tooltipTextByIndex.set(index / 2, lines[index + 1]);
-  }
-
-  return (
-    <div className="quote-tooltip" role="tooltip">
-      {quoteDraft.items.map((item, index) => (
-        <div className="quote-tooltip-item" key={`${item.sourceId}-${index}-${item.text}`}>
-          <div className="quote-tooltip-label">{item.sourceLabel}</div>
-          <div className="quote-tooltip-text" style={{ WebkitLineClamp: lineClamp }}>{tooltipTextByIndex.get(index)}</div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function readMessageSelection(selection) {
-  if (!selection || selection.rangeCount === 0) return null;
-  const range = selection.getRangeAt(0);
-  const container = range.commonAncestorContainer;
-  const element = container.nodeType === Node.ELEMENT_NODE ? container : container.parentElement;
-  const messageNode = element?.closest?.('[data-quote-source="message"]');
-  if (!messageNode) return null;
-  const text = selection.toString().trim();
-  if (!text) return null;
-
-  return buildQuoteDraft({
-    sourceType: 'message',
-    sourceId: messageNode.getAttribute('data-message-id') || 'message',
-    sourceLabel: messageNode.getAttribute('data-agent-name') || '会话消息',
-    text,
-  });
-}
-
-import './workspace.css';
-
-// Agent 剧本：模拟多轮讨论
-const SCRIPT = [
-  {
-    agent: 'PM Agent', role: '起草中', avatar: 'PM', color: '#7c3aed',
-    delay: 600,
-    content: '**PRD草案：积分防刷网关**\n\n**目标**：拦截作弊积分获取，降低薅羊毛损失，保障正常用户体验。\n\n**流程**：用户请求积分任务/发奖 -> 网关校验 -> 风控决策（放行/拦截/降级/二审） -> 结果回传业务方。\n\n**核心功能**：\n1. 多维识别：账号、设备、IP、行为频次、任务路径。\n2. 规则引擎：阈值、黑白名单、场景规则配置。\n3. 实时策略：高危拦截，中危验证码/延迟发放，低危放行。\n4. 审计监控：命中日志、告警、报表、误杀复核。\n\n**指标**：作弊拦截率、误杀率、积分损失率、接口耗时。',
-    highlights: {
-      label: '初步草案生成', color: '#7c3aed',
-      items: ['请 Tech 确认性能指标与熔断策略', '请 QA 确认风控策略及误杀兜底机制'],
-    },
-  },
-  {
-    agent: 'Tech Agent', role: '评估中', avatar: 'T', color: '#2563eb',
-    delay: 2200,
-    content: '技术视角补充：\n1. 网关必须增加**幂等校验**，防止接口被恶意重放。\n2. 风控决策必须有**熔断降级**机制：若超时（> 200ms）建议默认放行，避免拖垮主业务，事后异步打标。\n3. **防锁死机制**：并发扣减积分时，分布式锁必须设置合理的 TTL（如 3-5 秒）配合 Watch Dog 防死锁。\n4. 接口耗时建议明确指标：P95 延迟需控制在 100ms 以内。',
-    highlights: {
-      label: '技术建议', color: '#2563eb',
-      items: ['降级策略：默认放行+异步打标', '防锁死：合理TTL+看门狗', '明确 P95 < 100ms'],
-    },
-  },
-  {
-    agent: 'QA Agent', role: '评估中', avatar: 'QA', color: '#dc2626',
-    delay: 2000,
-    content: '质量视角补充：\n1. 需要把“杜绝重复发奖”列入核心目标。\n2. 为了防黑产缓存穿透，建议黑白名单增加**布隆过滤器**。\n3. 建议新规则上线支持**影子模式 (Shadow Mode)**，只记日志不真拦截，确认无误杀后再切正态。\n4. 拦截和降级操作必须 100% 日志留存，以备后期审计。',
-    highlights: {
-      label: '质量建议', color: '#dc2626',
-      items: ['防缓存穿透 (布隆过滤器)', '影子模式预热', '100% 审计留痕'],
-    },
-  },
-  {
-    agent: 'PM Agent', role: '整合中', avatar: 'PM', color: '#7c3aed',
-    delay: 2400,
-    content: '综合技术与 QA 的建议，已输出包含「熔断降级、防死锁、防穿透、影子模式」的 PRD 初稿（见右侧文档区）。\n大家请再审阅一下完整初稿。',
-    highlights: null,
-    isFinal: false,
-  },
-  {
-    agent: 'QA Agent', role: '复核中', avatar: 'QA', color: '#dc2626',
-    delay: 2000,
-    content: '初稿已审阅。防死锁和影子模式的加入让方案健壮了很多。但“业务流水唯一”在落地上需要确保上下游传参一致，建议在文档补充对于业务方接入规范的说明。其余无异议。',
-    highlights: {
-      label: '二审意见', color: '#dc2626',
-      items: ['强调业务方接入规范', '其余逻辑符合预期'],
-    },
-  },
-  {
-    agent: 'PM Agent', role: '定稿中', avatar: 'PM', color: '#7c3aed',
-    delay: 2200,
-    content: '**PRD核心定稿**\n\n**目标**：拦截作弊积分、杜绝重复发奖、控制误杀。\n**流程**：积分请求 -> 网关幂等校验 -> 特征/规则决策(支持影子模式) -> 放行/拦截/降级/二审 -> 审计留痕。\n**功能**：账号/设备/IP/频次识别；黑白名单(含布隆过滤)；验证码/延迟发放；日志、告警、复核。\n**要求**：业务流水唯一，分布式锁防死锁；风控超时触发熔断，默认放行并异步打标。\n**指标**：P95 < 100ms，日志留存100%，重复发奖率趋零，监控拦截率/误杀率/降级命中率。',
-    highlights: null,
-    isFinal: true,
-  }
-];
-
-const DOC = `# 产品需求文档（PRD）：积分防刷网关
-
-## 1. 概述
-
-积分防刷网关作为业务层与奖励发放层之间的前置风控拦截系统，旨在通过多维特征识别和实时规则引擎，有效拦截黑产薅羊毛行为，保障平台营销资金安全和正常用户体验。
-
-## 2. 核心目标
-
-- **拦截作弊积分获取**：降低平台资金损失。
-- **杜绝重复发奖**：确保高并发下的资金发放一致性。
-- **控制误杀率**：提供完善的验证与申诉机制，保障真实用户体验。
-
-## 3. 业务流程
-
-1. **积分请求接收**：上游业务方发起发奖或积分任务完成请求。
-2. **网关幂等校验**：基于唯一的业务流水号进行防重放校验，并发扣减采用分布式锁（TTL 3-5秒 + Watch Dog）防死锁。
-3. **特征与规则决策**：对账号、设备、IP、频次等进行多维度识别。黑白名单采用布隆过滤器防缓存穿透。
-4. **风控动作下发**：根据决策结果执行：放行 / 拦截 / 降级（如图形验证码、延迟发放） / 触发人工二审。支持**影子模式**预热新规则。
-5. **审计留痕与回传**：保存全链路日志（100%留存），并将最终结果回传业务方。
-
-## 4. 非功能性要求
-
-- **高可用与熔断降级**：风控引擎决策若超时（>200ms）需自动熔断。降级策略为**默认放行，异步打标**，绝不阻塞主业务线。
-- **接入规范**：业务侧必须传入规范的流水ID与设备指纹信息。
-- **性能指标**：核心决策接口 P95 耗时 < 100ms。
-
-## 5. 成功指标
-
-| 指标维度 | 监控指标 | 目标值 |
-|---------|---------|--------|
-| **性能** | P95 延迟 | < 100ms |
-| **质量** | 重复发奖率 | 趋近于 0 |
-| **风控** | 日志留存率 | 100% |
-| **运营** | 拦截率/误杀率/降级命中率 | 建立看板，每周回归 |
-`;
-
-function TiptapEditor({ content, onChange, onBlur, onQuoteSelection }) {
+function TiptapEditor({ content, onChange, onBlur }) {
   const editor = useEditor({
     extensions: [StarterKit, Markdown],
     content,
-    editorProps: {
-      attributes: {
-        class: 'doc-editor markdown-body',
-        style: 'outline: none; min-height: 100%;'
-      },
-    },
-    onUpdate: ({ editor }) => {
-      onChange(editor.storage.markdown.getMarkdown());
-    },
-    onBlur: ({ editor }) => {
-      if (onBlur) onBlur(editor.storage.markdown.getMarkdown());
-    },
+    editorProps: { attributes: { class: 'doc-editor markdown-body', style: 'outline:none;min-height:100%' } },
+    onUpdate: ({ editor }) => onChange(editor.storage.markdown.getMarkdown()),
+    onBlur: ({ editor }) => { if (onBlur) onBlur(editor.storage.markdown.getMarkdown()); },
   });
-
   useEffect(() => {
-    if (editor && content !== editor.storage.markdown.getMarkdown()) {
-      if (!editor.isFocused) {
-        editor.commands.setContent(content);
-      }
-    }
+    if (editor && content !== editor.storage.markdown.getMarkdown() && !editor.isFocused)
+      editor.commands.setContent(content);
   }, [content, editor]);
-
-  useEffect(() => {
-    if (!editor || !onQuoteSelection) return undefined;
-
-    const onMouseUp = () => {
-      const { from, to } = editor.state.selection;
-      if (from === to) {
-        onQuoteSelection(null);
-        return;
-      }
-      const selectedText = editor.state.doc.textBetween(from, to, '\n').trim();
-      if (!selectedText) {
-        onQuoteSelection(null);
-        return;
-      }
-
-      const selection = window.getSelection();
-      const rect = getSelectionRect(selection);
-      onQuoteSelection({
-        draft: buildQuoteDraft({
-          sourceType: 'editor',
-          sourceId: 'workspace-editor',
-          sourceLabel: '文档编辑区',
-          text: selectedText,
-        }),
-        rect,
-      });
-    };
-
-    const dom = editor.view.dom;
-    dom.addEventListener('mouseup', onMouseUp);
-    return () => {
-      dom.removeEventListener('mouseup', onMouseUp);
-    };
-  }, [editor, onQuoteSelection]);
-
-  return (
-    <>
-      <EditorContent editor={editor} style={{ height: '100%' }} />
-    </>
-  );
+  return <EditorContent editor={editor} style={{ height: '100%' }} />;
 }
 
-/**
- * Workspace 工作台主组件。负责处理和编排多 Agent 对话的事件流 (EventSource) 连接、
- * 人工干预发送指令、文档修改同步及历史消息载入逻辑。
- * @component
- */
+// ── 主组件 ──
 export default function Workspace() {
-  const [messages, setMessages]     = useState([]); // 对话消息历史列表
-  const [input, setInput]           = useState(''); // 用户输入的待发送指令文本
-  const [isLive, setIsLive]         = useState(true); // 是否处于直播进行中状态
-  const [interrupted, setInterrupted] = useState(false); // 讨论是否已被打断/暂停
-  const [typing, setTyping]           = useState(null); // 当前正在打字/生成中的 Agent 状态
-  const [toast, setToast]           = useState(null); // 界面悬浮 Toast 消息提示
-  const [done, setDone]             = useState(false); // 任务是否已彻底完成
-  const [taskStatus, setTaskStatus] = useState(null); // 后端任务包的运行状态 (raw_status)
-  const [docOpen, setDocOpen]       = useState(false); // 文档面板是否开启
-  const [docFullscreen, setDocFullscreen] = useState(false); // 文档面板是否全屏展示
-  const [doc, setDoc]               = useState(DOC); // 当前文档的 Markdown 文本内容
-  const { id: taskId }               = useParams(); // 从 URL 路由中提取的任务 ID
-  const [saved, setSaved]           = useState(true);
-  const [taskTitle, setTaskTitle]   = useState('AI 协作直播');
-  const [isEditing, setIsEditing]   = useState(false);
-  const [knowledgeHint, setKnowledgeHint] = useState(null);
-  const [knowledgePreview, setKnowledgePreview] = useState([]);
-  const [quoteDraft, setQuoteDraft] = useState(null);
-  const [selectionAction, setSelectionAction] = useState(null);
-  const [hasUserOpenedDoc, setHasUserOpenedDoc] = useState(false);
-  
-  const savedRef = useRef(saved);
-  useEffect(() => {
-    savedRef.current = saved;
-  }, [saved]);
+  const { id: taskId } = useParams();
 
-  const messagesEndRef = useRef(null);
-  const timerRef       = useRef(null);
-  const typeTimerRef   = useRef(null);
-  const streamRef      = useRef(null);
-  const fileInputRef   = useRef(null);
+  const [steps, setSteps] = useState([]);
+  const [streamingStep, setStreamingStep] = useState(null);
+  const [taskStatus, setTaskStatus] = useState(null);
+  const [taskTitle, setTaskTitle] = useState('AI 工作台');
+  const [isLive, setIsLive] = useState(false);
+  const [arbitration, setArbitration] = useState(null);
+  const [userMessages, setUserMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [taskType, setTaskType] = useState(null);
+  const [doc, setDoc] = useState('');
+  const [docSecondary, setDocSecondary] = useState('');
+  const [saved, setSaved] = useState(true);
+  const [openedDoc, setOpenedDoc] = useState(null); // null | 'primary' | 'secondary'
+
+  const PEERS = [
+    { id: 'codex', label: 'Codex', Icon: Terminal },
+    { id: 'claude', label: 'Claude', Icon: Bot },
+  ];
+
+  const streamRef = useRef(null);
+  const savedRef = useRef(true);
+  const fileInputRef = useRef(null);
+  const scrollRef = useRef(null);
   const writerMsgIdRef = useRef(null);
-  const startTimeRef   = useRef(null);
-  const agentStartTimeRef = useRef({});
-  const chatRef = useRef(null);
-  const knowledgeToastTimerRef = useRef(null);
 
-  const showKnowledgeToast = (message) => {
-    if (!message) return;
-    setToast({ type: 'knowledge', message });
-    clearTimeout(knowledgeToastTimerRef.current);
-    knowledgeToastTimerRef.current = setTimeout(() => setToast(null), 3200);
-  };
+  useEffect(() => { savedRef.current = saved; }, [saved]);
 
-  const formatRelativeTime = (timeStr) => {
-    if (!startTimeRef.current) return '00:00';
-    let msgTime = Date.now();
-    if (timeStr) {
-      msgTime = new Date(timeStr).getTime();
-    }
-    let diff = msgTime - startTimeRef.current;
-    if (diff < 0) diff = 0;
-    const totalSecs = Math.floor(diff / 1000);
-    const m = Math.floor(totalSecs / 60);
-    const s = totalSecs % 60;
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-  };
+  useEffect(() => {
+    setSteps([]); setStreamingStep(null); setTaskStatus(null); setArbitration(null);
+    setUserMessages([]); setInput(''); setDoc(''); setDocSecondary('');
+    setSaved(true); setOpenedDoc(null); setTaskType(null); setIsLive(false);
+    writerMsgIdRef.current = null;
 
-  const dismissSelectionAction = () => {
-    setSelectionAction(null);
-  };
+    if (!taskId || taskId === 'new') { setTaskTitle('新建任务'); setIsLive(true); return; }
 
-  const handleQuoteSelection = (selectionPayload) => {
-    if (!selectionPayload?.draft || !selectionPayload?.rect) {
-      dismissSelectionAction();
+    if (taskId === 'demo') {
+      setTaskTitle('积分防刷网关 PRD'); setTaskType('prd');
+      setSteps(MOCK_STEPS);
+      setStreamingStep({ stepId: 's3', text: MOCK_STREAM, isThinking: false });
+      setDoc(MOCK_DOC);
+      setDocSecondary('# PRD\n\n（副产出：将在 Spec 定稿后自动生成）');
+      setIsLive(true);
       return;
     }
-
-    setSelectionAction({
-      draft: selectionPayload.draft,
-      top: Math.max(selectionPayload.rect.top + window.scrollY - 54, 16),
-      left: selectionPayload.rect.left + window.scrollX + (selectionPayload.rect.width / 2),
-    });
-  };
-
-  const applySelectionQuote = () => {
-    if (!selectionAction?.draft) return;
-    setQuoteDraft(prev => appendQuoteDraft(prev, selectionAction.draft));
-    dismissSelectionAction();
-    window.getSelection()?.removeAllRanges();
-  };
-
-  const handleClearQuoteDraft = () => {
-    setQuoteDraft(clearQuoteDraft());
-  };
-
-  const handleUpload = async (e) => {
-    const picked = Array.from(e.target.files);
-    e.target.value = '';
-    for (const file of picked) {
-      await apiUpload('/api/materials', file, null);
-    }
-  };
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, typing]);
-
-  useEffect(() => {
-    const onPointerUp = () => {
-      const selection = window.getSelection();
-      if (!selection || selection.isCollapsed || !chatRef.current?.contains(selection.anchorNode)) {
-        return;
-      }
-
-      const draft = readMessageSelection(selection);
-      const rect = getSelectionRect(selection);
-      if (!draft || !rect) return;
-
-      handleQuoteSelection({ draft, rect });
-    };
-
-    const onPointerDown = (event) => {
-      if (event.target.closest('.selection-action-popover') || event.target.closest('.quote-draft-pill')) {
-        return;
-      }
-      dismissSelectionAction();
-    };
-
-    document.addEventListener('mouseup', onPointerUp);
-    document.addEventListener('mousedown', onPointerDown);
-    return () => {
-      document.removeEventListener('mouseup', onPointerUp);
-      document.removeEventListener('mousedown', onPointerDown);
-    };
-  }, []);
-
-  useEffect(() => {
-    setMessages([]);
-    setDoc('');
-    setDone(false);
-    setTaskStatus(null);
-    setIsLive(false);
-    setTyping(null);
-    setToast(null);
-    setInterrupted(false);
-    setQuoteDraft(null);
-    setSelectionAction(null);
-    setDocOpen(false);
-    setDocFullscreen(false);
-    setIsEditing(false);
-    setHasUserOpenedDoc(false);
-    startTimeRef.current = Date.now();
-
-    if (!taskId || taskId === 'new') {
-      setTaskTitle('新建任务');
-      setDoc(DOC);
-      playNext(0);
-      return () => { clearTimeout(timerRef.current); clearTimeout(typeTimerRef.current); };
-    }
-
-    startTimeRef.current = null; // Reset to null so first event sets it
 
     let closed = false;
     apiGet(`/api/tasks/${taskId}`, null).then(data => {
       if (closed) return;
-      if (data && data.title) {
-        setTaskTitle(data.title);
-      }
-      if (data?.knowledge_status?.state === 'error') {
-        const fallbackMsg = data.knowledge_status.error
-          ? `知识库出了点问题，暂时没法帮你查资料：${data.knowledge_status.error}`
-          : '知识库出了点问题，当前任务会先在没有资料辅助的情况下继续执行';
-        setKnowledgeHint(fallbackMsg);
-        showKnowledgeToast(fallbackMsg);
-        setKnowledgePreview(data.knowledge_status.preview || []);
-      } else if (data?.knowledge_status?.state === 'ready') {
-        const message = `已帮你查到 ${data.knowledge_status.items} 条相关资料，Agent 会参考这些内容继续工作`;
-        setKnowledgeHint(message);
-        showKnowledgeToast(message);
-        setKnowledgePreview(data.knowledge_status.preview || []);
-      } else if (data?.knowledge_status?.state === 'no_results') {
-        const message = '知识库连接正常，但这次暂时没搜到特别相关的资料，Agent 会继续自行生成内容';
-        setKnowledgeHint(message);
-        showKnowledgeToast(message);
-        setKnowledgePreview([]);
-      } else {
-        setKnowledgeHint(null);
-        setKnowledgePreview([]);
-      }
-      
-      if (data && shouldAutoRunTaskOnOpen({ rawStatus: data.raw_status })) {
-        apiPost(`/api/tasks/${taskId}/run`, {}, null).catch(e => console.error("run error", e));
-      }
-      
-      const isFinished = data && ['completed', 'cancelled', 'failed'].includes(data.raw_status);
+      if (data?.title) setTaskTitle(data.title);
+      if (data?.type) setTaskType(data.type);
+      if (data && shouldAutoRunTaskOnOpen({ rawStatus: data.raw_status }))
+        apiPost(`/api/tasks/${taskId}/run`, {}, null).catch(() => {});
+      const finished = ['completed', 'cancelled', 'failed'].includes(data?.raw_status);
       setTaskStatus(data?.raw_status || null);
-      setIsLive(!isFinished);
-      setDone(data && data.raw_status === 'completed');
-      
+      setIsLive(!finished);
       connectStream(taskId);
       loadDocument(taskId);
     });
-
-    apiGet('/api/knowledge/health', null).then(data => {
-      if (closed || !data) return;
-      if (data.status === 'degraded') {
-        const msg = data.error ? `知识库服务异常：${data.error}` : '知识库服务当前不可用';
-        setKnowledgeHint(msg);
-        showKnowledgeToast(msg);
-      } else if (!knowledgeHint && data.status === 'ok') {
-        setKnowledgeHint('知识库连接正常，任务开始后会自动尝试查找相关资料');
-      }
-    });
-
-    return () => {
-      closed = true;
-      if (streamRef.current) streamRef.current.close();
-      clearTimeout(timerRef.current);
-      clearTimeout(typeTimerRef.current);
-      clearTimeout(knowledgeToastTimerRef.current);
-    };
+    return () => { closed = true; if (streamRef.current) streamRef.current.close(); };
   }, [taskId]);
 
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+  }, [steps, streamingStep, userMessages, arbitration]);
 
   function connectStream(id) {
     if (streamRef.current) streamRef.current.close();
     const source = new EventSource(apiUrl(`/api/tasks/${id}/events`));
     streamRef.current = source;
-    source.onmessage = handleStreamEvent;
-    source.addEventListener('workflow.step.started', handleStreamEvent);
-    source.addEventListener('workflow.step.completed', handleStreamEvent);
-    source.addEventListener('agent.message.chunk', handleStreamEvent);
-    source.addEventListener('agent.message.completed', handleStreamEvent);
-    source.addEventListener('arbitration.requested', handleStreamEvent);
-    source.addEventListener('artifact.created', handleStreamEvent);
-    source.addEventListener('task.completed', handleStreamEvent);
-    source.addEventListener('task.cancelled', handleStreamEvent);
-    source.addEventListener('task.failed', handleStreamEvent);
-    source.addEventListener('tool.call.denied', handleStreamEvent);
-    source.addEventListener('model.fallback', handleStreamEvent);
-    source.onerror = () => {
-      source.close();
-      setTimeout(() => loadStoredMessages(id), 250);
-    };
+    const handle = (e) => { try { handleEvent(JSON.parse(e.data)); } catch (_) {} };
+    ['message','workflow.step.started','workflow.step.completed','agent.message.chunk',
+      'agent.message.completed','arbitration.requested','artifact.created',
+      'task.completed','task.cancelled','task.failed','tool.call.denied','model.fallback',
+    ].forEach(t => source.addEventListener(t, handle));
+    source.onerror = () => { source.close(); loadStoredMessages(id); };
+  }
+
+  function handleEvent(data) {
+    const msg = data.frontend_message;
+    if (!msg || msg.type === 'toast') return;
+    const evType = data.type;
+
+    if (evType === 'workflow.step.started') {
+      const p = data.payload || {};
+      if (p.step_type !== 'agent') return;
+      const role = data.role || 'SYSTEM';
+      setSteps(prev => prev.some(s => s.id === p.step_id) ? prev : [...prev, {
+        id: p.step_id, role, title: p.title || stepLabel(role),
+        status: 'running', output: '', summary: null,
+        startedAt: data.created_at, endedAt: null, expanded: true,
+      }]);
+      setStreamingStep({ stepId: p.step_id, text: '', isThinking: true });
+      setIsLive(true); return;
+    }
+    if (evType === 'workflow.step.completed') {
+      const p = data.payload || {};
+      setSteps(prev => prev.map(s => s.id === p.step_id
+        ? { ...s, status: 'done', summary: p.summary || null, endedAt: data.created_at, expanded: false } : s));
+      setStreamingStep(prev => prev?.stepId === p.step_id ? null : prev); return;
+    }
+    if (evType === 'workflow.step.failed') {
+      const p = data.payload || {};
+      setSteps(prev => prev.map(s => s.id === p.step_id
+        ? { ...s, status: 'failed', endedAt: data.created_at, expanded: false } : s));
+      setStreamingStep(prev => prev?.stepId === p.step_id ? null : prev); return;
+    }
+    if (msg.type === 'typing') { setStreamingStep(prev => prev ? { ...prev, isThinking: true } : null); return; }
+    if (msg.type === 'chunk') {
+      const isWriter = msg.avatar === 'W' || msg.avatar === 'Writer' || msg.agent?.toLowerCase().includes('writer');
+      if (isWriter) {
+        if (writerMsgIdRef.current !== msg.id) { writerMsgIdRef.current = msg.id; setDoc(cleanContent(msg.content)); }
+        else setDoc(prev => cleanContent((prev || '') + msg.content));
+      }
+      setStreamingStep(prev => prev ? { ...prev, isThinking: false, text: (prev.text || '') + msg.content } : null); return;
+    }
+    if (evType === 'agent.message.completed') {
+      const p = data.payload || {};
+      setSteps(prev => prev.map(s => s.id === p.step_id ? { ...s, output: p.content || p.summary || '' } : s)); return;
+    }
+    if (evType === 'arbitration.requested') {
+      const d = data.payload?.dispute_package || {};
+      setArbitration({ stepId: data.payload?.step_id, title: d.title || '需要你的判断',
+        question: d.decision_needed || '请选择一个方向继续。', options: d.options || [] });
+      setIsLive(false); return;
+    }
+    if (evType === 'artifact.created') { if (taskId && taskId !== 'new') loadDocument(taskId); return; }
+    if (evType === 'task.completed') {
+      setIsLive(false); setTaskStatus('completed');
+      if (streamRef.current) streamRef.current.close();
+      if (taskId && taskId !== 'new') loadDocument(taskId); return;
+    }
+    if (evType === 'task.cancelled') { setIsLive(false); setTaskStatus('cancelled'); return; }
+    if (evType === 'task.failed') { setIsLive(false); setTaskStatus('failed'); return; }
   }
 
   async function loadStoredMessages(id) {
-    const result = await apiGet(`/api/tasks/${id}/messages`, { messages: [] });
-    if (result.messages?.length) {
-      if (result.messages[0].created_at) {
-        startTimeRef.current = new Date(result.messages[0].created_at).getTime();
-      }
-      const formatted = result.messages.map(msg => ({
-        ...msg,
-        time: msg.created_at ? formatRelativeTime(msg.created_at) : msg.time
-      }));
-      setMessages(formatted);
-      if (formatted.some(message => message.isFinal)) {
-        setIsLive(false);
-        setDone(true);
-        setTaskStatus('completed');
-      }
+    const result = await apiGet(`/api/tasks/${id}/trace`, null);
+    if (!result) return;
+    const stepMap = {};
+    for (const ev of result.events || []) {
+      const p = ev.payload || {};
+      if (ev.type === 'workflow.step.started' && p.step_type === 'agent')
+        stepMap[p.step_id] = { id: p.step_id, role: ev.role || 'SYSTEM', title: p.title || stepLabel(ev.role),
+          status: 'running', output: '', summary: null, startedAt: ev.created_at, endedAt: null, expanded: false };
+      if (ev.type === 'workflow.step.completed' && stepMap[p.step_id])
+        Object.assign(stepMap[p.step_id], { status: 'done', summary: p.summary || null, endedAt: ev.created_at });
+      if (ev.type === 'agent.message.completed' && stepMap[p.step_id])
+        stepMap[p.step_id].output = p.content || p.summary || '';
     }
-  }
-
-  function handleStreamEvent(event) {
-    const data = JSON.parse(event.data);
-    const message = data.frontend_message;
-    if (!message) return;
-    
-    if (message.created_at && !startTimeRef.current) {
-      startTimeRef.current = new Date(message.created_at).getTime();
-    }
-    
-    if (message.type === 'toast') {
-      setToast({ type: 'default', message: message.content });
-      setTimeout(() => setToast(null), 3000);
-      return;
-    }
-
-    const isWriter = message.agent?.toLowerCase().includes('writer') || message.avatar === 'W' || message.avatar === 'Writer';
-
-    if (isWriter) {
-      if (shouldAutoOpenDocument({ reason: 'writer-event', hasUserOpenedDoc })) {
-        setDocOpen(true);
-      }
-      if (message.type === 'typing') {
-        writerMsgIdRef.current = message.id;
-        setDoc('');
-      } else if (message.type === 'chunk') {
-        if (writerMsgIdRef.current !== message.id) {
-          writerMsgIdRef.current = message.id;
-          setDoc(cleanContent(message.content));
-        } else {
-          setDoc(prev => cleanContent((prev || '') + message.content));
-        }
-      } else {
-        if (message.content && writerMsgIdRef.current !== message.id) {
-          writerMsgIdRef.current = message.id;
-          setDoc(cleanContent(message.content));
-        }
-      }
-      
-      if (message.isFinal) {
-        setIsLive(false);
-        setDone(true);
-        setTaskStatus('completed');
-        if (taskId && taskId !== 'new') loadDocument(taskId);
-        if (streamRef.current) streamRef.current.close();
-      }
-      return;
-    }
-    
-    if (message.type === 'typing') {
-      agentStartTimeRef.current[message.agent] = message.created_at || new Date().toISOString();
-      setTyping({
-        agent: message.agent,
-        role: message.role,
-        avatar: message.avatar,
-        color: message.color,
-        isThinking: true,
-        text: '',
-        created_at: message.created_at
-      });
-      return;
-    }
-    
-    if (message.type === 'chunk') {
-      if (!agentStartTimeRef.current[message.agent]) {
-        agentStartTimeRef.current[message.agent] = message.created_at || new Date().toISOString();
-      }
-      setTyping(prev => {
-        if (!prev || prev.agent !== message.agent) {
-          return {
-            agent: message.agent,
-            role: message.role,
-            avatar: message.avatar,
-            color: message.color,
-            isThinking: false,
-            text: message.content,
-            created_at: message.created_at
-          };
-        }
-        return { ...prev, isThinking: false, text: (prev.text || '') + message.content };
-      });
-      return;
-    }
-    
-    setTyping(null);
-    const msgStartTime = agentStartTimeRef.current[message.agent];
-    if (msgStartTime) {
-      delete agentStartTimeRef.current[message.agent];
-    }
-    const msgToSave = { 
-      ...message, 
-      startTime: msgStartTime,
-      time: message.created_at ? formatRelativeTime(message.created_at) : message.time 
-    };
-    setMessages(prev => prev.some(item => item.id === msgToSave.id) ? prev : [...prev, msgToSave]);
-    if (msgToSave.isFinal) {
-      setIsLive(false);
-      setDone(true);
-      setTaskStatus('completed');
-      if (taskId && taskId !== 'new') loadDocument(taskId);
-      if (streamRef.current) streamRef.current.close();
-    }
-  }
-
-  function handleRunTask() {
-    if (!taskId || taskId === 'new') return;
-    setInterrupted(false);
-    setIsLive(true);
-    setTaskStatus('running');
-    apiPost(`/api/tasks/${taskId}/run`, {}, null).catch(e => console.error('run error', e));
-  }
-
-  function handleOpenDocument() {
-    setHasUserOpenedDoc(true);
-    setDocOpen(true);
+    setSteps(Object.values(stepMap));
   }
 
   async function loadDocument(id) {
     const result = await apiGet(`/api/tasks/${id}/document`, null);
-    if (result && typeof result.content === 'string') {
-      setDoc(result.content);
-      setSaved(true);
-    }
-  }
-
-  function playNext(idx) {
-    if (idx >= SCRIPT.length) return;
-    const step = SCRIPT[idx];
-    timerRef.current = setTimeout(() => {
-      typeMessage(step, idx);
-    }, step.delay);
-  }
-
-  function typeMessage(step, idx) {
-    const full = step.content;
-    let i = 0;
-    setTyping({ agent: step.agent, avatar: step.avatar, color: step.color, role: step.role, text: '', full });
-
-    function tick() {
-      i += Math.floor(Math.random() * 3) + 2; // 每次打 2-4 个字
-      const text = full.slice(0, Math.min(i, full.length));
-      setTyping(prev => prev ? { ...prev, text } : null);
-      if (i < full.length) {
-        typeTimerRef.current = setTimeout(tick, 30);
-      } else {
-        // 打字完成，提交消息
-        setTyping(null);
-        const msg = { ...step, id: Date.now(), content: full, time: formatRelativeTime(null) };
-        setMessages(prev => [...prev, msg]);
-        if (step.isFinal) {
-          setIsLive(false);
-          setDone(true);
-        } else {
-          playNext(idx + 1);
-        }
-      }
-    }
-    typeTimerRef.current = setTimeout(tick, 30);
-  }
-
-  // 打断
-  function handleInterrupt() {
-    clearTimeout(timerRef.current);
-    clearTimeout(typeTimerRef.current);
-    if (taskId && taskId !== 'new') apiPost(`/api/tasks/${taskId}/interrupt`, {}, null);
-    setTyping(null);
-    setIsLive(false);
-    setInterrupted(true);
-  }
-
-  // 恢复
-  function handleResume() {
-    setInterrupted(false);
-    setIsLive(true);
-    const nextIdx = messages.length; // 从下一条继续
-    if (nextIdx < SCRIPT.length) playNext(nextIdx);
-  }
-
-  // 发送指令
-  function handleSend() {
-    if (!input.trim() && !quoteDraft?.items?.length) return;
-    const instruction = input;
-    const userMsg = {
-      id: Date.now(), isUser: true,
-      content: instruction,
-      time: formatRelativeTime(null),
-      quotedSelections: quoteDraft?.items || [],
-    };
-    setMessages(prev => [...prev, userMsg]);
-    setInput('');
-    if (taskId && taskId !== 'new') {
-      apiPost(`/api/tasks/${taskId}/decisions`, buildDecisionPayload(instruction, quoteDraft), null);
-    }
-    setQuoteDraft(null);
-    dismissSelectionAction();
-    // 恢复讨论
-    if (interrupted) {
-      setTimeout(() => {
-        setInterrupted(false);
-        setIsLive(true);
-        const nextIdx = messages.length + 1;
-        if (nextIdx < SCRIPT.length) playNext(nextIdx);
-      }, 800);
-    }
+    if (result && typeof result.content === 'string') { setDoc(result.content); setSaved(true); }
   }
 
   function saveDocument(content) {
-    if (savedRef.current) return;
-    if (!taskId || taskId === 'new') {
-      setSaved(true);
-      return;
-    }
+    if (savedRef.current || !taskId || taskId === 'new' || taskId === 'demo') return;
     apiPut(`/api/tasks/${taskId}/document`, { content }, null).then(() => setSaved(true));
   }
 
-  return (
-    <div className={`workspace${docOpen ? ' doc-open' : ''}${docFullscreen ? ' doc-fullscreen' : ''}`}>
-      {selectionAction && (
-        <button
-          className="selection-action-popover"
-          style={{ top: selectionAction.top, left: selectionAction.left }}
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={applySelectionQuote}
-        >
-          <MessageSquare size={16} />
-          <span>添加到对话</span>
-        </button>
-      )}
+  function handleInterrupt() {
+    if (taskId && taskId !== 'new' && taskId !== 'demo') apiPost(`/api/tasks/${taskId}/interrupt`, {}, null);
+    setIsLive(false); setStreamingStep(null);
+  }
 
-      {/* 中间：AI 协作直播 */}
-      <div className="ws-chat" ref={chatRef}>
+  function handleResume() {
+    if (!taskId || taskId === 'new' || taskId === 'demo') return;
+    setIsLive(true); apiPost(`/api/tasks/${taskId}/run`, {}, null).catch(() => {});
+  }
+
+  function handleSend() {
+    const text = input.trim();
+    if (!text) return;
+    setUserMessages(prev => [...prev, { id: Date.now(), text }]);
+    setInput('');
+    if (taskId && taskId !== 'new' && taskId !== 'demo')
+      apiPost(`/api/tasks/${taskId}/decisions`, { instruction: text }, null);
+    if (!isLive) handleResume();
+  }
+
+  function handleArbitrationChoice(option) {
+    if (!arbitration) return;
+    if (taskId && taskId !== 'new' && taskId !== 'demo')
+      apiPost(`/api/tasks/${taskId}/decisions`,
+        { instruction: option.pm_position || option.label || '', step_id: arbitration.stepId }, null);
+    setArbitration(null); setIsLive(true);
+  }
+
+  const isDone = taskStatus === 'completed';
+  const isFailed = taskStatus === 'failed';
+
+  const outputItems = taskType === 'prd'
+    ? [{ key: 'primary', label: 'Spec 规格', content: doc }, { key: 'secondary', label: 'PRD 文档', content: docSecondary }]
+    : [{ key: 'primary', label: taskType === 'manual' ? '操作手册' : '产出文档', content: doc }];
+  const hasOutput = outputItems.some(i => i.content);
+  const currentDocContent = openedDoc === 'secondary' ? docSecondary : doc;
+  const currentDocTitle = outputItems.find(i => i.key === openedDoc)?.label || '产出文档';
+
+  return (
+    <div className="workspace">
+
+      {/* ── 执行看板 ── */}
+      <div className="ws-chat">
         <div className="ws-chat-header">
           <div className="ws-chat-title">
             <span>{taskTitle}</span>
-            {isLive && !interrupted && (
-              <span className="live-badge"><span className="live-dot" />直播中</span>
-            )}
-            {interrupted && (
-              <span className="paused-badge">已暂停</span>
-            )}
+            {isLive && <span className="live-badge"><span className="live-dot" />运行中</span>}
+            {isDone && <span className="done-badge"><CheckCircle2 size={12} />已完成</span>}
+            {isFailed && <span className="failed-badge"><AlertCircle size={12} />执行失败</span>}
+            {taskStatus === 'cancelled' && <span className="paused-badge">已暂停</span>}
           </div>
           <div className="ws-chat-header-actions">
-            <button className="icon-btn" onClick={handleOpenDocument} title={getDocumentActionLabel({ done })}>
-              <PanelRightOpen size={15} />
-            </button>
-            <button className="icon-btn"><Settings2 size={15} /></button>
+            <button className="icon-btn" title="设置"><Settings2 size={15} /></button>
+            {hasOutput && (
+              <button
+                className={`icon-btn panel-toggle-btn${openedDoc ? ' active' : ''}`}
+                title={openedDoc ? '收起侧边栏' : '展开侧边栏'}
+                onClick={() => openedDoc ? setOpenedDoc(null) : setOpenedDoc(outputItems.find(i => i.content)?.key || null)}
+              >
+                <PanelRight size={15} />
+              </button>
+            )}
           </div>
         </div>
 
-        <div className="ws-chat-notice">
-          <Zap size={13} />
-          <span>多智能体协同讨论中，您可随时打断并下达指令</span>
-          <div className="ws-chat-notice-actions">
-            {shouldShowRunPrompt(taskStatus) ? (
-              <button className="notice-action-btn" onClick={handleRunTask}>继续执行</button>
-            ) : null}
-          </div>
-        </div>
+        <div className="ws-messages" ref={scrollRef}>
+          {steps.length === 0 && !isLive && <div className="step-empty">暂无执行记录</div>}
 
-        <div className="ws-messages">
-          {toast && (
-            <div className={`workspace-toast${toast.type === 'knowledge' ? ' workspace-toast-knowledge' : ''}`}>
-              {toast.type === 'knowledge' ? <BookOpen size={14} /> : <span>⚠️</span>}
-              <span>{toast.message}</span>
-            </div>
-          )}
-
-          {messages.map(msg => (
-            <MessageBubble key={msg.id} msg={msg} />
-          ))}
-
-          {/* 正在打字的消息 */}
-          {typing && (
-            <div className="msg">
-              <div className="msg-avatar">
-                {getAgentAvatar(typing.avatar)}
-              </div>
-              <div className="msg-body">
-                <div className="msg-header">
-                  <span className="msg-agent">{typing.agent}</span>
-                  <span className="msg-role">{typing.role}</span>
-                  <span className="msg-time">
-                    <LiveTimer startTime={agentStartTimeRef.current[typing.agent] || typing.created_at} />
-                  </span>
-                  <button className="interrupt-btn" onClick={handleInterrupt}>
-                    <Square size={10} />打断
-                  </button>
+          {steps.map((step, idx) => {
+            const isStreaming = streamingStep?.stepId === step.id;
+            const streamText = isStreaming ? streamingStep.text : '';
+            const isThinking = isStreaming && streamingStep?.isThinking;
+            return (
+              <div key={step.id} className={`step-row step-${step.status}`}>
+                <div className="step-track">
+                  <StepIcon status={step.status} color={stepColor(step.role)} />
+                  {idx < steps.length - 1 && <div className={`step-line${step.status === 'done' ? ' done' : ''}`} />}
                 </div>
-                <div className="msg-content markdown-body">
-                  {typing.isThinking ? (
-                    <div className="thinking-dots-wrap" style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-tertiary)' }}>
-                      <span className="thinking-dots"><span /><span /><span /></span>
-                      <span style={{ fontSize: '13px' }}>深度思考中...</span>
+                <div className="step-body">
+                  <div className="step-header"
+                    onClick={() => step.status !== 'running' &&
+                      setSteps(prev => prev.map(s => s.id === step.id ? { ...s, expanded: !s.expanded } : s))}>
+                    <span className="step-title" style={{ color: step.status === 'running' ? stepColor(step.role) : undefined }}>
+                      {step.title}
+                    </span>
+                    <LiveTimer startedAt={step.startedAt} endedAt={step.endedAt} />
+                    {step.status === 'running' && (
+                      <button className="interrupt-btn" onClick={e => { e.stopPropagation(); handleInterrupt(); }}>
+                        <Square size={9} />打断
+                      </button>
+                    )}
+                    {step.status !== 'running' && (
+                      <button className="step-expand-btn">
+                        {step.expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                      </button>
+                    )}
+                  </div>
+                  {step.status === 'running' && (
+                    <div className="step-stream markdown-body">
+                      {isThinking
+                        ? <span className="thinking-inline"><span className="thinking-dots"><span /><span /><span /></span>深度思考中...</span>
+                        : <ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanContent(streamText) + (streamText ? '▋' : '')}</ReactMarkdown>}
                     </div>
-                  ) : (
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                      {cleanContent(typing.text) + '▋'}
-                    </ReactMarkdown>
+                  )}
+                  {step.status !== 'running' && step.expanded && (step.output || step.summary) && (
+                    <div className="step-output markdown-body">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanContent(step.output || step.summary)}</ReactMarkdown>
+                    </div>
+                  )}
+                  {step.status === 'done' && !step.expanded && step.summary && (
+                    <div className="step-summary">{step.summary.slice(0, 80)}{step.summary.length > 80 ? '…' : ''}</div>
+                  )}
+                  {step.status === 'failed' && !step.expanded && (
+                    <div className="step-summary" style={{ color: '#dc2626' }}>执行失败，点击展开查看详情</div>
                   )}
                 </div>
               </div>
-            </div>
-          )}
+            );
+          })}
 
-
-          {/* 打断提示 */}
-          {interrupted && (
-            <div className="interrupt-notice">
-              <span>讨论已暂停，输入指令后继续</span>
-              <button className="resume-btn" onClick={handleResume}>继续讨论</button>
-            </div>
-          )}
-
-          {/* 完成卡片 */}
-          {done && !docOpen && (
-            <div className="done-card" onClick={handleOpenDocument}>
-              <div className="done-card-left">
-                <CheckCircle2 size={18} className="done-icon" />
-                <div>
-                  <div className="done-title">PRD 初稿已生成</div>
-                  <div className="done-sub">产品需求文档（PRD）- EvoLoop 智能进化平台</div>
-                </div>
-              </div>
-              <div className="done-card-right">
-                <span>查看文档</span>
-                <ChevronRight size={14} />
-              </div>
-            </div>
-          )}
-
-          <div ref={messagesEndRef} />
+          {userMessages.map(m => (
+            <div key={m.id} className="msg msg-user"><div className="msg-user-bubble">{m.text}</div></div>
+          ))}
         </div>
 
-        {/* 输入框 */}
+        {/* 输入区 / 裁决卡 */}
         <div className="ws-input-wrap">
-          <div className="ws-input-box">
-            {quoteDraft?.items?.length ? (
-              <div className="quote-draft-pill quote-draft-pill-with-tooltip">
-                <div className="quote-draft-pill-main">
-                  <MessageSquare size={15} />
-                  <span>{summarizeQuoteDraft(quoteDraft)}</span>
-                </div>
-                <button className="quote-draft-pill-remove" onClick={handleClearQuoteDraft} aria-label="移除引用">
-                  <X size={14} />
-                </button>
-                <QuoteTooltip quoteDraft={quoteDraft} />
+          {arbitration ? (
+            <div className="arbitration-card">
+              <div className="arb-title">{arbitration.title}</div>
+              <div className="arb-question">{arbitration.question}</div>
+              <div className="arb-options">
+                {arbitration.options.map((opt, i) => (
+                  <button key={i} className="arb-option-btn" onClick={() => handleArbitrationChoice(opt)}>
+                    {opt.pm_position || opt.label || `选项 ${i + 1}`}
+                  </button>
+                ))}
               </div>
-            ) : null}
-            <div className="ws-input-row">
-              <textarea
-                className="ws-input"
-                placeholder={interrupted ? '输入指令，Agent 将根据你的指令继续…' : '向 EvoLoop 发送指令…'}
-                value={input}
-                onChange={e => setInput(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
-                rows={1}
-              />
-              <button className={`ws-send${input || quoteDraft?.items?.length ? ' active' : ''}`} onClick={handleSend}>
-                <Send size={14} />
-              </button>
             </div>
-          </div>
-          <div className="ws-input-tools">
-            <button className="tool-btn"><Mic size={13} /></button>
-            <button className="tool-btn" onClick={() => fileInputRef.current?.click()}>
-              <Paperclip size={13} />上传文件<ChevronDown size={11} />
-            </button>
-            <input ref={fileInputRef} type="file" multiple style={{ display: 'none' }} onChange={handleUpload} />
-            <button className="tool-btn"><Wrench size={13} />调用工具<ChevronDown size={11} /></button>
-          </div>
+          ) : (
+            <div className="ws-input-box">
+              <div className="ws-input-row">
+                <textarea className="ws-input"
+                  placeholder={isLive ? '运行中，可打断并下达新指令…' : '向 EvoLoop 发送指令…'}
+                  value={input} onChange={e => setInput(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
+                  rows={1}
+                />
+                <button className={`ws-send${input.trim() ? ' active' : ''}`} onClick={handleSend}>
+                  <Send size={14} />
+                </button>
+              </div>
+              <div className="ws-input-tools">
+                <button className="tool-btn"><Mic size={13} /></button>
+                <button className="tool-btn" onClick={() => fileInputRef.current?.click()}>
+                  <Paperclip size={13} />上传文件
+                </button>
+                <input ref={fileInputRef} type="file" multiple style={{ display: 'none' }}
+                  onChange={async e => {
+                    for (const f of Array.from(e.target.files)) await apiUpload('/api/materials', f, null);
+                    e.target.value = '';
+                  }}
+                />
+                <div className="peer-icons">
+                  {PEERS.map(p => (
+                    <button key={p.id} className="peer-icon-btn" title={p.label}
+                      onClick={() => taskId && taskId !== 'new' && taskId !== 'demo' &&
+                        apiPost(`/api/tasks/${taskId}/peer-dispatch`, { peer_target: p.id }, null)}>
+                      <p.Icon size={13} />
+                    </button>
+                  ))}
+                </div>
+                {!isLive && taskStatus !== 'completed' && (
+                  <button className="tool-btn resume-tool-btn" onClick={handleResume}><Zap size={13} />继续执行</button>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* 右侧：文档区（仅 docOpen 时展示） */}
-      {docOpen && (
-        <div className="ws-doc">
-          <div className="ws-doc-header">
-            <div className="ws-doc-title-row">
-              <Zap size={14} className="doc-title-icon" />
-              <span className="doc-title">产品需求文档（PRD）</span>
-              <span className={`save-status${saved ? ' saved' : ''}`}>{saved ? '已保存' : '未保存'}</span>
-            </div>
-            <div className="ws-doc-actions">
-              <button
-                className="icon-btn"
-                onClick={() => { setHasUserOpenedDoc(true); setIsEditing(!isEditing); }}
-                title={isEditing ? '预览阅读' : '编辑源码'}
-              >
-                {isEditing ? <BookOpen size={14} /> : <Pencil size={14} />}
-              </button>
-              <button className="icon-btn"><Share2 size={14} /></button>
-              <button className="icon-btn"><MessageSquare size={14} /></button>
-              <button className="icon-btn" onClick={() => setDocFullscreen(f => !f)} title={docFullscreen ? '退出全屏' : '全屏编辑'}>
-                <Maximize2 size={14} />
-              </button>
-              <button className="icon-btn" onClick={() => { setDocOpen(false); setDocFullscreen(false); }}><X size={14} /></button>
-            </div>
-          </div>
-
-          <div className="doc-toolbar">
-            <button className="icon-btn"><RotateCcw size={13} /></button>
-            <div className="toolbar-sep" />
-            <select className="toolbar-select">
-              <option>正文</option>
-              <option>标题 1</option>
-              <option>标题 2</option>
-              <option>标题 3</option>
-              <option>标题 4</option>
-            </select>
-            <div className="toolbar-sep" />
-            <button className="icon-btn"><Bold size={13} /></button>
-            <button className="icon-btn"><Italic size={13} /></button>
-            <button className="icon-btn"><Underline size={13} /></button>
-            <div className="toolbar-sep" />
-            <button className="icon-btn"><List size={13} /></button>
-            <button className="icon-btn"><Code size={13} /></button>
-          </div>
-
-          <div className="doc-body">
-            {isEditing ? (
-              <TiptapEditor
-                key={taskId}
-                content={doc}
-                onChange={newDoc => { setDoc(newDoc); setSaved(false); }}
-                onBlur={newDoc => saveDocument(newDoc)}
-                onQuoteSelection={handleQuoteSelection}
-              />
-            ) : (
-              <div className="doc-preview" onClick={() => { setHasUserOpenedDoc(true); setDocOpen(true); setIsEditing(true); }}>
-                <DocRenderer content={doc} />
-              </div>
-            )}
-          </div>
+      {/* ── 右上角产出面板（抽屉打开时隐藏）── */}
+      {hasOutput && !openedDoc && (
+        <div className="output-panel">
+          <div className="output-panel-header">产出</div>
+          {outputItems.map(item => (
+            <button key={item.key}
+              className={`output-panel-item${openedDoc === item.key ? ' active' : ''}${!item.content ? ' disabled' : ''}`}
+              onClick={() => item.content && setOpenedDoc(k => k === item.key ? null : item.key)}>
+              <BookOpen size={12} />
+              <span>{item.label}</span>
+              {item.content && <ChevronRight size={11} className="output-item-arrow" />}
+            </button>
+          ))}
         </div>
       )}
-    </div>
-  );
-}
 
-function MessageBubble({ msg }) {
-  if (msg.isUser) {
-    return (
-      <div className="msg msg-user">
-        <div className="msg-user-stack">
-          {msg.quotedSelections?.length ? (
-            <div className="quote-draft-pill quote-draft-pill-inline quote-draft-pill-with-tooltip">
-              <div className="quote-draft-pill-main">
-                <MessageSquare size={15} />
-                <span>{msg.quotedSelections.length} 个已选文本片段</span>
-              </div>
-              <QuoteTooltip quoteDraft={{ items: msg.quotedSelections }} />
-            </div>
-          ) : null}
-          {msg.content ? <div className="msg-user-bubble">{msg.content}</div> : null}
+      {/* ── 右侧产出抽屉 ── */}
+      <div className={`output-drawer${openedDoc ? ' open' : ''}`}>
+        {/* 文件胶囊标签 + 右上角收起按钮 */}
+        <div className="output-drawer-header">
+          <div className="output-drawer-tags">
+            {outputItems.filter(i => i.content).map(item => (
+              <button
+                key={item.key}
+                className={`output-file-tag${openedDoc === item.key ? ' active' : ''}`}
+                onClick={() => setOpenedDoc(item.key)}
+              >
+                <span>{item.label}</span>
+                <span className="output-tag-close" onClick={e => { e.stopPropagation(); setOpenedDoc(null); }}>
+                  <X size={10} />
+                </span>
+              </button>
+            ))}
+          </div>
         </div>
-      </div>
-    );
-  }
-  return (
-    <div className="msg">
-      <div className="msg-avatar">
-        {getAgentAvatar(msg.avatar)}
-      </div>
-      <div className="msg-body">
-        <div className="msg-header">
-          <span className="msg-agent">{msg.agent}</span>
-          <span className="msg-role">{msg.role}</span>
-          <span className="msg-time">
-            {msg.startTime ? <LiveTimer startTime={msg.startTime} endTime={msg.created_at || new Date().toISOString()} /> : msg.time}
-          </span>
+        {/* 抽屉内容 */}
+        <div className="output-drawer-body">
+          {openedDoc && (
+            <TiptapEditor
+              key={`${taskId}-${openedDoc}`}
+              content={currentDocContent}
+              onChange={d => { openedDoc === 'secondary' ? setDocSecondary(d) : setDoc(d); setSaved(false); }}
+              onBlur={saveDocument}
+            />
+          )}
         </div>
-        <div
-          className="msg-content markdown-body"
-          data-quote-source="message"
-          data-message-id={msg.id}
-          data-agent-name={msg.agent || msg.role || '会话消息'}
-        >
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanContent(msg.content)}</ReactMarkdown>
-        </div>
-        {msg.highlights && (
-          <div className="msg-highlights">
-            <div className="highlights-label">{msg.highlights.label}</div>
-            <ul className="highlights-list">
-              {msg.highlights.items.map((item, i) => <li key={i}>{item}</li>)}
-            </ul>
+        {/* 保存状态 */}
+        {openedDoc && (
+          <div className="output-drawer-footer">
+            <span className={`save-status${saved ? ' saved' : ''}`}>{saved ? '已保存' : '未保存'}</span>
           </div>
         )}
       </div>
-    </div>
-  );
-}
-
-function DocRenderer({ content }) {
-  return (
-    <div className="doc-rendered markdown-body">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
     </div>
   );
 }

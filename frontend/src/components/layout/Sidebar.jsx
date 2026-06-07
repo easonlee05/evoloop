@@ -5,7 +5,7 @@
 
 import React, { useEffect, useState } from 'react';
 import { NavLink, useLocation, useNavigate, useParams } from 'react-router-dom';
-import { Zap, CheckSquare, BookOpen, ShieldCheck, Archive, Settings, ChevronRight } from 'lucide-react';
+import { Zap, CheckSquare, BookOpen, ShieldCheck, Archive, Settings, ChevronRight, LayoutDashboard } from 'lucide-react';
 import { apiGet, apiDelete } from '../../api';
 import { flattenConversationGroups } from './sidebarHistory';
 import './sidebar.css';
@@ -17,6 +17,7 @@ import './sidebar.css';
 const navItems = [
   { icon: <Zap size={15} />, label: '新建任务', path: '/', primary: true },
   { icon: <CheckSquare size={15} />, label: '任务大厅', path: '/tasks' },
+  { icon: <LayoutDashboard size={15} />, label: '工作台', path: '/workspace/demo' },
   { icon: <BookOpen size={15} />, label: '知识库', path: '/knowledge-base' },
   { icon: <ShieldCheck size={15} />, label: '法则审核', path: '/rule-audit', badge: true },
   { icon: <Archive size={15} />, label: '归档与回收', path: '/recycle-bin' },

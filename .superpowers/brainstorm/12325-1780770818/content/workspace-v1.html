@@ -1,0 +1,154 @@
+<h2>EvoLoop 3.1 Workspace</h2>
+<p class="subtitle">中度升级方向：保留现有风格，但把 Decision Gate、任务状态和当前执行上下文提到第一屏。</p>
+
+<div class="mockup">
+  <div class="mockup-header">工作台草图 v1</div>
+  <div class="mockup-body" style="padding:20px;background:linear-gradient(180deg,#f8fafc 0%,#eef2ff 100%);">
+    <div style="display:grid;grid-template-columns:280px 1fr 340px;gap:18px;min-height:620px;">
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div style="background:#ffffff;border:1px solid #dbe4ff;border-radius:18px;padding:16px;box-shadow:0 10px 30px rgba(99,102,241,.08);">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+            <strong style="font-size:15px;">控制面</strong>
+            <span style="font-size:12px;color:#4338ca;background:#eef2ff;border-radius:999px;padding:4px 10px;">running</span>
+          </div>
+          <div style="display:grid;gap:10px;">
+            <div style="background:#f8fafc;border-radius:14px;padding:12px;">
+              <div style="font-size:12px;color:#64748b;">Current Step</div>
+              <div style="margin-top:4px;font-size:14px;font-weight:600;color:#0f172a;">machine_spec_compiler</div>
+            </div>
+            <div style="background:#fff7ed;border-radius:14px;padding:12px;border:1px solid #fed7aa;">
+              <div style="font-size:12px;color:#9a3412;">Decision Gate</div>
+              <div style="margin-top:4px;font-size:14px;font-weight:600;color:#7c2d12;">等待业务范围裁决</div>
+              <div style="margin-top:6px;font-size:12px;color:#9a3412;">缺少支付链路是否纳入本轮验收</div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+              <div style="background:#eff6ff;border-radius:14px;padding:12px;">
+                <div style="font-size:12px;color:#1d4ed8;">Degraded</div>
+                <div style="margin-top:4px;font-size:18px;font-weight:700;color:#1e3a8a;">1</div>
+              </div>
+              <div style="background:#ecfeff;border-radius:14px;padding:12px;">
+                <div style="font-size:12px;color:#0f766e;">Artifacts</div>
+                <div style="margin-top:4px;font-size:18px;font-weight:700;color:#134e4a;">4</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:18px;padding:16px;">
+          <strong style="font-size:15px;">步骤轨</strong>
+          <div style="display:flex;flex-direction:column;gap:10px;margin-top:12px;">
+            <div style="padding:10px 12px;border-radius:14px;background:#dcfce7;color:#166534;">open_question_identifier</div>
+            <div style="padding:10px 12px;border-radius:14px;background:#e0e7ff;color:#3730a3;font-weight:600;">machine_spec_compiler</div>
+            <div style="padding:10px 12px;border-radius:14px;background:#f8fafc;color:#475569;">agent_package_generator</div>
+            <div style="padding:10px 12px;border-radius:14px;background:#f8fafc;color:#475569;">acceptance_protocol_generator</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div style="background:#ffffff;border:1px solid #dbeafe;border-radius:18px;padding:16px;min-height:144px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <strong style="font-size:15px;">协作直播</strong>
+            <span style="font-size:12px;color:#475569;">Task · spec_to_agent</span>
+          </div>
+          <div style="margin-top:14px;display:flex;flex-direction:column;gap:12px;">
+            <div style="background:#f8fafc;border-radius:14px;padding:12px 14px;max-width:82%;">
+              PM Agent 正在收敛业务意图，已识别 2 个必须裁决问题。
+            </div>
+            <div style="background:#eef2ff;border-radius:14px;padding:12px 14px;max-width:88%;margin-left:auto;border:1px solid #c7d2fe;">
+              Reviewer Agent 标记支付链路说明不足，建议先确认是否进入本轮。
+            </div>
+            <div style="background:#fff7ed;border-radius:14px;padding:12px 14px;max-width:78%;border:1px solid #fed7aa;">
+              系统已暂停在 Decision Gate，等待用户继续。
+            </div>
+          </div>
+        </div>
+
+        <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:18px;padding:16px;min-height:420px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <strong style="font-size:15px;">任务文档 / 工作上下文</strong>
+            <span style="font-size:12px;color:#64748b;">自动切换到当前主 artifact</span>
+          </div>
+          <div style="margin-top:14px;background:#f8fafc;border-radius:16px;padding:18px;min-height:330px;">
+            <div style="font-size:13px;color:#475569;margin-bottom:10px;"># Machine Spec Draft</div>
+            <div style="height:10px;background:#cbd5e1;border-radius:999px;width:72%;margin-bottom:10px;"></div>
+            <div style="height:10px;background:#e2e8f0;border-radius:999px;width:94%;margin-bottom:10px;"></div>
+            <div style="height:10px;background:#e2e8f0;border-radius:999px;width:88%;margin-bottom:10px;"></div>
+            <div style="height:10px;background:#e2e8f0;border-radius:999px;width:64%;margin-bottom:18px;"></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+              <div style="background:#ffffff;border-radius:14px;padding:12px;">
+                <div style="font-size:12px;color:#64748b;">Product Context</div>
+                <div style="margin-top:8px;font-size:13px;color:#0f172a;">目标：把业务意图编译为可执行规格与验收协议</div>
+              </div>
+              <div style="background:#ffffff;border-radius:14px;padding:12px;">
+                <div style="font-size:12px;color:#64748b;">Linked Artifact</div>
+                <div style="margin-top:8px;font-size:13px;color:#0f172a;">agent_package_codex.md</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:18px;padding:16px;">
+          <strong style="font-size:15px;">状态摘要</strong>
+          <div style="display:grid;gap:10px;margin-top:12px;">
+            <div style="background:#f8fafc;border-radius:14px;padding:12px;">
+              <div style="font-size:12px;color:#64748b;">Run Health</div>
+              <div style="margin-top:6px;font-size:14px;font-weight:600;color:#0f172a;">健康，有 1 个降级信号</div>
+            </div>
+            <div style="background:#fefce8;border-radius:14px;padding:12px;border:1px solid #fde68a;">
+              <div style="font-size:12px;color:#a16207;">Next Required Action</div>
+              <div style="margin-top:6px;font-size:14px;font-weight:600;color:#713f12;">回答 Decision Gate</div>
+            </div>
+          </div>
+        </div>
+
+        <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:18px;padding:16px;">
+          <strong style="font-size:15px;">结构化 Trace</strong>
+          <div style="display:flex;flex-direction:column;gap:10px;margin-top:12px;">
+            <div style="padding:12px;border-radius:14px;background:#f8fafc;">
+              <div style="font-size:12px;color:#64748b;">workflow.step.started</div>
+              <div style="margin-top:4px;font-size:13px;color:#0f172a;">machine_spec_compiler</div>
+            </div>
+            <div style="padding:12px;border-radius:14px;background:#f8fafc;">
+              <div style="font-size:12px;color:#64748b;">tool.call.completed</div>
+              <div style="margin-top:4px;font-size:13px;color:#0f172a;">knowledge.retrieve · 4 items</div>
+            </div>
+            <div style="padding:12px;border-radius:14px;background:#fff7ed;border:1px solid #fed7aa;">
+              <div style="font-size:12px;color:#9a3412;">arbitration.requested</div>
+              <div style="margin-top:4px;font-size:13px;color:#7c2d12;">scope_confirmation</div>
+            </div>
+          </div>
+        </div>
+
+        <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:18px;padding:16px;">
+          <strong style="font-size:15px;">你想怎么调？</strong>
+          <div class="options" style="margin-top:12px;">
+            <div class="option" data-choice="v1-good" onclick="toggleSelect(this)">
+              <div class="letter">A</div>
+              <div class="content">
+                <h3>层级对了</h3>
+                <p>继续沿这个布局细化交互和真实数据接入</p>
+              </div>
+            </div>
+            <div class="option" data-choice="v1-left-stronger" onclick="toggleSelect(this)">
+              <div class="letter">B</div>
+              <div class="content">
+                <h3>左轨再重一点</h3>
+                <p>让 Decision Gate 和步骤轨更抢眼，聊天区再后退一点</p>
+              </div>
+            </div>
+            <div class="option" data-choice="v1-center-stronger" onclick="toggleSelect(this)">
+              <div class="letter">C</div>
+              <div class="content">
+                <h3>中间再重一点</h3>
+                <p>保留状态卡，但让协作直播仍然是绝对主舞台</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

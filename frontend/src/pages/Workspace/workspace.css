@@ -1,12 +1,450 @@
-/* Sana AI 风格重构版 workspace.css */
+/* ── 步骤轨道 ── */
+.step-empty {
+  padding: var(--sp-8);
+  color: var(--text-tertiary);
+  font-size: 13px;
+  text-align: center;
+}
+
+.step-row {
+  display: flex;
+  gap: var(--sp-4);
+  padding: 2px 0;
+}
+
+.step-track {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 20px;
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+
+.step-dot-pending {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid #d4d4d8;
+  background: #fff;
+  flex-shrink: 0;
+}
+
+.step-line {
+  width: 2px;
+  flex: 1;
+  min-height: 16px;
+  background: #e4e4e7;
+  margin: 4px 0;
+  border-radius: 1px;
+}
+.step-line.done { background: #bbf7d0; }
+
+.step-body {
+  flex: 1;
+  min-width: 0;
+  padding-bottom: var(--sp-6);
+}
+
+.step-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  cursor: pointer;
+  user-select: none;
+  min-height: 22px;
+}
+
+.step-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+
+.step-timer {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.step-expand-btn {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  background: none;
+  border: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  border-radius: var(--r-md);
+  flex-shrink: 0;
+}
+.step-expand-btn:hover { background: #f4f4f5; color: var(--text-primary); }
+
+.step-stream {
+  margin-top: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5);
+  background: #fafafa;
+  border-radius: 12px;
+  border: 1px solid rgba(0,0,0,0.04);
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--text-secondary);
+}
+
+.step-output {
+  margin-top: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5);
+  background: #fafafa;
+  border-radius: 12px;
+  border: 1px solid rgba(0,0,0,0.04);
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--text-secondary);
+}
+
+.step-summary {
+  margin-top: var(--sp-2);
+  font-size: 12px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+
+.thinking-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+/* 完成/失败 badge */
+.done-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #16a34a;
+  background: #f0fdf4;
+  padding: 2px 8px;
+  border-radius: var(--r-full);
+}
+
+.failed-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #dc2626;
+  background: #fef2f2;
+  padding: 2px 8px;
+  border-radius: var(--r-full);
+}
+
+/* spin animation for loader */
+.spin {
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* ── 裁决卡 ── */
+.arbitration-card {
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 16px;
+  padding: var(--sp-5) var(--sp-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.arb-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #92400e;
+}
+
+.arb-question {
+  font-size: 13px;
+  color: #78350f;
+  line-height: 1.6;
+}
+
+.arb-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+}
+
+.arb-option-btn {
+  height: 32px;
+  padding: 0 var(--sp-4);
+  background: #fff;
+  border: 1px solid #fcd34d;
+  border-radius: var(--r-full);
+  font-size: 12px;
+  font-weight: 600;
+  color: #92400e;
+  cursor: pointer;
+  font-family: var(--font);
+  transition: all var(--t-fast);
+}
+.arb-option-btn:hover {
+  background: #d97706;
+  border-color: #d97706;
+  color: #fff;
+}
+
+/* resume tool btn */
+.resume-tool-btn {
+  color: #7c3aed !important;
+  font-weight: 600 !important;
+}
+.resume-tool-btn:hover { background: #f3e8ff !important; }
+
+/* ── Peer icon buttons (圆圈 icon，放工具栏里) ── */
+.peer-icons {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.peer-icon-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 1px solid rgba(0,0,0,0.1);
+  background: #f4f4f5;
+  color: #52525b;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all var(--t-fast);
+  flex-shrink: 0;
+}
+.peer-icon-btn:hover {
+  background: #f0fdf4;
+  border-color: #86efac;
+  color: #15803d;
+}
+
+/* ── Doc tabs ── */
+.doc-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: #f4f4f5;
+  border-radius: 8px;
+  padding: 2px;
+}
+
+.doc-tab {
+  height: 24px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  font-family: var(--font);
+  transition: all var(--t-fast);
+}
+.doc-tab.active {
+  background: #fff;
+  color: var(--text-primary);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+
+/* notice-action-btn (retained for compatibility) */
+.notice-action-btn {
+  height: 22px;
+  padding: 0 var(--sp-3);
+  background: rgba(0,0,0,0.06);
+  border: none;
+  border-radius: var(--r-full);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: var(--font);
+}
+
+/* ── 右上角产出面板 ── */
+.output-panel {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 180px;
+  background: rgba(255,255,255,0.95);
+  border: 1px solid rgba(0,0,0,0.07);
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.08), 0 1px 4px rgba(0,0,0,0.04);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  z-index: 50;
+  overflow: hidden;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.output-panel-header {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-tertiary);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 4px 8px 6px;
+}
+
+.output-panel-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 32px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: var(--font);
+  text-align: left;
+  transition: all var(--t-fast);
+}
+.output-panel-item:hover { background: #f4f4f5; color: var(--text-primary); }
+.output-panel-item.active { background: #f0f9ff; color: #0369a1; font-weight: 600; }
+.output-panel-item.disabled { opacity: 0.4; cursor: default; }
+
+.output-item-arrow {
+  margin-left: auto;
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+
+/* ── 右侧产出侧边栏（与主区并排，打开时压缩主区） ── */
+.output-drawer {
+  flex: 0 0 0;
+  width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border-left: none;
+  background: #fff;
+  transition: flex-basis 0.28s cubic-bezier(0.16,1,0.3,1), border-color 0.28s;
+}
+.output-drawer.open {
+  flex-basis: 46%;
+  min-width: 360px;
+  border-left: 1px solid rgba(0,0,0,0.07);
+  overflow: visible;
+}
+
+/* panel toggle 激活态 */
+.panel-toggle-btn.active {
+  background: #f4f4f5;
+  color: var(--text-primary);
+}
+
+.output-drawer-header {
+  display: flex;
+  align-items: center;
+  height: 44px;
+  border-bottom: 1px solid rgba(0,0,0,0.06);
+  flex-shrink: 0;
+  background: #fff;
+  padding: 0 var(--sp-4);
+  gap: var(--sp-2);
+}
+
+.output-drawer-tags {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: 1;
+}
+
+/* 胶囊标签 */
+.output-file-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid rgba(0,0,0,0.1);
+  border-radius: 999px;
+  background: #f4f4f5;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: var(--font);
+  white-space: nowrap;
+  transition: all var(--t-fast);
+}
+.output-file-tag:hover { border-color: rgba(0,0,0,0.18); color: var(--text-primary); }
+.output-file-tag.active {
+  background: #18181b;
+  border-color: #18181b;
+  color: #fff;
+}
+
+/* × 只在 hover 时出现 */
+.output-tag-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  opacity: 0;
+  transition: opacity var(--t-fast), background var(--t-fast);
+  flex-shrink: 0;
+}
+.output-file-tag:hover .output-tag-close { opacity: 1; }
+.output-tag-close:hover { background: rgba(255,255,255,0.25); }
+
+.output-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--sp-8) var(--sp-10);
+}
+
+.output-drawer-footer {
+  padding: var(--sp-3) var(--sp-5);
+  border-top: 1px solid rgba(0,0,0,0.04);
+  flex-shrink: 0;
+}
+
+/* ── Sana AI 风格重构版 workspace.css ── */
 /* 默认只有聊天区，doc-open 时变两列 */
 .workspace {
-  display: grid;
-  grid-template-columns: 1fr;
+  display: flex;
+  flex-direction: row;
   height: 100%;
   overflow: hidden;
-  transition: grid-template-columns 0.35s cubic-bezier(0.16,1,0.3,1);
   background: #ffffff;
+  position: relative;
 }
 
 .workspace.doc-open {
@@ -18,7 +456,8 @@
 .ws-chat {
   display: flex;
   flex-direction: column;
-  border-right: 1px solid rgba(0, 0, 0, 0.04);
+  flex: 1 1 0%;
+  min-width: 0;
   overflow: hidden;
   position: relative;
   background: #ffffff;
