@@ -312,11 +312,11 @@ export default function Workspace() {
           </div>
           <div className="ws-chat-header-actions">
             <button className="icon-btn" title="设置"><Settings2 size={15} /></button>
-            {hasOutput && (
+            {hasOutput && !openedDoc && (
               <button
-                className={`icon-btn panel-toggle-btn${openedDoc ? ' active' : ''}`}
-                title={openedDoc ? '收起侧边栏' : '展开侧边栏'}
-                onClick={() => openedDoc ? setOpenedDoc(null) : setOpenedDoc(outputItems.find(i => i.content)?.key || null)}
+                className="icon-btn panel-toggle-btn"
+                title="展开侧边栏"
+                onClick={() => setOpenedDoc(outputItems.find(i => i.content)?.key || null)}
               >
                 <PanelRight size={15} />
               </button>
@@ -458,7 +458,7 @@ export default function Workspace() {
 
       {/* ── 右侧产出抽屉 ── */}
       <div className={`output-drawer${openedDoc ? ' open' : ''}`}>
-        {/* 文件胶囊标签 + 右上角收起按钮 */}
+        {/* 文件胶囊标签 + 固定在右侧的收起按钮 */}
         <div className="output-drawer-header">
           <div className="output-drawer-tags">
             {outputItems.filter(i => i.content).map(item => (
@@ -474,6 +474,13 @@ export default function Workspace() {
               </button>
             ))}
           </div>
+          <button
+            className="icon-btn output-drawer-toggle"
+            title="收起侧边栏"
+            onClick={() => setOpenedDoc(null)}
+          >
+            <PanelRight size={15} />
+          </button>
         </div>
         {/* 抽屉内容 */}
         <div className="output-drawer-body">
